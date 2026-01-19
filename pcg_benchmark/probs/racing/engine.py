@@ -2,7 +2,7 @@
 import numpy as np
 
 class CarPhysicsEngine:
-    def __init__(self, start_position, start_angle=0.0, time_step=0.1, friction_coef=0.1, max_steering=np.pi/4, max_speed=10.0, max_throttle=1.0, max_brake=-5.0, steering_rate=np.pi/2, length=2.5, lateral_friction=2.0):
+    def __init__(self, start_position, start_angle=0.0, time_step=0.1, friction_coef=0.1, max_steering=np.pi/4, max_speed=60.0, max_throttle=5.0, max_brake=-10.0, steering_rate=np.pi/2, length=2.5, lateral_friction=2.0):
         self.time_step = time_step
         self.friction_coef = friction_coef
         self.max_steering = max_steering
@@ -26,51 +26,76 @@ class CarPhysicsEngine:
     def step(self, action):
         # action: dict with 'steering' (radians), 'throttle' (acceleration, can be negative for braking)
         target_steering = np.clip(action.get('steering', 0.0), -self.max_steering, self.max_steering)
-        # Throttle input is normalized between [-1, 1] and then scaled by max_throttle/max_brake
         norm_throttle = np.clip(action.get('throttle', 0.0), -1.0, 1.0)
-        if norm_throttle >= 0:
-            throttle = norm_throttle * self.max_throttle
-        else:
-            throttle = norm_throttle * -self.max_brake  # max_brake is negative, so -max_brake is positive
+        throttle = norm_throttle * self.max_throttle if norm_throttle >= 0 else norm_throttle * -self.max_brake
 
-        # Limit steering rate (how fast the wheels can turn)
+        # Limit steering rate
         steering_diff = target_steering - self.steering_angle
         max_steering_change = self.steering_rate * self.time_step
-        steering_change = np.clip(steering_diff, -max_steering_change, max_steering_change)
-        self.steering_angle += steering_change
+        self.steering_angle += np.clip(steering_diff, -max_steering_change, max_steering_change)
         self.steering_angle = np.clip(self.steering_angle, -self.max_steering, self.max_steering)
 
-        # Get car's local velocity (forward, lateral)
+        # Precompute trigonometric values
         cos_a = np.cos(self.angle)
         sin_a = np.sin(self.angle)
-        rot = np.array([[cos_a, sin_a], [-sin_a, cos_a]])  # world to local
-        v_local = np.dot(rot, self.velocity)
-        v_forward = v_local[0]
-        v_lateral = v_local[1]
 
-        # Apply throttle/brake to forward velocity
-        # Acceleration decreases as car nears top speed
+        # Transform velocity to local frame
+        v_forward = cos_a * self.velocity[0] + sin_a * self.velocity[1]
+        v_lateral = -sin_a * self.velocity[0] + cos_a * self.velocity[1]
+
+        #throttle/brake is applied to forward velocity
         accel_scale = max(0.0, 1.0 - v_forward / self.max_speed) if throttle > 0 else 1.0
         effective_accel = throttle * accel_scale
         acceleration = effective_accel - self.friction_coef * v_forward
         v_forward += acceleration * self.time_step
         v_forward = np.clip(v_forward, 0.0, self.max_speed)
 
-        # Lateral friction (simulate grip/sliding)
-        max_lateral_acc = self.lateral_friction * 9.81
-        if abs(self.steering_angle) > 1e-4 and v_forward > 0.1:
-            turning_radius = self.length / np.tan(self.steering_angle)
-            desired_lateral = v_forward ** 2 / abs(turning_radius)
-            if abs(desired_lateral) > max_lateral_acc:
-                # Too much force: reduce lateral velocity (simulate sliding)
-                v_lateral *= max_lateral_acc / abs(desired_lateral)
-        # Apply friction to lateral velocity
-        v_lateral *= np.exp(-self.lateral_friction * self.time_step)
+        # --- Realistic tire grip and understeer ---
+        # Parameters for tire model
+        tire_stiffness_front = 8000.0  # N/rad
+        tire_stiffness_rear = 8000.0   # N/rad
+        mass = 1200.0  # kg
+        g = 9.81
+        # Nonlinear tire force model (saturates at high slip angles)
+        def tire_force(stiffness, slip_angle):
+            # Saturate force for large slip angles (drifting)
+            max_slip = np.deg2rad(15)
+            force = -stiffness * slip_angle
+            if abs(slip_angle) > max_slip:
+                force = -stiffness * max_slip * np.sign(slip_angle)
+            return force
 
-        # Convert local velocity back to world frame
-        v_local = np.array([v_forward, v_lateral])
-        inv_rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])  # local to world
-        self.velocity = inv_rot @ v_local
+        # Calculate slip angles
+        if abs(v_forward) > 0.1:
+            beta = np.arctan2(v_lateral, abs(v_forward))  # body slip angle
+            # Calculate yaw rate (omega)
+            if abs(self.steering_angle) > 1e-4:
+                turning_radius = self.length / np.tan(self.steering_angle)
+                yaw_rate = v_forward / turning_radius
+            else:
+                yaw_rate = 0.0
+            # Steering effectiveness drops at high speed
+            steering_effect = 1.0 / (1.0 + 0.03 * v_forward)
+            slip_angle_front = beta + self.steering_angle * steering_effect - self.length * 0.5 * yaw_rate / max(abs(v_forward), 1e-3)
+            slip_angle_rear = beta - self.length * 0.5 * yaw_rate / max(abs(v_forward), 1e-3)
+        else:
+            slip_angle_front = 0.0
+            slip_angle_rear = 0.0
+        # Lateral tire forces (nonlinear model)
+        F_yf = tire_force(tire_stiffness_front, slip_angle_front)
+        F_yr = tire_force(tire_stiffness_rear, slip_angle_rear)
+        # Limit tire force to friction circle
+        max_tire_force = mass * g * 0.7  # 0.7 = friction coefficient
+        F_yf = np.clip(F_yf, -max_tire_force, max_tire_force)
+        F_yr = np.clip(F_yr, -max_tire_force, max_tire_force)
+        # Update lateral velocity and yaw rate
+        v_lateral += (F_yf + F_yr) / mass * self.time_step
+        # More sliding: reduce lateral friction
+        v_lateral *= np.exp(-self.lateral_friction * 0.5 * self.time_step)
+
+        # Transform velocity back to world frame
+        self.velocity[0] = cos_a * v_forward - sin_a * v_lateral
+        self.velocity[1] = sin_a * v_forward + cos_a * v_lateral
 
         # Update heading based on forward velocity and steering
         if abs(self.steering_angle) > 1e-4:
