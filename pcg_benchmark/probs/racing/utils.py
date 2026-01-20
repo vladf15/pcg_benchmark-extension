@@ -1,30 +1,30 @@
+import functools
 import itertools
+from typing import Dict, Iterable, List, Set, Tuple
 
-def get_racing_line_targets(curve_points, track_width, entry_frac=0.2, exit_frac=0.8):
-    """
-    For each segment, return entry, apex, and exit points with left, right, and center offsets.
-    Returns: list of dicts per segment: { 'entry': {'left': pt, 'center': pt, 'right': pt}, ... }
-    """
-    curve_points = np.asarray(curve_points)
+import numpy as np
+
+
+@functools.lru_cache(maxsize=128)
+def get_racing_line_targets_cached(curve_points_tuple, track_width, entry_frac=0.2, exit_frac=0.8):
+    curve_points = np.array(curve_points_tuple)
     n = len(curve_points)
     if n < 2:
         return []
     half_width = track_width / 2.0
     targets = []
-    for i in range(n-1):
+    for i in range(n - 1):
         p_start = curve_points[i]
-        p_end = curve_points[i+1]
+        p_end = curve_points[i + 1]
         direction = p_end - p_start
         norm = np.linalg.norm(direction)
         if norm == 0:
             perp = np.array([0, 0])
         else:
             perp = np.array([-direction[1], direction[0]]) / norm
-        # Entry, apex, exit fractions
         entry_pt = p_start + direction * entry_frac
         apex_pt = p_start + direction * 0.5
         exit_pt = p_start + direction * exit_frac
-        # Offset each by left/right/center
         entry = {
             'left': entry_pt + perp * half_width,
             'center': entry_pt,
@@ -42,30 +42,27 @@ def get_racing_line_targets(curve_points, track_width, entry_frac=0.2, exit_frac
         }
         targets.append({'entry': entry, 'apex': apex, 'exit': exit})
     return targets
-import numpy as np
 
-def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, continuity=0.0):
-    """
-    Kochanek-Bartels spline with per-segment tension and bias.
-    tension, bias: arrays/lists of length n (segments), or scalar for global value.
-    """
-    points = np.asarray(points)
+
+def get_racing_line_targets(curve_points, track_width, entry_frac=0.2, exit_frac=0.8):
+    """Return entry/apex/exit target points for each segment."""
+    curve_points_tuple = tuple(map(tuple, np.asarray(curve_points)))
+    return get_racing_line_targets_cached(curve_points_tuple, track_width, entry_frac, exit_frac)
+
+@functools.lru_cache(maxsize=128)
+def interpolate_curves_cached(points_tuple, samples_per_segment=20, tension_tuple=None, bias_tuple=None, continuity=0.0):
+    points = np.array(points_tuple)
     n = len(points)
     if n < 2:
         return points
-    # If scalar, broadcast to all segments
-    if tension is None:
+    if tension_tuple is None:
         tension = np.zeros(n)
-    elif np.isscalar(tension):
-        tension = np.full(n, tension)
     else:
-        tension = np.asarray(tension)
-    if bias is None:
+        tension = np.array(tension_tuple)
+    if bias_tuple is None:
         bias = np.zeros(n)
-    elif np.isscalar(bias):
-        bias = np.full(n, bias)
     else:
-        bias = np.asarray(bias)
+        bias = np.array(bias_tuple)
     points = np.vstack([points[0], points, points[-1]])
     dim = points.shape[1]
     total_segments = n - 1
@@ -83,14 +80,12 @@ def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, 
         p0, p1, p2, p3 = points[i-1], points[i], points[i+1], points[i+2]
         seg_tension = tension[i-1] if i-1 < len(tension) else 0.0
         seg_bias = bias[i-1] if i-1 < len(bias) else 0.0
-        # Calculate tangents using per-segment Tension, Bias, Continuity
         dt1 = ((1-seg_tension)*(1+seg_bias)*(1+continuity))/2
         dt2 = ((1-seg_tension)*(1-seg_bias)*(1-continuity))/2
         m1 = dt1*(p1-p0) + dt2*(p2-p1)
         dt3 = ((1-seg_tension)*(1+seg_bias)*(1-continuity))/2
         dt4 = ((1-seg_tension)*(1-seg_bias)*(1+continuity))/2
         m2 = dt3*(p2-p1) + dt4*(p3-p2)
-        # Vectorized computation for all t in t_vals
         pts = (
             h1[:, None] * p1 +
             h2[:, None] * p2 +
@@ -102,19 +97,95 @@ def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, 
     curve_points[-1] = points[-1]
     return curve_points
 
+def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, continuity=0.0):
+    """Interpolate control points into a Kochanek-Bartels spline polyline."""
+    points_tuple = tuple(map(tuple, np.asarray(points)))
+    tension_tuple = tuple(tension) if tension is not None else None
+    bias_tuple = tuple(bias) if bias is not None else None
+    return interpolate_curves_cached(points_tuple, samples_per_segment, tension_tuple, bias_tuple, continuity)
+
+
+@functools.lru_cache(maxsize=128)
+def count_self_intersections_cached(points_tuple):
+    points = np.array(points_tuple)
+    return _count_self_intersections_grid(points)
 
 def count_self_intersections(points):
-    # Check all pairs of non-adjacent segments for intersection
-    def segments_intersect(a1, a2, b1, b2):
-        def ccw(p1, p2, p3):
-            return (p3[1]-p1[1]) * (p2[0]-p1[0]) > (p2[1]-p1[1]) * (p3[0]-p1[0])
-        return (ccw(a1, b1, b2) != ccw(a2, b1, b2)) and (ccw(a1, a2, b1) != ccw(a1, a2, b2))
+    points_tuple = tuple(map(tuple, np.asarray(points)))
+    return count_self_intersections_cached(points_tuple)
+
+
+def _segments_intersect_strict_ccw(a1, a2, b1, b2) -> bool:
+    """Strict segment intersection test (ignores collinear/endpoint touches)."""
+
+    def ccw(p1, p2, p3):
+        return (p3[1] - p1[1]) * (p2[0] - p1[0]) > (p2[1] - p1[1]) * (p3[0] - p1[0])
+
+    return (ccw(a1, b1, b2) != ccw(a2, b1, b2)) and (ccw(a1, a2, b1) != ccw(a1, a2, b2))
+
+
+def _count_self_intersections_grid(points: np.ndarray) -> int:
+    """Count self-intersections using a grid to prune segment pairs."""
+
+    points = np.asarray(points)
     n = len(points)
-    count = 0
-    for i, j in itertools.combinations(range(n-1), 2):
-        # Skip adjacent or overlapping segments
-        if abs(i-j) <= 1:
+    if n < 4:
+        return 0
+
+    seg_start = points[:-1]
+    seg_end = points[1:]
+    m = n - 1
+
+    seg_min = np.minimum(seg_start, seg_end)
+    seg_max = np.maximum(seg_start, seg_end)
+
+    seg_vec = seg_end - seg_start
+    seg_len = np.linalg.norm(seg_vec, axis=1)
+    nonzero = seg_len > 1e-12
+    if np.any(nonzero):
+        base = float(np.median(seg_len[nonzero]))
+        cell_size = max(1e-9, base * 2.0)
+    else:
+        cell_size = 1.0
+
+    origin = np.min(points, axis=0)
+    eps = max(1e-12, cell_size * 1e-9)
+
+    gx0 = np.floor((seg_min[:, 0] - origin[0] - eps) / cell_size).astype(np.int64)
+    gx1 = np.floor((seg_max[:, 0] - origin[0] + eps) / cell_size).astype(np.int64)
+    gy0 = np.floor((seg_min[:, 1] - origin[1] - eps) / cell_size).astype(np.int64)
+    gy1 = np.floor((seg_max[:, 1] - origin[1] + eps) / cell_size).astype(np.int64)
+
+    cell_to_segments: Dict[Tuple[int, int], List[int]] = {}
+    for i in range(m):
+        for gx in range(int(gx0[i]), int(gx1[i]) + 1):
+            for gy in range(int(gy0[i]), int(gy1[i]) + 1):
+                key = (gx, gy)
+                if key in cell_to_segments:
+                    cell_to_segments[key].append(i)
+                else:
+                    cell_to_segments[key] = [i]
+
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    for segs in cell_to_segments.values():
+        if len(segs) < 2:
             continue
-        if segments_intersect(points[i], points[i+1], points[j], points[j+1]):
+        segs_sorted = sorted(segs)
+        for a_idx in range(len(segs_sorted) - 1):
+            i = segs_sorted[a_idx]
+            for b_idx in range(a_idx + 1, len(segs_sorted)):
+                j = segs_sorted[b_idx]
+                if j - i <= 1:
+                    continue
+                candidate_pairs.add((i, j))
+
+    count = 0
+    for i, j in candidate_pairs:
+        if seg_max[i, 0] < seg_min[j, 0] or seg_max[j, 0] < seg_min[i, 0]:
+            continue
+        if seg_max[i, 1] < seg_min[j, 1] or seg_max[j, 1] < seg_min[i, 1]:
+            continue
+        if _segments_intersect_strict_ccw(seg_start[i], seg_end[i], seg_start[j], seg_end[j]):
             count += 1
+
     return count
