@@ -455,64 +455,166 @@ class RacingProblem(Problem):
             skip = self._skip_render
         if skip:
             return []
+
         track_points, tension, bias = self._extract_content(content)
         trajectory = self._get_cached_trajectory(track_points, tension=tension, bias=bias)
 
         if trajectory is not None and len(trajectory) > 0:
             adaptive_sampling = max(1, int(len(trajectory) // 250))
             frame_sampling = max(int(frame_sampling), adaptive_sampling)
+
         track_points_np = self._normalize_track_points(track_points)
         curve_points = interpolate_curves(track_points_np, samples_per_segment=10, tension=tension, bias=bias)
+        curve_np = np.asarray(curve_points, dtype=float)
+
+        grass_color = (34, 139, 34)
+        edge_color = (10, 10, 10)
+        road_color = (215, 215, 215)
+        centerline_color = (120, 120, 120)
+
         frames = []
         car_length = 30
         car_width = 16
-        scaled_curve = [(int(x), int(y)) for (x, y) in curve_points]
-        left_edge = []
-        right_edge = []
-        half_width = self._track_width / 2.0
-        n = len(curve_points)
-        for j in range(n):
-            if j == 0:
-                dir_prev = curve_points[1] - curve_points[0]
-            else:
-                dir_prev = curve_points[j] - curve_points[j-1]
-            if j == n-1:
-                dir_next = curve_points[j] - curve_points[j-1]
-            else:
-                dir_next = curve_points[j+1] - curve_points[j]
-            avg_dir = dir_prev + dir_next
-            norm = np.linalg.norm(avg_dir)
-            if norm == 0:
-                perp = np.array([0, 0])
-            else:
-                perp = np.array([-avg_dir[1], avg_dir[0]]) / norm
-            left = curve_points[j] + perp * half_width
-            right = curve_points[j] - perp * half_width
-            left_edge.append((int(left[0]), int(left[1])))
-            right_edge.append((int(right[0]), int(right[1])))
+
+        scaled_curve = [(int(round(x)), int(round(y))) for (x, y) in curve_np]
+        half_width = float(self._track_width) * 0.5
+
+        def _segment_intersection_point(a1, a2, b1, b2):
+            ax1, ay1 = a1
+            ax2, ay2 = a2
+            bx1, by1 = b1
+            bx2, by2 = b2
+            dax = ax2 - ax1
+            day = ay2 - ay1
+            dbx = bx2 - bx1
+            dby = by2 - by1
+            denom = dax * dby - day * dbx
+            if abs(denom) < 1e-12:
+                return None
+            dx = bx1 - ax1
+            dy = by1 - ay1
+            t = (dx * dby - dy * dbx) / denom
+            u = (dx * day - dy * dax) / denom
+            if t <= 1e-9 or t >= 1.0 - 1e-9 or u <= 1e-9 or u >= 1.0 - 1e-9:
+                return None
+            return (ax1 + t * dax, ay1 + t * day)
+
+        def _trim_self_intersections(polyline, max_passes=6):
+            pts = [(float(x), float(y)) for (x, y) in polyline]
+            if len(pts) < 4:
+                return pts
+            for _ in range(max_passes):
+                m = len(pts) - 1
+                found = False
+                for i in range(m - 2):
+                    a1 = pts[i]
+                    a2 = pts[i + 1]
+                    for j in range(i + 2, m):
+                        if j - i <= 1:
+                            continue
+                        b1 = pts[j]
+                        b2 = pts[j + 1]
+                        p = _segment_intersection_point(a1, a2, b1, b2)
+                        if p is None:
+                            continue
+                        pts = pts[: i + 1] + [p] + pts[j + 1 :]
+                        found = True
+                        break
+                    if found:
+                        break
+                if not found:
+                    break
+            return pts
+
+        left_edge_f = []
+        right_edge_f = []
+        n = len(curve_np)
+        if n >= 2:
+            for j in range(n):
+                if j == 0:
+                    dir_prev = curve_np[1] - curve_np[0]
+                else:
+                    dir_prev = curve_np[j] - curve_np[j - 1]
+                if j == n - 1:
+                    dir_next = curve_np[j] - curve_np[j - 1]
+                else:
+                    dir_next = curve_np[j + 1] - curve_np[j]
+
+                avg_dir = dir_prev + dir_next
+                norm = float(np.linalg.norm(avg_dir))
+                if norm == 0.0:
+                    perp = np.array([0.0, 0.0], dtype=float)
+                else:
+                    perp = np.array([-avg_dir[1], avg_dir[0]], dtype=float) / norm
+
+                left = curve_np[j] + perp * half_width
+                right = curve_np[j] - perp * half_width
+                left_edge_f.append((float(left[0]), float(left[1])))
+                right_edge_f.append((float(right[0]), float(right[1])))
+
+            left_edge_f = _trim_self_intersections(left_edge_f)
+            right_edge_f = _trim_self_intersections(right_edge_f)
+            left_edge = [(int(round(x)), int(round(y))) for (x, y) in left_edge_f]
+            right_edge = [(int(round(x)), int(round(y))) for (x, y) in right_edge_f]
+
         track_polygon = left_edge + right_edge[::-1]
+
+        track_background = Image.new("RGB", (self._width, self._height), grass_color)
+        bg_draw = ImageDraw.Draw(track_background)
+        if len(track_polygon) >= 3:
+            bg_draw.polygon(track_polygon, fill=road_color)
+
+        edge_line_width = 2
+        if len(left_edge) > 1:
+            bg_draw.line(left_edge, fill=edge_color, width=edge_line_width)
+        if len(right_edge) > 1:
+            bg_draw.line(right_edge, fill=edge_color, width=edge_line_width)
+
+        if len(scaled_curve) > 1:
+            bg_draw.line(scaled_curve, fill=centerline_color, width=2)
+
+        def _rotated_rect(center_x, center_y, forward, right, half_len, half_wid):
+            fx, fy = forward
+            rx, ry = right
+            return [
+                (center_x + fx * half_len + rx * half_wid, center_y + fy * half_len + ry * half_wid),
+                (center_x + fx * half_len - rx * half_wid, center_y + fy * half_len - ry * half_wid),
+                (center_x - fx * half_len - rx * half_wid, center_y - fy * half_len - ry * half_wid),
+                (center_x - fx * half_len + rx * half_wid, center_y - fy * half_len + ry * half_wid),
+            ]
 
         for i, state in enumerate(trajectory):
             if i % frame_sampling != 0:
                 continue
-            img = Image.new("RGB", (self._width, self._height), (255, 255, 255))
+            img = track_background.copy()
             draw = ImageDraw.Draw(img)
-            draw.polygon(track_polygon, fill=(220, 220, 220))
-            if len(left_edge) > 1:
-                draw.line(left_edge, fill=(0, 0, 0), width=2)
-            if len(right_edge) > 1:
-                draw.line(right_edge, fill=(0, 0, 0), width=2)
-            if len(scaled_curve) > 1:
-                draw.line(scaled_curve, fill=(100, 100, 100), width=2)
+
             car_x, car_y = state[0], state[1]
-            if len(state) > 2:
-                angle = state[2]
-            else:
-                angle = 0.0
+            angle = state[2] if len(state) > 2 else 0.0
             cos_a = np.cos(angle)
             sin_a = np.sin(angle)
+            forward = (float(cos_a), float(sin_a))
+            right = (float(-sin_a), float(cos_a))
+
             dx = car_length / 2.0
             dy = car_width / 2.0
+
+            wheel_len = car_length * 0.20
+            wheel_wid = car_width * 0.22
+            half_wheel_len = wheel_len / 2.0
+            half_wheel_wid = wheel_wid / 2.0
+            wheel_base = car_length * 0.34
+            wheel_track = car_width * 0.44
+            wheel_centers = [
+                (car_x + forward[0] * wheel_base + right[0] * wheel_track, car_y + forward[1] * wheel_base + right[1] * wheel_track),
+                (car_x + forward[0] * wheel_base - right[0] * wheel_track, car_y + forward[1] * wheel_base - right[1] * wheel_track),
+                (car_x - forward[0] * wheel_base + right[0] * wheel_track, car_y - forward[1] * wheel_base + right[1] * wheel_track),
+                (car_x - forward[0] * wheel_base - right[0] * wheel_track, car_y - forward[1] * wheel_base - right[1] * wheel_track),
+            ]
+            for wx, wy in wheel_centers:
+                wheel = _rotated_rect(wx, wy, forward, right, half_wheel_len, half_wheel_wid)
+                draw.polygon(wheel, fill=(25, 25, 25), outline=(0, 0, 0))
+
             corners = [
                 (car_x + cos_a * dx - sin_a * dy, car_y + sin_a * dx + cos_a * dy),
                 (car_x + cos_a * dx + sin_a * dy, car_y + sin_a * dx - cos_a * dy),
@@ -524,6 +626,7 @@ class RacingProblem(Problem):
             front_y = car_y + sin_a * dx
             draw.line([(car_x, car_y), (front_x, front_y)], fill=(0, 0, 255), width=3)
             frames.append(img)
+
         return frames
 
 
