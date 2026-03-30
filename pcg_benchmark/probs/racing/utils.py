@@ -97,12 +97,16 @@ def interpolate_curves_cached(points_tuple, samples_per_segment=20, tension_tupl
     curve_points[-1] = points[-1]
     return curve_points
 
-def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, continuity=0.0):
-    """Interpolate control points into a Kochanek-Bartels spline polyline."""
+def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None):
+    """
+    Interpolate control points into a Kochanek-Bartels spline polyline.
+    Continuity is always locked to 0.0 for smooth transitions.
+    Tension and bias parameters provide all necessary variety.
+    """
     points_tuple = tuple(map(tuple, np.asarray(points)))
     tension_tuple = tuple(tension) if tension is not None else None
     bias_tuple = tuple(bias) if bias is not None else None
-    return interpolate_curves_cached(points_tuple, samples_per_segment, tension_tuple, bias_tuple, continuity)
+    return interpolate_curves_cached(points_tuple, samples_per_segment, tension_tuple, bias_tuple, continuity=0.0)
 
 
 @functools.lru_cache(maxsize=128)
@@ -115,13 +119,45 @@ def count_self_intersections(points):
     return count_self_intersections_cached(points_tuple)
 
 
-def _segments_intersect_strict_ccw(a1, a2, b1, b2) -> bool:
-    """Strict segment intersection test (ignores collinear/endpoint touches)."""
+def _segments_intersect_inclusive(a1, a2, b1, b2, eps: float = 1e-9) -> bool:
+    """Inclusive segment intersection test.
 
-    def ccw(p1, p2, p3):
-        return (p3[1] - p1[1]) * (p2[0] - p1[0]) > (p2[1] - p1[1]) * (p3[0] - p1[0])
+    Counts proper crossings *and* endpoint/collinear touches (within eps).
+    This is intentionally stricter than the classic CCW-only test so that
+    self-intersecting or self-touching polylines are rejected.
+    """
 
-    return (ccw(a1, b1, b2) != ccw(a2, b1, b2)) and (ccw(a1, a2, b1) != ccw(a1, a2, b2))
+    def orient(p, q, r) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_segment(p, q, r) -> bool:
+        # r is on segment pq (inclusive), assuming collinear within eps.
+        return (
+            min(p[0], q[0]) - eps <= r[0] <= max(p[0], q[0]) + eps
+            and min(p[1], q[1]) - eps <= r[1] <= max(p[1], q[1]) + eps
+        )
+
+    o1 = orient(a1, a2, b1)
+    o2 = orient(a1, a2, b2)
+    o3 = orient(b1, b2, a1)
+    o4 = orient(b1, b2, a2)
+
+    # Proper intersection
+    if (o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps):
+        if (o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps):
+            return True
+
+    # Collinear / endpoint touches
+    if abs(o1) <= eps and on_segment(a1, a2, b1):
+        return True
+    if abs(o2) <= eps and on_segment(a1, a2, b2):
+        return True
+    if abs(o3) <= eps and on_segment(b1, b2, a1):
+        return True
+    if abs(o4) <= eps and on_segment(b1, b2, a2):
+        return True
+
+    return False
 
 
 def _count_self_intersections_grid(points: np.ndarray) -> int:
@@ -185,7 +221,11 @@ def _count_self_intersections_grid(points: np.ndarray) -> int:
             continue
         if seg_max[i, 1] < seg_min[j, 1] or seg_max[j, 1] < seg_min[i, 1]:
             continue
-        if _segments_intersect_strict_ccw(seg_start[i], seg_end[i], seg_start[j], seg_end[j]):
+
+        # Use an inclusive intersection test so self-touching is rejected too.
+        # eps is scaled to the cell size used by the grid to remain robust.
+        eps_i = max(1e-9, cell_size * 1e-6)
+        if _segments_intersect_inclusive(seg_start[i], seg_end[i], seg_start[j], seg_end[j], eps=eps_i):
             count += 1
 
     return count
