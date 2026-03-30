@@ -12,9 +12,9 @@ class SteeringAgent:
     def __init__(
         self,
         curve_points,
-        track_width=50,
+        track_width=12.0,
         line_strategy=None,
-        max_speed=22.0,
+        max_speed=33.0,
         enable_wander=False,
     ):
         """Create a steering agent for the given path."""
@@ -24,39 +24,45 @@ class SteeringAgent:
         self.enable_wander = bool(enable_wander)
 
         # Prediction + projection parameters
-        self.look_ahead_dist = 35.0
-        self.curvature_lookahead = 75.0
+        self.look_ahead_dist = 20.0
+        self.curvature_lookahead = 55.0
         self.predict_time_base = 0.75
         self.predict_time_speed_gain = 0.04
         self.search_ahead = 40
         self.search_back = 0
 
         # Corridor containment
-        self.corridor_margin = 6.0
-        self.centering_gain_rad = math.radians(3.0)
-        self.containment_gain_rad = math.radians(18.0)
+        self.corridor_margin = max(1.0, 0.18 * float(self.track_width))
+        self.centering_gain_rad = math.radians(6.0)
+        self.containment_gain_rad = math.radians(30.0)
 
-        self.racing_line_max_frac = 0.85
-        self.racing_line_entry_frac = 0.70  # outside before apex
-        self.racing_line_apex_frac = 0.35   # inside near apex
+        self.racing_line_max_frac = 0.45
+        self.racing_line_entry_frac = 0.40  # outside before apex
+        self.racing_line_apex_frac = 0.15   # inside near apex
         self.racing_line_enable = True
 
         # Stanley steering parameters
         self.nominal_max_steer_rad = math.radians(28.0)
-        self.stanley_k = 0.035
+        self.stanley_k = 0.055
         self.stanley_v0 = 1.5
         self.curvature_ff_gain = 0.35
         self.curvature_ff_gain_line = 0.22
 
         # Lookahead distance as a function of speed (keeps high-speed stable)
         self.lookahead_base = float(self.look_ahead_dist)
-        self.lookahead_speed_gain = 1.2
-        self.lookahead_min = 18.0
-        self.lookahead_max = 110.0
+        self.lookahead_speed_gain = 0.6
+        self.lookahead_min = 12.0
+        self.lookahead_max = 65.0
 
         # Speed planning (path-aware)
-        self.min_speed = 4.0
-        self.turn_speed = 9.0
+        # Units are m/s. Defaults roughly correspond to:
+        # - straights: ~50 m/s  (180 km/h)
+        # - hairpins:  ~17 m/s   (60 km/h)
+        self.min_speed = 6.0
+        self.turn_speed = 10.0
+        # Approximate lateral acceleration limit used for cornering speed.
+        # Race tires on dry tarmac are typically ~0.9g..1.3g.
+        self.lat_accel_max = 7.0
 
         # Monotonic progress along the polyline
         self.current_idx = 0
@@ -329,6 +335,14 @@ class SteeringAgent:
 
             desired_lat_off = outside_lat * (1.0 - phase_t) + inside_lat * phase_t
 
+            # Avoid aggressive corner-cutting near the edge: progressively
+            # reduce the racing-line bias when we're already laterally offset.
+            edge_ratio = abs_off / corridor if corridor > 1e-6 else 1.0
+            if edge_ratio >= 0.75:
+                desired_lat_off = 0.0
+            elif edge_ratio >= 0.60:
+                desired_lat_off *= (0.75 - edge_ratio) / 0.15
+
             max_off = float(self.racing_line_max_frac) * float(corridor)
             if desired_lat_off < -max_off:
                 desired_lat_off = -max_off
@@ -401,15 +415,44 @@ class SteeringAgent:
                 t = 1.0
             desired_speed_dist = self.max_speed * (1.0 - t) + self.min_speed * t
 
-        if bend_factor <= 0.10:
-            turn_scale = 0.0
-        elif bend_factor <= 0.25:
-            turn_scale = 0.55
+        # Physics-based corner speed (approx): v <= sqrt(a_lat_max * R).
+        # Estimate curvature from the change in heading (bend) over an arc-length window.
+        # Use a geometric curvature estimate from three points on the path.
+        # Circumcircle radius for (proj, near_pt, far_pt):
+        #   R = (|AB|*|BC|*|CA|) / (2*|cross(AB, AC)|)
+        # curvature ~ 1/R.
+        ax = float(near_pt[0] - proj[0])
+        ay = float(near_pt[1] - proj[1])
+        cx = float(far_pt[0] - proj[0])
+        cy = float(far_pt[1] - proj[1])
+        bx = float(far_pt[0] - near_pt[0])
+        by = float(far_pt[1] - near_pt[1])
+        ab = math.hypot(ax, ay)
+        bc = math.hypot(bx, by)
+        ca = math.hypot(cx, cy)
+        cross = abs(ax * cy - ay * cx)
+        if cross <= 1e-6 or ab <= 1e-6 or bc <= 1e-6 or ca <= 1e-6:
+            desired_speed_turn = float(self.max_speed)
         else:
-            turn_scale = 0.78
-        desired_speed_turn = self.max_speed * (1.0 - turn_scale * bend_factor)
-        if desired_speed_turn < self.turn_speed:
-            desired_speed_turn = self.turn_speed
+            radius = (ab * bc * ca) / (2.0 * cross)
+            desired_speed_turn = math.sqrt(max(0.0, float(self.lat_accel_max)) * float(radius))
+        if desired_speed_turn > float(self.max_speed):
+            desired_speed_turn = float(self.max_speed)
+        if desired_speed_turn < float(self.turn_speed):
+            desired_speed_turn = float(self.turn_speed)
+
+        # Additional safety: if we're already near the corridor edge, reduce
+        # corner speed further to avoid running wide.
+        if corridor > 1e-6 and abs_off > 0.60 * corridor:
+            edge_ratio = abs_off / corridor
+            t_edge = (edge_ratio - 0.60) / 0.40
+            if t_edge < 0.0:
+                t_edge = 0.0
+            elif t_edge > 1.0:
+                t_edge = 1.0
+            desired_speed_turn *= (1.0 - 0.65 * t_edge)
+            if desired_speed_turn < float(self.min_speed):
+                desired_speed_turn = float(self.min_speed)
 
         desired_speed = desired_speed_dist
         if desired_speed_turn < desired_speed:

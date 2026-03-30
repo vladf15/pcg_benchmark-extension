@@ -83,7 +83,7 @@ class CarPhysicsEngine:
         max_throttle=1.0,
         max_brake=-1.0,
         steering_rate=np.deg2rad(180.0),
-        length=22.0,
+        length=5.0,
         lateral_friction=0.55,
     ):
         self.time_step = time_step

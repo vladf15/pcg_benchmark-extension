@@ -122,3 +122,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+_debug_racing_rollout.py
+
+_debug_turn_test.py
+
+_smoke_overlap_test.py

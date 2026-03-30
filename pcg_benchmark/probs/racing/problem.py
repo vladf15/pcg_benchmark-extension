@@ -11,6 +11,8 @@ from pcg_benchmark.probs.racing.utils import (
     count_track_area_intersections,
 )
 
+PX_PER_M = 5.0
+
 
 class RacingProblem(Problem):
     """Benchmark problem for generating and evaluating 2D racetrack control points."""
@@ -104,9 +106,9 @@ class RacingProblem(Problem):
         # Cached simulation is used for feature computation; early-out if clearly OOB.
         margin = float(self._track_width) * 0.5 + 2.0
         x_min = margin
-        x_max = float(self._width - 1) - margin
+        x_max = float(self._width) - margin
         y_min = margin
-        y_max = float(self._height - 1) - margin
+        y_max = float(self._height) - margin
 
         while not done and steps < max_steps:
             action = self._agent.act(state)
@@ -168,9 +170,9 @@ class RacingProblem(Problem):
         steps = 0
         margin = float(self._track_width) * 0.5 + 2.0
         x_min = margin
-        x_max = float(self._width - 1) - margin
+        x_max = float(self._width) - margin
         y_min = margin
-        y_max = float(self._height - 1) - margin
+        y_max = float(self._height) - margin
 
         while not done and steps < max_steps:
             action = self._agent.act(state)
@@ -211,9 +213,10 @@ class RacingProblem(Problem):
 
     def __init__(self, num_points=None, **kwargs):
         Problem.__init__(self, **kwargs)
-        self._track_width = kwargs.get("track_width", 50)
-        self._width = kwargs.get("width", 800)
-        self._height = kwargs.get("height", 600)
+        # World dimensions are in metres. Rendering uses PX_PER_M.
+        self._track_width = float(kwargs.get("track_width", 16.0))
+        self._width = float(kwargs.get("width", 500.0))
+        self._height = float(kwargs.get("height", 500.0))
         self._default_max_steps = kwargs.get("max_steps", 4000)
         self._skip_render = kwargs.get("skip_render", False)
 
@@ -234,7 +237,7 @@ class RacingProblem(Problem):
         self._final_target = None
 
         if num_points is None:
-            num_points = kwargs.get("num_points", 10)
+            num_points = kwargs.get("num_points", 12)
         self.num_points = num_points
 
         if "track_points" in kwargs:
@@ -256,7 +259,7 @@ class RacingProblem(Problem):
         # Spline parameters (tension/bias/continuity) are intentionally disabled
         # to keep tracks smoother and reduce search dimensionality.
         self._content_space = DictionarySpace({
-            "track_points": ArraySpace((self.num_points, 2), FloatSpace(0, min(self._width, self._height) - 20)),
+            "track_points": ArraySpace((self.num_points, 2), FloatSpace(0, min(self._width, self._height))),
         })
         self._control_space = DictionarySpace({
             "steering": FloatSpace(-1, 1),
@@ -320,7 +323,8 @@ class RacingProblem(Problem):
         if end_xy is None or self._final_target is None:
             return False
         dist = float(np.linalg.norm(np.asarray(end_xy, dtype=float) - np.asarray(self._final_target, dtype=float)))
-        final_threshold = 10.0
+        track_width = float(getattr(self, '_track_width', 12.0))
+        final_threshold = max(2.0, 0.2 * track_width)
 
         # If we're clearly at the goal, finish immediately.
         if dist < final_threshold:
@@ -340,7 +344,7 @@ class RacingProblem(Problem):
         progress_idx = int(self._get_progress_index())
         nseg = max(1, int(len(getattr(self, '_curve_points', [])) - 1))
         if progress_idx >= max(0, nseg - 2):
-            near_threshold = max(18.0, 0.9 * float(getattr(self, '_track_width', 50)))
+            near_threshold = max(18.0, 0.9 * track_width)
             if dist < near_threshold:
                 if not getattr(self, '_closed_loop', False):
                     return True
@@ -639,9 +643,9 @@ class RacingProblem(Problem):
             oob_violation = max(
                 0.0,
                 margin - minx,
-                maxx - (self._width - 1 - margin),
+                maxx - (self._width - margin),
                 margin - miny,
-                maxy - (self._height - 1 - margin),
+                maxy - (self._height - margin),
             )
         # 0 => in bounds, track_width/2 out => strong penalty
         oob_penalty = float(np.exp(-oob_violation / max(1e-6, float(self._track_width) * 0.5)))
@@ -820,17 +824,22 @@ class RacingProblem(Problem):
         )
         curve_np = np.asarray(curve_points, dtype=float)
 
+        scale = float(PX_PER_M)
+        img_w = int(round(float(self._width) * scale))
+        img_h = int(round(float(self._height) * scale))
+        curve_px = curve_np * scale
+
         grass_color = (34, 139, 34)
         edge_color = (10, 10, 10)
         road_color = (215, 215, 215)
         centerline_color = (120, 120, 120)
 
         frames = []
-        car_length = 30
-        car_width = 16
+        car_length = 5.0 * scale
+        car_width = 2.0 * scale
 
-        scaled_curve = [(int(round(x)), int(round(y))) for (x, y) in curve_np]
-        half_width = float(self._track_width) * 0.5
+        scaled_curve = [(int(round(x)), int(round(y))) for (x, y) in curve_px]
+        half_width = float(self._track_width) * scale * 0.5
 
         def _segment_intersection_point(a1, a2, b1, b2):
             ax1, ay1 = a1
@@ -881,11 +890,11 @@ class RacingProblem(Problem):
 
         left_edge_f = []
         right_edge_f = []
-        n = len(curve_np)
+        n = len(curve_px)
         if n >= 2:
             closed_loop = bool(getattr(self, '_closed_loop', False))
-            has_dup_close = closed_loop and n >= 3 and np.allclose(curve_np[0], curve_np[-1], atol=1e-9, rtol=0.0)
-            base = curve_np[:-1] if has_dup_close else curve_np
+            has_dup_close = closed_loop and n >= 3 and np.allclose(curve_px[0], curve_px[-1], atol=1e-9, rtol=0.0)
+            base = curve_px[:-1] if has_dup_close else curve_px
             m = len(base)
             for j in range(m):
                 if closed_loop and m >= 3:
@@ -926,7 +935,7 @@ class RacingProblem(Problem):
 
         track_polygon = left_edge + right_edge[::-1]
 
-        track_background = Image.new("RGB", (self._width, self._height), grass_color)
+        track_background = Image.new("RGB", (img_w, img_h), grass_color)
         bg_draw = ImageDraw.Draw(track_background)
         if len(track_polygon) >= 3:
             bg_draw.polygon(track_polygon, fill=road_color)
@@ -956,7 +965,8 @@ class RacingProblem(Problem):
             img = track_background.copy()
             draw = ImageDraw.Draw(img)
 
-            car_x, car_y = state[0], state[1]
+            car_x = float(state[0]) * scale
+            car_y = float(state[1]) * scale
             angle = state[2] if len(state) > 2 else 0.0
             cos_a = np.cos(angle)
             sin_a = np.sin(angle)
