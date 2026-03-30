@@ -1,57 +1,38 @@
 from .engine import CarPhysicsEngine
-from .agent import SimpleAgent, SteeringAgent
+from .agent import SteeringAgent
 from pcg_benchmark.probs import Problem
-from pcg_benchmark.spaces import ArraySpace, IntegerSpace, FloatSpace, DictionarySpace
+from pcg_benchmark.spaces import ArraySpace, FloatSpace, DictionarySpace
 import numpy as np
-import json
 import time
 from PIL import Image, ImageDraw
-from pcg_benchmark.probs.racing.utils import interpolate_curves, count_self_intersections
-import os
-import itertools
-from functools import wraps
+from pcg_benchmark.probs.racing.utils import (
+    interpolate_curves,
+    count_self_intersections,
+    count_track_area_intersections,
+)
+
 
 class RacingProblem(Problem):
     """Benchmark problem for generating and evaluating 2D racetrack control points."""
 
-    def _profile(func):
-        """Record wall-clock durations for a wrapped method."""
-        @wraps(func)
-        def wrapper(self, *args, **kwargs):
-            start = time.time()
-            result = func(self, *args, **kwargs)
-            elapsed = time.time() - start
-            if not hasattr(self, '_profile_data'):
-                self._profile_data = {}
-            if func.__name__ not in self._profile_data:
-                self._profile_data[func.__name__] = []
-            self._profile_data[func.__name__].append(elapsed)
-            return result
-        return wrapper
-
-    def _get_info_cache_key(self, track_points, tension=None, bias=None):
-        """Create a hashable cache key from points and spline parameters."""
+    def _get_info_cache_key(self, track_points):
+        """Create a hashable cache key from track points."""
         arr = np.asarray(track_points)
         points_key = tuple(map(tuple, arr.reshape(-1, arr.shape[-1])))
-        tension_key = None
-        bias_key = None
-        if tension is not None:
-            tension_arr = np.asarray(tension, dtype=float).reshape(-1)
-            tension_key = tuple(map(float, tension_arr.tolist()))
-        if bias is not None:
-            bias_arr = np.asarray(bias, dtype=float).reshape(-1)
-            bias_key = tuple(map(float, bias_arr.tolist()))
-        return (points_key, tension_key, bias_key)
+        return points_key
 
     def _extract_content(self, content):
-        """Parse content into (track_points, tension, bias)."""
+        """Parse content into (track_points, tension, bias).
+
+        The schema is `track_points` only; spline parameters are ignored.
+        """
         if content is None:
             return self._default_track_points, None, None
         if isinstance(content, dict):
             return (
                 content.get("track_points", self._default_track_points),
-                content.get("tension", None),
-                content.get("bias", None),
+                None,
+                None,
             )
         return content, None, None
 
@@ -64,13 +45,44 @@ class RacingProblem(Problem):
         track_points = np.asarray(track_points, dtype=float)
         if track_points.ndim == 1:
             track_points = track_points.reshape(-1, 2)
+
+        # For closed loops, rotate the seam to a low-curvature vertex.
+        if getattr(self, '_closed_loop', False) and len(track_points) >= 4:
+            pts = track_points
+            n = len(pts)
+            best_i = 0
+            best_angle = float('inf')
+            for i in range(n):
+                p_prev = pts[(i - 1) % n]
+                p = pts[i]
+                p_next = pts[(i + 1) % n]
+                v1 = p - p_prev
+                v2 = p_next - p
+                n1 = float(np.linalg.norm(v1))
+                n2 = float(np.linalg.norm(v2))
+                if n1 < 1e-6 or n2 < 1e-6:
+                    continue
+                d = float(np.dot(v1, v2) / (n1 * n2))
+                d = -1.0 if d < -1.0 else (1.0 if d > 1.0 else d)
+                ang = float(np.arccos(d))  # radians
+                if ang < best_angle:
+                    best_angle = ang
+                    best_i = i
+            if best_i != 0:
+                track_points = np.vstack([pts[best_i:], pts[:best_i]])
         return track_points
 
     def _set_track_cache(self, track_points):
         """Cache normalized track points and final target."""
         track_points = self._normalize_track_points(track_points)
         self._track_points_np = track_points
-        self._final_target = track_points[-1] if len(track_points) > 0 else None
+        if len(track_points) == 0:
+            self._final_target = None
+        elif getattr(self, '_closed_loop', False):
+            # Lap target is the start/finish point.
+            self._final_target = track_points[0]
+        else:
+            self._final_target = track_points[-1]
         return track_points
 
     def _get_cached_simulation_summary(self, track_points, tension=None, bias=None, max_steps=None):
@@ -78,19 +90,18 @@ class RacingProblem(Problem):
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
-        key = (self._get_info_cache_key(track_points, tension=tension, bias=bias), max_steps)
+        # tension/bias are ignored; kept only for API compatibility.
+        key = (self._get_info_cache_key(track_points), max_steps)
         cached = self._simulation_summary_cache.get(key)
         if cached is not None:
             return cached
 
         # Reuse precomputed curve points when available (info() already builds them).
-        state = self.reset(track_points=track_points, tension=tension, bias=bias)
+        state = self.reset(track_points=track_points, tension=None, bias=None)
         self._agent.reset()
         done = False
         steps = 0
-        # Cached simulation is used for feature computation (not for agent training).
-        # Add a conservative early-out if the car goes clearly out-of-bounds to
-        # avoid spending max_steps on hopeless trajectories.
+        # Cached simulation is used for feature computation; early-out if clearly OOB.
         margin = float(self._track_width) * 0.5 + 2.0
         x_min = margin
         x_max = float(self._width - 1) - margin
@@ -109,7 +120,7 @@ class RacingProblem(Problem):
         steps_len = steps + 1
         finished = False
         if end_xy is not None and len(track_points) > 0:
-            finished = (steps_len < max_steps) and (np.linalg.norm(track_points[-1] - end_xy) < 10.0)
+            finished = (steps_len < max_steps) and self._is_finished(end_xy, steps_len=steps_len)
 
         summary = (steps_len, finished, end_xy)
         self._simulation_summary_cache[key] = summary
@@ -121,7 +132,7 @@ class RacingProblem(Problem):
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
         curve_points = np.asarray(curve_points, dtype=float)
-        key = (self._get_info_cache_key(track_points, tension=None, bias=None), max_steps, ('curve', curve_points.shape[0]))
+        key = (self._get_info_cache_key(track_points), max_steps, ('curve', curve_points.shape[0]))
         cached = self._simulation_summary_cache.get(key)
         if cached is not None:
             return cached
@@ -141,11 +152,11 @@ class RacingProblem(Problem):
             self._engine.start_position = np.asarray(self._curve_points[0], dtype=float)
             self._engine.start_angle = start_angle
         if not hasattr(self, '_agent') or self._agent is None:
-            if self._agent_type == "steering":
-                self._agent = SteeringAgent(self._curve_points, track_width=self._track_width,
-                                           enable_wander=self._enable_wander)
-            else:
-                self._agent = SimpleAgent(track_points)
+            self._agent = SteeringAgent(
+                self._curve_points,
+                track_width=self._track_width,
+                enable_wander=self._enable_wander,
+            )
         else:
             self._agent.curve_points = self._curve_points
 
@@ -173,7 +184,7 @@ class RacingProblem(Problem):
         steps_len = steps + 1
         finished = False
         if end_xy is not None and len(track_points) > 0:
-            finished = (steps_len < max_steps) and (np.linalg.norm(track_points[-1] - end_xy) < 10.0)
+            finished = (steps_len < max_steps) and self._is_finished(end_xy, steps_len=steps_len)
 
         summary = (steps_len, finished, end_xy)
         self._simulation_summary_cache[key] = summary
@@ -184,16 +195,13 @@ class RacingProblem(Problem):
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
-        key = (self._get_info_cache_key(track_points, tension=tension, bias=bias), max_steps)
+        # tension/bias are ignored for this problem; they are kept only for API compatibility.
+        key = (self._get_info_cache_key(track_points), max_steps)
         if key in self._trajectory_cache:
             return self._trajectory_cache[key]
-        traj = self.evaluate({"track_points": track_points, "tension": tension, "bias": bias}, max_steps=max_steps)
+        traj = self.evaluate({"track_points": track_points}, max_steps=max_steps)
         self._trajectory_cache[key] = traj
         return traj
-
-    def get_profile_data(self):
-        """Return profiling data collected by `_profile`."""
-        return getattr(self, '_profile_data', {})
 
     def clear_caches(self):
         """Clear cached info and trajectories."""
@@ -207,13 +215,18 @@ class RacingProblem(Problem):
         self._width = kwargs.get("width", 800)
         self._height = kwargs.get("height", 600)
         self._default_max_steps = kwargs.get("max_steps", 4000)
-        self._enable_profiling = kwargs.get("enable_profiling", False)
         self._skip_render = kwargs.get("skip_render", False)
-        
+
+        # Track topology
+        self._closed_loop = bool(kwargs.get("closed_loop", True))
+        # Guard against immediately "finishing" when start==finish.
+        self._lap_finish_min_steps = int(kwargs.get("lap_finish_min_steps", 60))
+        self._lap_finish_min_progress_frac = float(kwargs.get("lap_finish_min_progress_frac", 0.25))
+        self._steps_since_reset = 0
+
         # Agent configuration
-        self._agent_type = kwargs.get("agent_type", "steering")  # "simple" or "steering"
         self._enable_wander = kwargs.get("enable_wander", False)
-        
+
         self._info_cache = {}
         self._trajectory_cache = {}
         self._simulation_summary_cache = {}
@@ -221,7 +234,7 @@ class RacingProblem(Problem):
         self._final_target = None
 
         if num_points is None:
-            num_points = kwargs.get("num_points", 8)
+            num_points = kwargs.get("num_points", 10)
         self.num_points = num_points
 
         if "track_points" in kwargs:
@@ -239,10 +252,11 @@ class RacingProblem(Problem):
 
         self._car_state = np.array([self._default_track_points[0][0], self._default_track_points[0][1], 0.0, 0.0, 0.0])
 
+        # Content schema: track points only.
+        # Spline parameters (tension/bias/continuity) are intentionally disabled
+        # to keep tracks smoother and reduce search dimensionality.
         self._content_space = DictionarySpace({
             "track_points": ArraySpace((self.num_points, 2), FloatSpace(0, min(self._width, self._height) - 20)),
-            "tension": ArraySpace((self.num_points-1,), FloatSpace(-1, 1)),
-            "bias": ArraySpace((self.num_points-1,), FloatSpace(-1, 1)),
         })
         self._control_space = DictionarySpace({
             "steering": FloatSpace(-1, 1),
@@ -252,31 +266,91 @@ class RacingProblem(Problem):
     def reset(self, track_points=None, tension=None, bias=None):
         """Initialize engine/agent state for a new instance."""
         track_points = self._set_track_cache(track_points)
-        if len(track_points) < 2:
-            start_direction = (1.0, 0.0)
+        closed_loop = bool(getattr(self, '_closed_loop', False))
+        self._curve_points = interpolate_curves(
+            track_points,
+            samples_per_segment=10,
+            tension=None,
+            bias=None,
+            closed=closed_loop,
+        )
+
+        # Start pose: derive from the interpolated curve (not control points),
+        # since closed-loop curves may rotate the seam to a smoother location.
+        if len(self._curve_points) < 2:
+            start_angle = 0.0
         else:
-            x0, y0 = track_points[0]
-            x1, y1 = track_points[1]
-            start_direction = (x1 - x0, y1 - y0)
-        start_angle = np.arctan2(start_direction[1], start_direction[0])
-        self._curve_points = interpolate_curves(track_points, samples_per_segment=10, tension=tension, bias=bias)
+            dx = float(self._curve_points[1][0] - self._curve_points[0][0])
+            dy = float(self._curve_points[1][1] - self._curve_points[0][1])
+            start_angle = float(np.arctan2(dy, dx))
+
+        if closed_loop and len(self._curve_points) > 0:
+            self._final_target = np.asarray(self._curve_points[0], dtype=float)
+
+        # Lap-completion guard (prevents instant finish when start==finish).
+        self._steps_since_reset = 0
         if not hasattr(self, '_engine') or self._engine is None:
             self._engine = CarPhysicsEngine(start_position=self._curve_points[0], start_angle=start_angle)
         else:
             self._engine.start_position = np.asarray(self._curve_points[0], dtype=float)
             self._engine.start_angle = start_angle
         if not hasattr(self, '_agent') or self._agent is None:
-            # Create agent based on configured type
-            if self._agent_type == "steering":
-                self._agent = SteeringAgent(self._curve_points, track_width=self._track_width,
-                                           enable_wander=self._enable_wander)
-            else:
-                self._agent = SimpleAgent(track_points)
+            self._agent = SteeringAgent(
+                self._curve_points,
+                track_width=self._track_width,
+                enable_wander=self._enable_wander,
+            )
         else:
             self._agent.curve_points = self._curve_points
         state = self._engine.reset()
         self._car_state = state
         return state
+
+    def _get_progress_index(self) -> int:
+        agent = getattr(self, '_agent', None)
+        if agent is None:
+            return 0
+        if hasattr(agent, 'current_idx'):
+            return int(getattr(agent, 'current_idx') or 0)
+        if hasattr(agent, 'current_segment_idx'):
+            return int(getattr(agent, 'current_segment_idx') or 0)
+        return 0
+
+    def _is_finished(self, end_xy, *, steps_len: int) -> bool:
+        if end_xy is None or self._final_target is None:
+            return False
+        dist = float(np.linalg.norm(np.asarray(end_xy, dtype=float) - np.asarray(self._final_target, dtype=float)))
+        final_threshold = 10.0
+
+        # If we're clearly at the goal, finish immediately.
+        if dist < final_threshold:
+            if not getattr(self, '_closed_loop', False):
+                return True
+            # For circuits, still require some progress so we don't "finish" at t=0.
+            if int(steps_len) < int(getattr(self, '_lap_finish_min_steps', 60)):
+                return False
+            min_progress_frac = float(getattr(self, '_lap_finish_min_progress_frac', 0.25))
+            nseg = max(1, int(len(getattr(self, '_curve_points', [])) - 1))
+            min_progress_idx = int(max(1, min_progress_frac * nseg))
+            return self._get_progress_index() >= min_progress_idx
+
+        # Robust fallback: near the end of the path, some controllers can "miss"
+        # the exact goal point and keep driving. If progress indicates we're on
+        # the last segment(s), accept a larger radius.
+        progress_idx = int(self._get_progress_index())
+        nseg = max(1, int(len(getattr(self, '_curve_points', [])) - 1))
+        if progress_idx >= max(0, nseg - 2):
+            near_threshold = max(18.0, 0.9 * float(getattr(self, '_track_width', 50)))
+            if dist < near_threshold:
+                if not getattr(self, '_closed_loop', False):
+                    return True
+                if int(steps_len) < int(getattr(self, '_lap_finish_min_steps', 60)):
+                    return False
+                min_progress_frac = float(getattr(self, '_lap_finish_min_progress_frac', 0.25))
+                min_progress_idx = int(max(1, min_progress_frac * nseg))
+                return progress_idx >= min_progress_idx
+
+        return False
 
     def step(self, action, track_points=None):
         """Advance the car state by one step and return (state, reward, done, info)."""
@@ -285,25 +359,26 @@ class RacingProblem(Problem):
 
         state = self._engine.step(action)
         self._car_state = state
+        self._steps_since_reset = int(getattr(self, '_steps_since_reset', 0)) + 1
         x, y = state[0], state[1]
         final_target = self._final_target
         if final_target is None:
             dist_to_final = float('inf')
         else:
             dist_to_final = np.hypot(final_target[0] - x, final_target[1] - y)
-        final_threshold = 10.0
-        done = (final_target is not None) and (dist_to_final < final_threshold)
+        # Use robust finish logic for both open and closed tracks.
+        done = self._is_finished(state[:2], steps_len=self._steps_since_reset)
         reward = -dist_to_final
-        info = {"waypoint": getattr(self._agent, "current_curve_idx", None)}
+        info = {"waypoint": self._get_progress_index()}
         return state, reward, done, info
 
     def evaluate(self, content=None, max_steps=None, profile=False):
         """Simulate agent trajectory through the racetrack and return a list of states."""
         if max_steps is None:
             max_steps = self._default_max_steps
-        track_points, tension, bias = self._extract_content(content)
+        track_points, _tension, _bias = self._extract_content(content)
         track_points = self._set_track_cache(track_points)
-        state = self.reset(track_points=track_points, tension=tension, bias=bias)
+        state = self.reset(track_points=track_points, tension=None, bias=None)
         self._agent.reset()
         done = False
         steps = 0
@@ -330,7 +405,7 @@ class RacingProblem(Problem):
 
     def info(self, content, trajectory=None, use_cache=True):
         """Return features for an instance of a track and the agent simulation metrics."""
-        track_points, tension, bias = self._extract_content(content)
+        track_points, _tension, _bias = self._extract_content(content)
         track_points = self._normalize_track_points(track_points)
         
         # Handle degenerate tracks with < 2 points
@@ -349,11 +424,11 @@ class RacingProblem(Problem):
                 'track_points': track_points,
                 'trajectory_end': track_points[0] if len(track_points) > 0 else None,
                 'curve_points': track_points,
-                'tension': None if tension is None else np.asarray(tension, dtype=float),
-                'bias': None if bias is None else np.asarray(bias, dtype=float),
+                'tension': None,
+                'bias': None,
             }
         
-        cache_key = self._get_info_cache_key(track_points, tension=tension, bias=bias)
+        cache_key = self._get_info_cache_key(track_points)
         if use_cache and cache_key in self._info_cache and trajectory is None:
             return self._info_cache[cache_key]
         
@@ -381,18 +456,30 @@ class RacingProblem(Problem):
         avg_turn = np.mean(turn_angles) if turn_angles.size > 0 else 0.0
         max_turn = np.max(turn_angles) if turn_angles.size > 0 else 0.0
         min_turn = np.min(turn_angles) if turn_angles.size > 0 else 0.0
+        closed_loop = bool(getattr(self, '_closed_loop', False))
         if trajectory is None:
-            # Build curve once, then reuse it for both simulation and returned info.
-            curve_points = interpolate_curves(track_points, samples_per_segment=10, tension=tension, bias=bias)
+            curve_points = interpolate_curves(
+                track_points,
+                samples_per_segment=10,
+                tension=None,
+                bias=None,
+                closed=closed_loop,
+            )
             steps, finished, end_xy = self._get_cached_simulation_summary_with_curve(track_points, curve_points)
             trajectory_end = end_xy
         else:
             steps = len(trajectory)
             trajectory_end = trajectory[-1][:2] if len(trajectory) > 0 else None
-            finished = steps < self._default_max_steps and trajectory_end is not None and np.linalg.norm(track_points[-1] - trajectory_end) < 10.0
+            finished = steps < self._default_max_steps and self._is_finished(trajectory_end, steps_len=steps)
 
         if trajectory is not None:
-            curve_points = interpolate_curves(track_points, samples_per_segment=10, tension=tension, bias=bias)
+            curve_points = interpolate_curves(
+                track_points,
+                samples_per_segment=10,
+                tension=None,
+                bias=None,
+                closed=closed_loop,
+            )
 
         info_dict = {
             "num_points": num_points,
@@ -408,8 +495,8 @@ class RacingProblem(Problem):
             "track_points": track_points,
             "trajectory_end": trajectory_end,
             "curve_points": curve_points,
-            "tension": None if tension is None else np.asarray(tension, dtype=float),
-            "bias": None if bias is None else np.asarray(bias, dtype=float),
+            "tension": None,
+            "bias": None,
         }
         if use_cache:
             self._info_cache[cache_key] = info_dict
@@ -417,18 +504,7 @@ class RacingProblem(Problem):
 
 
     def _compute_spatial_clustering_penalty(self, track_points, min_segment_gap=3, threshold_multiplier=1.1):
-        """
-        Penalize control points that are far apart in sequence but close in space.
-        This prevents self-intersecting tracks by discouraging loops and crossovers.
-        
-        Args:
-            track_points: (N, 2) array of control points
-            min_segment_gap: minimum segment separation to check (e.g., 3 means points[i] vs points[i+3:])
-            threshold_multiplier: multiplier for track_width to determine distance threshold
-        
-        Returns:
-            penalty value in [0, 1], where 1.0 = no penalty, 0.0 = severe violations
-        """
+        """Penalty for non-local control points that get too close in space."""
         points = np.asarray(track_points, dtype=float)
         n = len(points)
         
@@ -457,10 +533,7 @@ class RacingProblem(Problem):
         return penalty
 
     def _segment_to_segment_distance(self, p1, p2, p3, p4):
-        """
-        Compute minimum distance between two line segments.
-        Segment 1: p1->p2, Segment 2: p3->p4
-        """
+        """Minimum distance between 2D segments p1-p2 and p3-p4."""
         def point_to_segment_distance(p, a, b):
             """Distance from point p to line segment a->b"""
             ab = b - a
@@ -481,20 +554,9 @@ class RacingProblem(Problem):
         return min(d1, d2)
 
     def _compute_segment_proximity_penalty(self, curve_points, min_distance=None):
-        """
-        Penalize when non-adjacent curve segments come too close.
-        Prevents later track sections from overlapping earlier segments.
-        
-        Args:
-            curve_points: (N, 2) array of interpolated curve points
-            min_distance: minimum required distance between non-adjacent segments
-                         Defaults to 1.5 * track_width
-        
-        Returns:
-            penalty value in [0, 1], where 1.0 = no penalty, 0.0 = severe violations
-        """
+        """Penalty for non-adjacent curve segments getting too close."""
         if min_distance is None:
-            min_distance = self._track_width * 1.5
+            min_distance = self._track_width * 2.0
         
         curve_points = np.asarray(curve_points, dtype=float)
         n = len(curve_points)
@@ -502,13 +564,12 @@ class RacingProblem(Problem):
         if n < 5:
             return 1.0  # Not enough points to form multiple segments
         
-        violations = 0
-        total_severity = 0.0
-        max_violations_to_check = 50  # Early termination after finding many violations
+        # Track the minimum clearance ratio among checked non-local pairs.
+        # 1.0 means all clearances >= min_distance.
+        min_ratio = 1.0
         
-        # Check all non-adjacent segment pairs
+        # Check all non-adjacent segment pairs.
         for i in range(n - 1):
-            # Quick spatial bounds check: skip if segments are obviously far apart
             seg_i_min = np.min(curve_points[i:i+2], axis=0)
             seg_i_max = np.max(curve_points[i:i+2], axis=0)
             
@@ -517,13 +578,12 @@ class RacingProblem(Problem):
                 seg_j_min = np.min(curve_points[j:j+2], axis=0)
                 seg_j_max = np.max(curve_points[j:j+2], axis=0)
                 
-                # Skip if bounding boxes are far apart (quick rejection)
                 bbox_gap = max(
                     max(seg_i_min[0] - seg_j_max[0], seg_j_min[0] - seg_i_max[0]),
                     max(seg_i_min[1] - seg_j_max[1], seg_j_min[1] - seg_i_max[1])
                 )
                 if bbox_gap > min_distance:
-                    continue  # Too far, skip this pair
+                    continue
                 
                 dist = self._segment_to_segment_distance(
                     curve_points[i], curve_points[i + 1],
@@ -531,25 +591,21 @@ class RacingProblem(Problem):
                 )
                 
                 if dist < min_distance:
-                    violations += 1
-                    # Severity: how much it violates the threshold (normalized to [0, 1])
-                    severity = 1.0 - (dist / min_distance)
-                    total_severity += severity
-                    
-                    # Early termination: if we found many violations, stop checking
-                    if violations >= max_violations_to_check:
-                        break
-            
-            if violations >= max_violations_to_check:
+                    ratio = float(dist / (min_distance + 1e-12))
+                    if ratio < min_ratio:
+                        min_ratio = ratio
+
+                        if min_ratio < 0.15:
+                            break
+
+            if min_ratio < 0.15:
                 break
-        
-        if violations == 0:
+
+        if min_ratio >= 1.0:
             return 1.0
-        
-        # Penalize based on average violation severity
-        avg_severity = total_severity / violations
-        penalty = max(0.0, 1.0 - avg_severity * 1.0)
-        return penalty
+
+        penalty = max(0.0, min_ratio) ** 8
+        return float(penalty)
 
     def quality(self, info):
         """Compute a quality score for a track, returning 0.0 for invalid geometry."""
@@ -562,27 +618,48 @@ class RacingProblem(Problem):
         points = np.asarray(track_points, dtype=float)
         curve_points = info.get('curve_points', None)
         if curve_points is None:
-            curve_points = interpolate_curves(points, samples_per_segment=10, tension=info.get('tension', None), bias=info.get('bias', None))
+            curve_points = interpolate_curves(
+                points,
+                samples_per_segment=10,
+                tension=None,
+                bias=None,
+                closed=bool(getattr(self, '_closed_loop', False)),
+            )
         curve_points = np.asarray(curve_points, dtype=float)
 
+        # Soft boundary penalty (splines can overshoot even if control points are inside).
+        # Hard-returning 0.0 here makes evolutionary search collapse to a sea of zeros.
         margin = float(self._track_width) * 0.5 + 2.0
+        oob_violation = 0.0
         if len(curve_points) > 0:
-            if (
-                np.min(curve_points[:, 0]) < margin or
-                np.max(curve_points[:, 0]) > (self._width - 1 - margin) or
-                np.min(curve_points[:, 1]) < margin or
-                np.max(curve_points[:, 1]) > (self._height - 1 - margin)
-            ):
-                return 0.0
+            minx = float(np.min(curve_points[:, 0]))
+            maxx = float(np.max(curve_points[:, 0]))
+            miny = float(np.min(curve_points[:, 1]))
+            maxy = float(np.max(curve_points[:, 1]))
+            oob_violation = max(
+                0.0,
+                margin - minx,
+                maxx - (self._width - 1 - margin),
+                margin - miny,
+                maxy - (self._height - 1 - margin),
+            )
+        # 0 => in bounds, track_width/2 out => strong penalty
+        oob_penalty = float(np.exp(-oob_violation / max(1e-6, float(self._track_width) * 0.5)))
         trajectory_end = info.get('trajectory_end', None)
         if trajectory_end is None:
             trajectory_end = points[-1] if len(points) > 0 else None
         if trajectory_end is None:
             return 0.0
-        final_point = points[-1] if len(points) > 0 else None
-        if final_point is None:
+        # Goal point: open tracks aim for the last control point; circuits aim
+        # to return to the start/finish point on the *curve* (the loop seam can
+        # be rotated for smoothness, so it may not coincide with control point 0).
+        if len(points) == 0:
             return 0.0
-        dist_to_goal = np.linalg.norm(final_point - trajectory_end)
+        if getattr(self, '_closed_loop', False) and len(curve_points) > 0:
+            final_point = curve_points[0]
+        else:
+            final_point = points[-1]
+        dist_to_goal = float(np.linalg.norm(final_point - np.asarray(trajectory_end, dtype=float)))
         control_total_length = np.sum(np.linalg.norm(points[1:] - points[:-1], axis=1)) if len(points) > 1 else 1.0
         curve_total_length = np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1)) if len(curve_points) > 1 else control_total_length
         completion_pct = 1.0 - min(dist_to_goal / (curve_total_length + 1e-6), 1.0)
@@ -643,24 +720,34 @@ class RacingProblem(Problem):
         sharp_turns = np.sum(np.array(turn_angles) > np.deg2rad(50))
         sharp_turn_penalty = 1.0 - min((sharp_turns - 2) / 3.0, 1.0) if sharp_turns > 2 else 1.0
         max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
-        if max_turn > np.deg2rad(120):
-            return 0.0
+        # Soft max-turn penalty (keep a very steep penalty, but not a hard 0).
+        # Hard rejection here also collapses search to all zeros.
+        max_turn_limit = np.deg2rad(120)
+        excess_turn = max(0.0, float(max_turn - max_turn_limit))
+        # Allow some violations early in search, but penalize quickly.
+        turn_penalty = float(np.exp(-excess_turn / max(1e-6, np.deg2rad(12))))
         if max_turn > np.deg2rad(85):
             sharp_turn_penalty *= 0.25
         ideal_variety = np.deg2rad(10)
         variety_score = np.exp(-((curvature_variety - ideal_variety) ** 2) / (2 * (ideal_variety/2) ** 2)) if avg_curvature > 0 else 0.0
 
-        intersections = count_self_intersections(curve_points)
-        if intersections > 0:
-            return 0.0
+        # Geometry validity / overlap checks (steep penalty rather than hard-zero).
+        center_inters = int(count_self_intersections(curve_points, closed=bool(getattr(self, '_closed_loop', False))))
+        area_inters = int(
+            count_track_area_intersections(
+                curve_points,
+                track_width=float(self._track_width),
+                min_cross_index_gap=2,
+                closed=bool(getattr(self, '_closed_loop', False)),
+            )
+        )
 
+        geom_violations = max(0, center_inters) + max(0, area_inters)
+        geom_penalty = float(np.exp(-1.5 * float(min(geom_violations, 50))))
         intersection_score = 1.0
         
-        # Compute spatial clustering penalty to prevent overlapping track geometry
         spatial_clustering_penalty = self._compute_spatial_clustering_penalty(points, min_segment_gap=3, threshold_multiplier=1.1)
-        
-        # Compute segment proximity penalty to prevent later segments from overlapping earlier ones
-        segment_proximity_penalty = self._compute_segment_proximity_penalty(curve_points, min_distance=self._track_width * 3.0)
+        segment_proximity_penalty = self._compute_segment_proximity_penalty(curve_points, min_distance=self._track_width * 2.0)
 
         min_steps = 30 * (len(points) - 1)
         max_steps_for_scoring = 200 * (len(points) - 1)
@@ -684,7 +771,7 @@ class RacingProblem(Problem):
         w_length_score = 0.08
         w_intersection = 0.04
         w_spatial_clustering = 0.01
-        w_segment_proximity = 0.10
+        w_segment_proximity = 0.20
         w_time = 0.01
         quality = (
             w_completion * completion_pct +
@@ -700,7 +787,8 @@ class RacingProblem(Problem):
             w_segment_proximity * segment_proximity_penalty +
             w_time * time_score
         )
-        return quality
+        total_penalty = float(oob_penalty) * float(turn_penalty) * float(geom_penalty)
+        return float(quality) * total_penalty
 
     def diversity(self, info1, info2):
         return 0.0
@@ -715,15 +803,21 @@ class RacingProblem(Problem):
         if skip:
             return []
 
-        track_points, tension, bias = self._extract_content(content)
-        trajectory = self._get_cached_trajectory(track_points, tension=tension, bias=bias)
+        track_points, _tension, _bias = self._extract_content(content)
+        trajectory = self._get_cached_trajectory(track_points, tension=None, bias=None)
 
         if trajectory is not None and len(trajectory) > 0:
             adaptive_sampling = max(1, int(len(trajectory) // 250))
             frame_sampling = max(int(frame_sampling), adaptive_sampling)
 
         track_points_np = self._normalize_track_points(track_points)
-        curve_points = interpolate_curves(track_points_np, samples_per_segment=10, tension=tension, bias=bias)
+        curve_points = interpolate_curves(
+            track_points_np,
+            samples_per_segment=10,
+            tension=None,
+            bias=None,
+            closed=bool(getattr(self, '_closed_loop', False)),
+        )
         curve_np = np.asarray(curve_points, dtype=float)
 
         grass_color = (34, 139, 34)
@@ -789,15 +883,25 @@ class RacingProblem(Problem):
         right_edge_f = []
         n = len(curve_np)
         if n >= 2:
-            for j in range(n):
-                if j == 0:
-                    dir_prev = curve_np[1] - curve_np[0]
+            closed_loop = bool(getattr(self, '_closed_loop', False))
+            has_dup_close = closed_loop and n >= 3 and np.allclose(curve_np[0], curve_np[-1], atol=1e-9, rtol=0.0)
+            base = curve_np[:-1] if has_dup_close else curve_np
+            m = len(base)
+            for j in range(m):
+                if closed_loop and m >= 3:
+                    prev_i = (j - 1) % m
+                    next_i = (j + 1) % m
+                    dir_prev = base[j] - base[prev_i]
+                    dir_next = base[next_i] - base[j]
                 else:
-                    dir_prev = curve_np[j] - curve_np[j - 1]
-                if j == n - 1:
-                    dir_next = curve_np[j] - curve_np[j - 1]
-                else:
-                    dir_next = curve_np[j + 1] - curve_np[j]
+                    if j == 0:
+                        dir_prev = base[1] - base[0]
+                    else:
+                        dir_prev = base[j] - base[j - 1]
+                    if j == m - 1:
+                        dir_next = base[j] - base[j - 1]
+                    else:
+                        dir_next = base[j + 1] - base[j]
 
                 avg_dir = dir_prev + dir_next
                 norm = float(np.linalg.norm(avg_dir))
@@ -806,10 +910,14 @@ class RacingProblem(Problem):
                 else:
                     perp = np.array([-avg_dir[1], avg_dir[0]], dtype=float) / norm
 
-                left = curve_np[j] + perp * half_width
-                right = curve_np[j] - perp * half_width
+                left = base[j] + perp * half_width
+                right = base[j] - perp * half_width
                 left_edge_f.append((float(left[0]), float(left[1])))
                 right_edge_f.append((float(right[0]), float(right[1])))
+
+            if has_dup_close and left_edge_f:
+                left_edge_f.append(left_edge_f[0])
+                right_edge_f.append(right_edge_f[0])
 
             left_edge_f = _trim_self_intersections(left_edge_f)
             right_edge_f = _trim_self_intersections(right_edge_f)
