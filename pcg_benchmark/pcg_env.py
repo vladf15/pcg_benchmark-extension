@@ -296,15 +296,25 @@ class PCGEnv:
     Returns:
         any|any[]: a rendered representaion for each of the input content which can be string, image, video, image sequence, etc.
     """
-    def render(self, contents):
+    def render(self, contents, *args, **kwargs):
         single_input = False
-        if self.content_space.isSampled(contents):
+        # Treat dict as a single content instance (even if schema differs).
+        # This matches the behavior of info()/quality() which avoid iterating dict keys.
+        if isinstance(contents, dict):
             contents = [contents]
             single_input = True
+        elif self.content_space.isSampled(contents):
+            contents = [contents]
+            single_input = True
+        else:
+            is_array = hasattr(contents, "__len__") and not isinstance(contents, dict)
+            if not is_array:
+                contents = [contents]
+                single_input = True
 
         result = []
         for c in contents:
-            result.append(self._problem.render(c))
+            result.append(self._problem.render(c, *args, **kwargs))
         
         if single_input:
             return result[0]

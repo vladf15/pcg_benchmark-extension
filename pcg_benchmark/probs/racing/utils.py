@@ -5,19 +5,11 @@ import numpy as np
 
 
 @functools.lru_cache(maxsize=128)
-def interpolate_curves_cached(points_tuple, samples_per_segment=20, tension_tuple=None, bias_tuple=None, continuity=0.0):
+def interpolate_curves_cached(points_tuple, samples_per_segment=20):
     points = np.array(points_tuple)
     n = len(points)
     if n < 2:
         return points
-    if tension_tuple is None:
-        tension = np.zeros(n)
-    else:
-        tension = np.array(tension_tuple)
-    if bias_tuple is None:
-        bias = np.zeros(n)
-    else:
-        bias = np.array(bias_tuple)
     points = np.vstack([points[0], points, points[-1]])
     dim = points.shape[1]
     total_segments = n - 1
@@ -33,14 +25,12 @@ def interpolate_curves_cached(points_tuple, samples_per_segment=20, tension_tupl
     h4 = t3 - t2
     for i in range(1, n):
         p0, p1, p2, p3 = points[i-1], points[i], points[i+1], points[i+2]
-        seg_tension = tension[i-1] if i-1 < len(tension) else 0.0
-        seg_bias = bias[i-1] if i-1 < len(bias) else 0.0
-        dt1 = ((1-seg_tension)*(1+seg_bias)*(1+continuity))/2
-        dt2 = ((1-seg_tension)*(1-seg_bias)*(1-continuity))/2
-        m1 = dt1*(p1-p0) + dt2*(p2-p1)
-        dt3 = ((1-seg_tension)*(1+seg_bias)*(1-continuity))/2
-        dt4 = ((1-seg_tension)*(1-seg_bias)*(1+continuity))/2
-        m2 = dt3*(p2-p1) + dt4*(p3-p2)
+        # The benchmark uses neutral spline parameters, which reduces to
+        # Catmull-Rom-style tangents:
+        #   m1 = 0.5 * (p2 - p0)
+        #   m2 = 0.5 * (p3 - p1)
+        m1 = 0.5 * (p2 - p0)
+        m2 = 0.5 * (p3 - p1)
         pts = (
             h1[:, None] * p1 +
             h2[:, None] * p2 +
@@ -54,7 +44,7 @@ def interpolate_curves_cached(points_tuple, samples_per_segment=20, tension_tupl
 
 
 @functools.lru_cache(maxsize=128)
-def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20, tension_tuple=None, bias_tuple=None, continuity=0.0):
+def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
     """Closed (periodic) Kochanek-Bartels spline polyline.
 
     Returns an explicitly closed polyline (last point equals first).
@@ -63,15 +53,6 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20, tensi
     n = len(points)
     if n < 2:
         return points
-
-    if tension_tuple is None:
-        tension = np.zeros(n)
-    else:
-        tension = np.array(tension_tuple)
-    if bias_tuple is None:
-        bias = np.zeros(n)
-    else:
-        bias = np.array(bias_tuple)
 
     # Pad for wrap-around tangents.
     pad = np.vstack([points[-1], points, points[0], points[1] if n > 1 else points[0]])
@@ -91,14 +72,9 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20, tensi
 
     for i in range(1, n + 1):
         p0, p1, p2, p3 = pad[i - 1], pad[i], pad[i + 1], pad[i + 2]
-        seg_tension = tension[i - 1] if (i - 1) < len(tension) else 0.0
-        seg_bias = bias[i - 1] if (i - 1) < len(bias) else 0.0
-        dt1 = ((1 - seg_tension) * (1 + seg_bias) * (1 + continuity)) / 2
-        dt2 = ((1 - seg_tension) * (1 - seg_bias) * (1 - continuity)) / 2
-        m1 = dt1 * (p1 - p0) + dt2 * (p2 - p1)
-        dt3 = ((1 - seg_tension) * (1 + seg_bias) * (1 - continuity)) / 2
-        dt4 = ((1 - seg_tension) * (1 - seg_bias) * (1 + continuity)) / 2
-        m2 = dt3 * (p2 - p1) + dt4 * (p3 - p2)
+        # Neutral spline parameters (Catmull-Rom-style tangents).
+        m1 = 0.5 * (p2 - p0)
+        m2 = 0.5 * (p3 - p1)
         pts = (
             h1[:, None] * p1 +
             h2[:, None] * p2 +
@@ -139,12 +115,9 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20, tensi
 
     return curve_points
 
-def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, *, closed: bool = False):
-    """Interpolate control points into a Kochanek-Bartels spline polyline.
 
-    Continuity is locked to 0.0. `tension` and `bias` default to the neutral
-    setting (all zeros) when passed as `None`.
-    """
+def interpolate_curves(points, samples_per_segment=20, *, closed: bool = False):
+    """Interpolate control points into a Kochanek-Bartels spline polyline."""
     pts = np.asarray(points)
     if closed and len(pts) >= 3:
         # If the loop is already explicitly closed (last==first), drop the
@@ -153,11 +126,9 @@ def interpolate_curves(points, samples_per_segment=20, tension=None, bias=None, 
             pts = pts[:-1]
 
     points_tuple = tuple(map(tuple, np.asarray(pts)))
-    tension_tuple = tuple(tension) if tension is not None else None
-    bias_tuple = tuple(bias) if bias is not None else None
     if closed:
-        return interpolate_curves_closed_cached(points_tuple, samples_per_segment, tension_tuple, bias_tuple, continuity=0.0)
-    return interpolate_curves_cached(points_tuple, samples_per_segment, tension_tuple, bias_tuple, continuity=0.0)
+        return interpolate_curves_closed_cached(points_tuple, samples_per_segment)
+    return interpolate_curves_cached(points_tuple, samples_per_segment)
 
 
 @functools.lru_cache(maxsize=128)

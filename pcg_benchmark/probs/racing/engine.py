@@ -12,7 +12,7 @@ class CarPhysicsEngine:
 
     def _build_pacejka_lut(self):
         """Precompute Pacejka (magic formula) coefficients over a fixed grid."""
-        B_lat, C_lat, D_lat, E_lat = 1.6, 1.70, 1.0, 0.97
+        B_lat, C_lat, D_lat, E_lat = 7.0, 1.70, 1.0, 0.97
         B_lon, C_lon, D_lon, E_lon = 1.9, 1.95, 1.0, 0.97
 
         slip_angles = np.linspace(-np.deg2rad(25), np.deg2rad(25), 101)
@@ -78,13 +78,13 @@ class CarPhysicsEngine:
         start_angle=0.0,
         time_step=0.1,
         friction_coef=0.0,
-        max_steering=np.deg2rad(28.0),
+        max_steering=np.deg2rad(30.0),
         max_speed=55.0,
         max_throttle=1.0,
         max_brake=-1.0,
         steering_rate=np.deg2rad(180.0),
         length=5.0,
-        lateral_friction=0.55,
+        lateral_friction=1.2,
     ):
         self.time_step = time_step
         self.friction_coef = friction_coef
@@ -98,7 +98,6 @@ class CarPhysicsEngine:
         self.start_position = np.array(start_position, dtype=float)
         self.start_angle = start_angle
 
-        # Vehicle properties
         self.mass = 1350.0
         self.lf = self.length * 0.55
         self.lr = self.length * 0.45
@@ -107,16 +106,15 @@ class CarPhysicsEngine:
         self.rho_air = 1.225
         self.cd_a = 1.35
 
-        # Forces in Newtons. Throttle is normalized in [-1, 1].
-        self.max_drive_force = 6000.0
-        self.max_brake_force = 12000.0
+        self.max_drive_force = 25000.0
+        self.max_brake_force = 13500.0
 
         self._throttle_state = 0.0
-        self.throttle_slew_rate = 2.2
+        self.throttle_slew_rate = 6.0
 
-        self.tire_mu = 1.55
+        self.tire_mu = 1.45
 
-        self.max_slip_angle = np.deg2rad(25.0)
+        self.max_slip_angle = np.deg2rad(10.0)
         self.max_slip_ratio = 1.0
 
         self.g = 9.81
@@ -148,11 +146,11 @@ class CarPhysicsEngine:
         cos_a0 = math.cos(self.angle)
         sin_a0 = math.sin(self.angle)
         v_forward0 = cos_a0 * self.velocity[0] + sin_a0 * self.velocity[1]
-        v0 = abs(float(v_forward0))
-        max_steer_low = math.radians(80.0)
+        # Use total speed to blend steering lock between low-speed and high-speed limits.
+        v0 = math.hypot(float(self.velocity[0]), float(self.velocity[1]))
+        max_steer_low = math.radians(75.0)
         max_steer_high = float(self.max_steering)
-        # Blend over ~0..14 m/s from low-speed lock to high-speed limit.
-        t_lock = v0 / 14.0
+        t_lock = v0 / 18.0
         if t_lock < 0.0:
             t_lock = 0.0
         elif t_lock > 1.0:
@@ -226,7 +224,7 @@ class CarPhysicsEngine:
             t = 0.0
         elif t > 1.0:
             t = 1.0
-        steering_gain = (1.75 * (1.0 - t)) + (0.45 * t)
+        steering_gain = (1.75 * (1.0 - t)) + (0.70 * t)
         delta = self.steering_angle * steering_gain
 
         vxf = v_forward
@@ -238,6 +236,7 @@ class CarPhysicsEngine:
         vxf_safe = self._sign(vxf) * max(abs(vxf), vx_eps)
         vxr_safe = self._sign(vxr) * max(abs(vxr), vx_eps)
 
+        # Slip angles are measured in each axle frame.
         slip_angle_front = delta - math.atan2(vyf, vxf_safe)
         slip_angle_rear = -math.atan2(vyr, vxr_safe)
 
@@ -289,6 +288,7 @@ class CarPhysicsEngine:
         Fy_f = Fy0_f
         Fy_r = Fy0_r
 
+        # Friction-circle clamp for combined longitudinal and lateral tire force.
         if muFzf > 1e-6:
             mag2 = Fx0_f * Fx0_f + Fy_f * Fy_f
             lim2 = muFzf * muFzf
@@ -304,6 +304,7 @@ class CarPhysicsEngine:
                 Fx0_r *= s
                 Fy_r *= s
 
+        # Rotate front-axle tire forces from wheel frame into body frame.
         c = math.cos(delta)
         s = math.sin(delta)
         Fx_f = Fx0_f * c - Fy_f * s
@@ -339,6 +340,7 @@ class CarPhysicsEngine:
         self.velocity[1] = sin_a * v_forward + cos_a * v_lateral
 
         self.angle += yaw_rate * time_step
+        self.angle = (self.angle + math.pi) % (2.0 * math.pi) - math.pi
 
         self.position += self.velocity * time_step
         return self.get_state()

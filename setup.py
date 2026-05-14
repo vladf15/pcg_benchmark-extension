@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setup(name='pcg_benchmark',
       version='0.1.0',
-      install_requires=['numpy>=1.22', 'pillow'],
+  install_requires=['numpy>=1.22', 'pillow', 'scipy>=1.8'],
       packages=find_packages(),
       package_data={'': ['*', '**']},
       include_package_data=True,

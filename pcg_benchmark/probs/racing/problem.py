@@ -4,7 +4,7 @@ from pcg_benchmark.probs import Problem
 from pcg_benchmark.spaces import ArraySpace, FloatSpace, DictionarySpace
 import numpy as np
 import time
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from pcg_benchmark.probs.racing.utils import (
     interpolate_curves,
     count_self_intersections,
@@ -14,32 +14,32 @@ from pcg_benchmark.probs.racing.utils import (
 PX_PER_M = 5.0
 
 
+
+def _rotated_rect(center_x, center_y, forward, right, half_len, half_wid):
+    fx, fy = forward; rx, ry = right
+    return [
+        (center_x + fx * half_len + rx * half_wid, center_y + fy * half_len + ry * half_wid),
+        (center_x + fx * half_len - rx * half_wid, center_y + fy * half_len - ry * half_wid),
+        (center_x - fx * half_len - rx * half_wid, center_y - fy * half_len - ry * half_wid),
+        (center_x - fx * half_len + rx * half_wid, center_y - fy * half_len + ry * half_wid),
+    ]
+
+
 class RacingProblem(Problem):
     """Benchmark problem for generating and evaluating 2D racetrack control points."""
 
     def _get_info_cache_key(self, track_points):
-        """Create a hashable cache key from track points."""
         arr = np.asarray(track_points)
-        points_key = tuple(map(tuple, arr.reshape(-1, arr.shape[-1])))
-        return points_key
+        return tuple(map(tuple, arr.reshape(-1, 2)))
 
     def _extract_content(self, content):
-        """Parse content into (track_points, tension, bias).
-
-        The schema is `track_points` only; spline parameters are ignored.
-        """
         if content is None:
-            return self._default_track_points, None, None
+            return self._default_track_points
         if isinstance(content, dict):
-            return (
-                content.get("track_points", self._default_track_points),
-                None,
-                None,
-            )
-        return content, None, None
+            return content.get("track_points", self._default_track_points)
+        return content
 
     def _normalize_track_points(self, track_points):
-        """Return an (N,2) float ndarray for track points."""
         if track_points is None:
             track_points = self._default_track_points
         elif isinstance(track_points, dict):
@@ -48,12 +48,12 @@ class RacingProblem(Problem):
         if track_points.ndim == 1:
             track_points = track_points.reshape(-1, 2)
 
-        # For closed loops, rotate the seam to a low-curvature vertex.
-        if getattr(self, '_closed_loop', False) and len(track_points) >= 4:
+        if self._closed_loop and len(track_points) >= 4:
             pts = track_points
             n = len(pts)
             best_i = 0
             best_angle = float('inf')
+            # Rotate seam to the smoothest vertex (smallest local turn angle).
             for i in range(n):
                 p_prev = pts[(i - 1) % n]
                 p = pts[i]
@@ -65,8 +65,8 @@ class RacingProblem(Problem):
                 if n1 < 1e-6 or n2 < 1e-6:
                     continue
                 d = float(np.dot(v1, v2) / (n1 * n2))
-                d = -1.0 if d < -1.0 else (1.0 if d > 1.0 else d)
-                ang = float(np.arccos(d))  # radians
+                d = max(-1.0, min(1.0, d))
+                ang = float(np.arccos(d))
                 if ang < best_angle:
                     best_angle = ang
                     best_i = i
@@ -75,97 +75,78 @@ class RacingProblem(Problem):
         return track_points
 
     def _set_track_cache(self, track_points):
-        """Cache normalized track points and final target."""
         track_points = self._normalize_track_points(track_points)
         self._track_points_np = track_points
         if len(track_points) == 0:
             self._final_target = None
-        elif getattr(self, '_closed_loop', False):
-            # Lap target is the start/finish point.
+        elif self._closed_loop:
             self._final_target = track_points[0]
         else:
             self._final_target = track_points[-1]
         return track_points
 
-    def _get_cached_simulation_summary(self, track_points, tension=None, bias=None, max_steps=None):
-        """Simulate a policy and cache only summary stats."""
+    @staticmethod
+    def _compute_turn_angles(points: np.ndarray) -> np.ndarray:
+        """Return valid interior turn angles (radians) for a polyline."""
+        diffs = points[1:] - points[:-1]
+        if len(diffs) < 2:
+            return np.array([], dtype=float)
+        v1 = diffs[:-1]
+        v2 = diffs[1:]
+        v1_norm = np.linalg.norm(v1, axis=1, keepdims=True)
+        v2_norm = np.linalg.norm(v2, axis=1, keepdims=True)
+        valid = (v1_norm[:, 0] > 1e-3) & (v2_norm[:, 0] > 1e-3)
+        v1_unit = np.zeros_like(v1)
+        v2_unit = np.zeros_like(v2)
+        v1_unit[valid] = v1[valid] / v1_norm[valid]
+        v2_unit[valid] = v2[valid] / v2_norm[valid]
+        dots = np.clip(np.einsum('ij,ij->i', v1_unit, v2_unit), -1.0, 1.0)
+        return np.arccos(dots)[valid]
+
+    def _get_cached_simulation_summary(self, track_points, max_steps=None, *, curve_points=None):
+        """Simulate a policy and cache summary stats.
+
+        If curve_points are provided they are used directly, skipping re-interpolation.
+        """
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
-        # tension/bias are ignored; kept only for API compatibility.
-        key = (self._get_info_cache_key(track_points), max_steps)
+        if curve_points is not None:
+            curve_points = np.asarray(curve_points, dtype=float)
+            key = (self._get_info_cache_key(track_points), max_steps, ('curve', curve_points.shape[0]))
+        else:
+            key = (self._get_info_cache_key(track_points), max_steps)
         cached = self._simulation_summary_cache.get(key)
         if cached is not None:
             return cached
 
-        # Reuse precomputed curve points when available (info() already builds them).
-        state = self.reset(track_points=track_points, tension=None, bias=None)
+        if curve_points is not None:
+            if len(track_points) < 2:
+                start_angle = 0.0
+            else:
+                start_angle = float(np.arctan2(
+                    track_points[1][1] - track_points[0][1],
+                    track_points[1][0] - track_points[0][0],
+                ))
+            self._curve_points = curve_points
+            if not hasattr(self, '_engine') or self._engine is None:
+                self._engine = CarPhysicsEngine(start_position=curve_points[0], start_angle=start_angle)
+            else:
+                self._engine.start_position = np.asarray(curve_points[0], dtype=float)
+                self._engine.start_angle = start_angle
+            if not hasattr(self, '_agent') or self._agent is None:
+                self._agent = SteeringAgent(curve_points, track_width=self._track_width, enable_wander=self._enable_wander)
+            else:
+                self._agent.curve_points = curve_points
+            if self._closed_loop and len(curve_points) > 0:
+                self._final_target = np.asarray(curve_points[0], dtype=float)
+            self._steps_since_reset = 0
+            state = self._engine.reset()
+            self._car_state = state
+        else:
+            state = self.reset(track_points=track_points)
+
         self._agent.reset()
-        done = False
-        steps = 0
-        # Cached simulation is used for feature computation; early-out if clearly OOB.
-        margin = float(self._track_width) * 0.5 + 2.0
-        x_min = margin
-        x_max = float(self._width) - margin
-        y_min = margin
-        y_max = float(self._height) - margin
-
-        while not done and steps < max_steps:
-            action = self._agent.act(state)
-            state, _, done, _ = self.step(action, track_points=None)
-            x, y = float(state[0]), float(state[1])
-            if x < x_min or x > x_max or y < y_min or y > y_max:
-                break
-            steps += 1
-
-        end_xy = state[:2].copy() if state is not None else None
-        steps_len = steps + 1
-        finished = False
-        if end_xy is not None and len(track_points) > 0:
-            finished = (steps_len < max_steps) and self._is_finished(end_xy, steps_len=steps_len)
-
-        summary = (steps_len, finished, end_xy)
-        self._simulation_summary_cache[key] = summary
-        return summary
-
-    def _get_cached_simulation_summary_with_curve(self, track_points, curve_points, max_steps=None):
-        """Simulate a policy using already-interpolated curve_points and cache summary stats."""
-        if max_steps is None:
-            max_steps = self._default_max_steps
-        track_points = self._normalize_track_points(track_points)
-        curve_points = np.asarray(curve_points, dtype=float)
-        key = (self._get_info_cache_key(track_points), max_steps, ('curve', curve_points.shape[0]))
-        cached = self._simulation_summary_cache.get(key)
-        if cached is not None:
-            return cached
-
-        # Manual reset without recomputing interpolation.
-        if len(track_points) < 2:
-            start_angle = 0.0
-        else:
-            x0, y0 = track_points[0]
-            x1, y1 = track_points[1]
-            start_angle = float(np.arctan2(y1 - y0, x1 - x0))
-
-        self._curve_points = curve_points
-        if not hasattr(self, '_engine') or self._engine is None:
-            self._engine = CarPhysicsEngine(start_position=self._curve_points[0], start_angle=start_angle)
-        else:
-            self._engine.start_position = np.asarray(self._curve_points[0], dtype=float)
-            self._engine.start_angle = start_angle
-        if not hasattr(self, '_agent') or self._agent is None:
-            self._agent = SteeringAgent(
-                self._curve_points,
-                track_width=self._track_width,
-                enable_wander=self._enable_wander,
-            )
-        else:
-            self._agent.curve_points = self._curve_points
-
-        state = self._engine.reset()
-        self._car_state = state
-        self._agent.reset()
-
         done = False
         steps = 0
         margin = float(self._track_width) * 0.5 + 2.0
@@ -184,20 +165,20 @@ class RacingProblem(Problem):
 
         end_xy = state[:2].copy() if state is not None else None
         steps_len = steps + 1
-        finished = False
-        if end_xy is not None and len(track_points) > 0:
-            finished = (steps_len < max_steps) and self._is_finished(end_xy, steps_len=steps_len)
-
+        finished = (
+            end_xy is not None
+            and len(track_points) > 0
+            and steps_len < max_steps
+            and self._is_finished(end_xy, steps_len=steps_len)
+        )
         summary = (steps_len, finished, end_xy)
         self._simulation_summary_cache[key] = summary
         return summary
 
-    def _get_cached_trajectory(self, track_points, tension=None, bias=None, max_steps=None):
-        """Roll out a policy and cache the full trajectory."""
+    def _get_cached_trajectory(self, track_points, max_steps=None):
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
-        # tension/bias are ignored for this problem; they are kept only for API compatibility.
         key = (self._get_info_cache_key(track_points), max_steps)
         if key in self._trajectory_cache:
             return self._trajectory_cache[key]
@@ -206,28 +187,24 @@ class RacingProblem(Problem):
         return traj
 
     def clear_caches(self):
-        """Clear cached info and trajectories."""
         self._info_cache = {}
         self._trajectory_cache = {}
         self._simulation_summary_cache = {}
 
     def __init__(self, num_points=None, **kwargs):
         Problem.__init__(self, **kwargs)
-        # World dimensions are in metres. Rendering uses PX_PER_M.
         self._track_width = float(kwargs.get("track_width", 16.0))
         self._width = float(kwargs.get("width", 500.0))
         self._height = float(kwargs.get("height", 500.0))
         self._default_max_steps = kwargs.get("max_steps", 4000)
         self._skip_render = kwargs.get("skip_render", False)
 
-        # Track topology
         self._closed_loop = bool(kwargs.get("closed_loop", True))
-        # Guard against immediately "finishing" when start==finish.
         self._lap_finish_min_steps = int(kwargs.get("lap_finish_min_steps", 60))
         self._lap_finish_min_progress_frac = float(kwargs.get("lap_finish_min_progress_frac", 0.25))
         self._steps_since_reset = 0
+        self._curve_points = []
 
-        # Agent configuration
         self._enable_wander = kwargs.get("enable_wander", False)
 
         self._info_cache = {}
@@ -237,7 +214,7 @@ class RacingProblem(Problem):
         self._final_target = None
 
         if num_points is None:
-            num_points = kwargs.get("num_points", 12)
+            num_points = kwargs.get("num_points", 10)
         self.num_points = num_points
 
         if "track_points" in kwargs:
@@ -255,9 +232,6 @@ class RacingProblem(Problem):
 
         self._car_state = np.array([self._default_track_points[0][0], self._default_track_points[0][1], 0.0, 0.0, 0.0])
 
-        # Content schema: track points only.
-        # Spline parameters (tension/bias/continuity) are intentionally disabled
-        # to keep tracks smoother and reduce search dimensionality.
         self._content_space = DictionarySpace({
             "track_points": ArraySpace((self.num_points, 2), FloatSpace(0, min(self._width, self._height))),
         })
@@ -265,21 +239,15 @@ class RacingProblem(Problem):
             "steering": FloatSpace(-1, 1),
             "throttle": FloatSpace(-1, 1),
         })
-        
-    def reset(self, track_points=None, tension=None, bias=None):
-        """Initialize engine/agent state for a new instance."""
+
+    def reset(self, track_points=None):
         track_points = self._set_track_cache(track_points)
-        closed_loop = bool(getattr(self, '_closed_loop', False))
         self._curve_points = interpolate_curves(
             track_points,
             samples_per_segment=10,
-            tension=None,
-            bias=None,
-            closed=closed_loop,
+            closed=self._closed_loop,
         )
 
-        # Start pose: derive from the interpolated curve (not control points),
-        # since closed-loop curves may rotate the seam to a smoother location.
         if len(self._curve_points) < 2:
             start_angle = 0.0
         else:
@@ -287,10 +255,9 @@ class RacingProblem(Problem):
             dy = float(self._curve_points[1][1] - self._curve_points[0][1])
             start_angle = float(np.arctan2(dy, dx))
 
-        if closed_loop and len(self._curve_points) > 0:
+        if self._closed_loop and len(self._curve_points) > 0:
             self._final_target = np.asarray(self._curve_points[0], dtype=float)
 
-        # Lap-completion guard (prevents instant finish when start==finish).
         self._steps_since_reset = 0
         if not hasattr(self, '_engine') or self._engine is None:
             self._engine = CarPhysicsEngine(start_position=self._curve_points[0], start_angle=start_angle)
@@ -323,66 +290,49 @@ class RacingProblem(Problem):
         if end_xy is None or self._final_target is None:
             return False
         dist = float(np.linalg.norm(np.asarray(end_xy, dtype=float) - np.asarray(self._final_target, dtype=float)))
-        track_width = float(getattr(self, '_track_width', 12.0))
-        final_threshold = max(2.0, 0.2 * track_width)
+        final_threshold = max(2.0, 0.2 * self._track_width)
+        nseg = max(1, len(self._curve_points) - 1)
+        min_progress_idx = int(max(1, self._lap_finish_min_progress_frac * nseg))
 
-        # If we're clearly at the goal, finish immediately.
         if dist < final_threshold:
-            if not getattr(self, '_closed_loop', False):
+            if not self._closed_loop:
                 return True
-            # For circuits, still require some progress so we don't "finish" at t=0.
-            if int(steps_len) < int(getattr(self, '_lap_finish_min_steps', 60)):
-                return False
-            min_progress_frac = float(getattr(self, '_lap_finish_min_progress_frac', 0.25))
-            nseg = max(1, int(len(getattr(self, '_curve_points', [])) - 1))
-            min_progress_idx = int(max(1, min_progress_frac * nseg))
-            return self._get_progress_index() >= min_progress_idx
+            return steps_len >= self._lap_finish_min_steps and self._get_progress_index() >= min_progress_idx
 
-        # Robust fallback: near the end of the path, some controllers can "miss"
-        # the exact goal point and keep driving. If progress indicates we're on
-        # the last segment(s), accept a larger radius.
-        progress_idx = int(self._get_progress_index())
-        nseg = max(1, int(len(getattr(self, '_curve_points', [])) - 1))
+        progress_idx = self._get_progress_index()
         if progress_idx >= max(0, nseg - 2):
-            near_threshold = max(18.0, 0.9 * track_width)
+            near_threshold = max(18.0, 0.9 * self._track_width)
             if dist < near_threshold:
-                if not getattr(self, '_closed_loop', False):
+                if not self._closed_loop:
                     return True
-                if int(steps_len) < int(getattr(self, '_lap_finish_min_steps', 60)):
-                    return False
-                min_progress_frac = float(getattr(self, '_lap_finish_min_progress_frac', 0.25))
-                min_progress_idx = int(max(1, min_progress_frac * nseg))
-                return progress_idx >= min_progress_idx
+                return steps_len >= self._lap_finish_min_steps and progress_idx >= min_progress_idx
 
         return False
 
     def step(self, action, track_points=None):
-        """Advance the car state by one step and return (state, reward, done, info)."""
         if track_points is not None:
             self._set_track_cache(track_points)
 
         state = self._engine.step(action)
         self._car_state = state
-        self._steps_since_reset = int(getattr(self, '_steps_since_reset', 0)) + 1
+        self._steps_since_reset += 1
         x, y = state[0], state[1]
         final_target = self._final_target
         if final_target is None:
             dist_to_final = float('inf')
         else:
             dist_to_final = np.hypot(final_target[0] - x, final_target[1] - y)
-        # Use robust finish logic for both open and closed tracks.
         done = self._is_finished(state[:2], steps_len=self._steps_since_reset)
         reward = -dist_to_final
         info = {"waypoint": self._get_progress_index()}
         return state, reward, done, info
 
     def evaluate(self, content=None, max_steps=None, profile=False):
-        """Simulate agent trajectory through the racetrack and return a list of states."""
         if max_steps is None:
             max_steps = self._default_max_steps
-        track_points, _tension, _bias = self._extract_content(content)
+        track_points = self._extract_content(content)
         track_points = self._set_track_cache(track_points)
-        state = self.reset(track_points=track_points, tension=None, bias=None)
+        state = self.reset(track_points=track_points)
         self._agent.reset()
         done = False
         steps = 0
@@ -408,11 +358,9 @@ class RacingProblem(Problem):
         return trajectory
 
     def info(self, content, trajectory=None, use_cache=True):
-        """Return features for an instance of a track and the agent simulation metrics."""
-        track_points, _tension, _bias = self._extract_content(content)
+        track_points = self._extract_content(content)
         track_points = self._normalize_track_points(track_points)
-        
-        # Handle degenerate tracks with < 2 points
+
         if len(track_points) < 2:
             return {
                 'num_points': self.num_points,
@@ -428,65 +376,35 @@ class RacingProblem(Problem):
                 'track_points': track_points,
                 'trajectory_end': track_points[0] if len(track_points) > 0 else None,
                 'curve_points': track_points,
-                'tension': None,
-                'bias': None,
             }
-        
+
         cache_key = self._get_info_cache_key(track_points)
         if use_cache and cache_key in self._info_cache and trajectory is None:
             return self._info_cache[cache_key]
-        
-        num_points = self.num_points
+
         diffs = track_points[1:] - track_points[:-1]
         segment_lengths = np.linalg.norm(diffs, axis=1)
-        total_length = np.sum(segment_lengths)
-        avg_length = np.mean(segment_lengths)
-        max_length = np.max(segment_lengths)
-        min_length = np.min(segment_lengths)
+        total_length = float(np.sum(segment_lengths))
+        avg_length = float(np.mean(segment_lengths))
+        max_length = float(np.max(segment_lengths))
+        min_length = float(np.min(segment_lengths))
 
-        v1 = diffs[:-1]
-        v2 = diffs[1:]
-        v1_norm = np.linalg.norm(v1, axis=1, keepdims=True)
-        v2_norm = np.linalg.norm(v2, axis=1, keepdims=True)
-        valid = (v1_norm[:, 0] > 1e-3) & (v2_norm[:, 0] > 1e-3)
-        v1_unit = np.zeros_like(v1)
-        v2_unit = np.zeros_like(v2)
-        v1_unit[valid] = v1[valid] / v1_norm[valid]
-        v2_unit[valid] = v2[valid] / v2_norm[valid]
-        dots = np.einsum('ij,ij->i', v1_unit, v2_unit)
-        dots = np.clip(dots, -1.0, 1.0)
-        turn_angles = np.arccos(dots)
-        turn_angles = turn_angles[valid]
-        avg_turn = np.mean(turn_angles) if turn_angles.size > 0 else 0.0
-        max_turn = np.max(turn_angles) if turn_angles.size > 0 else 0.0
-        min_turn = np.min(turn_angles) if turn_angles.size > 0 else 0.0
-        closed_loop = bool(getattr(self, '_closed_loop', False))
+        turn_angles = self._compute_turn_angles(track_points)
+        avg_turn = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
+        max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
+        min_turn = float(np.min(turn_angles)) if turn_angles.size > 0 else 0.0
+
+        curve_points = interpolate_curves(track_points, samples_per_segment=10, closed=self._closed_loop)
         if trajectory is None:
-            curve_points = interpolate_curves(
-                track_points,
-                samples_per_segment=10,
-                tension=None,
-                bias=None,
-                closed=closed_loop,
-            )
-            steps, finished, end_xy = self._get_cached_simulation_summary_with_curve(track_points, curve_points)
+            steps, finished, end_xy = self._get_cached_simulation_summary(track_points, curve_points=curve_points)
             trajectory_end = end_xy
         else:
             steps = len(trajectory)
             trajectory_end = trajectory[-1][:2] if len(trajectory) > 0 else None
             finished = steps < self._default_max_steps and self._is_finished(trajectory_end, steps_len=steps)
 
-        if trajectory is not None:
-            curve_points = interpolate_curves(
-                track_points,
-                samples_per_segment=10,
-                tension=None,
-                bias=None,
-                closed=closed_loop,
-            )
-
         info_dict = {
-            "num_points": num_points,
+            "num_points": self.num_points,
             "total_length": total_length,
             "avg_length": avg_length,
             "max_length": max_length,
@@ -499,106 +417,89 @@ class RacingProblem(Problem):
             "track_points": track_points,
             "trajectory_end": trajectory_end,
             "curve_points": curve_points,
-            "tension": None,
-            "bias": None,
         }
         if use_cache:
             self._info_cache[cache_key] = info_dict
         return info_dict
 
-
     def _compute_spatial_clustering_penalty(self, track_points, min_segment_gap=3, threshold_multiplier=1.1):
-        """Penalty for non-local control points that get too close in space."""
         points = np.asarray(track_points, dtype=float)
         n = len(points)
-        
+
         if n < min_segment_gap + 1:
-            return 1.0  # Not enough points to form violations
-        
+            return 1.0
+
         threshold = self._track_width * threshold_multiplier
         num_violations = 0
         total_violation_severity = 0.0
-        
+
         for i in range(n):
             for j in range(i + min_segment_gap, n):
                 spatial_distance = np.linalg.norm(points[i] - points[j])
                 if spatial_distance < threshold:
                     num_violations += 1
-                    # Severity: how much it violates the threshold (0 to 1)
                     severity = 1.0 - (spatial_distance / threshold)
                     total_violation_severity += severity
-        
+
         if num_violations == 0:
             return 1.0
-        
-        # Penalize based on average violation severity
+
         avg_severity = total_violation_severity / num_violations
-        penalty = max(0.0, 1.0 - avg_severity * 0.8)
-        return penalty
+        return max(0.0, 1.0 - avg_severity * 0.8)
 
     def _segment_to_segment_distance(self, p1, p2, p3, p4):
-        """Minimum distance between 2D segments p1-p2 and p3-p4."""
         def point_to_segment_distance(p, a, b):
-            """Distance from point p to line segment a->b"""
             ab = b - a
             ap = p - a
             ab_sq = np.dot(ab, ab)
             if ab_sq < 1e-12:
                 return np.linalg.norm(ap)
-            t = np.dot(ap, ab) / ab_sq
-            t = np.clip(t, 0.0, 1.0)
-            closest = a + t * ab
-            return np.linalg.norm(p - closest)
-        
-        # Min distance is the minimum of all point-to-segment distances
-        d1 = min(point_to_segment_distance(p1, p3, p4), 
-                 point_to_segment_distance(p2, p3, p4))
-        d2 = min(point_to_segment_distance(p3, p1, p2), 
-                 point_to_segment_distance(p4, p1, p2))
-        return min(d1, d2)
+            t = np.clip(np.dot(ap, ab) / ab_sq, 0.0, 1.0)
+            return np.linalg.norm(p - (a + t * ab))
+
+        return min(
+            point_to_segment_distance(p1, p3, p4),
+            point_to_segment_distance(p2, p3, p4),
+            point_to_segment_distance(p3, p1, p2),
+            point_to_segment_distance(p4, p1, p2),
+        )
 
     def _compute_segment_proximity_penalty(self, curve_points, min_distance=None):
-        """Penalty for non-adjacent curve segments getting too close."""
         if min_distance is None:
             min_distance = self._track_width * 2.0
-        
+
         curve_points = np.asarray(curve_points, dtype=float)
         n = len(curve_points)
-        
+
         if n < 5:
-            return 1.0  # Not enough points to form multiple segments
-        
-        # Track the minimum clearance ratio among checked non-local pairs.
-        # 1.0 means all clearances >= min_distance.
+            return 1.0
+
         min_ratio = 1.0
-        
-        # Check all non-adjacent segment pairs.
+
         for i in range(n - 1):
             seg_i_min = np.min(curve_points[i:i+2], axis=0)
             seg_i_max = np.max(curve_points[i:i+2], axis=0)
-            
-            # Start checking j segments that are at least 3 steps away
+
             for j in range(i + 3, n - 1):
                 seg_j_min = np.min(curve_points[j:j+2], axis=0)
                 seg_j_max = np.max(curve_points[j:j+2], axis=0)
-                
+
                 bbox_gap = max(
                     max(seg_i_min[0] - seg_j_max[0], seg_j_min[0] - seg_i_max[0]),
                     max(seg_i_min[1] - seg_j_max[1], seg_j_min[1] - seg_i_max[1])
                 )
                 if bbox_gap > min_distance:
                     continue
-                
+
                 dist = self._segment_to_segment_distance(
                     curve_points[i], curve_points[i + 1],
                     curve_points[j], curve_points[j + 1]
                 )
-                
+
                 if dist < min_distance:
                     ratio = float(dist / (min_distance + 1e-12))
                     if ratio < min_ratio:
                         min_ratio = ratio
-
                         if min_ratio < 0.15:
                             break
 
@@ -608,89 +509,56 @@ class RacingProblem(Problem):
         if min_ratio >= 1.0:
             return 1.0
 
-        penalty = max(0.0, min_ratio) ** 8
-        return float(penalty)
+        return float(max(0.0, min_ratio) ** 8)
 
     def quality(self, info):
-        """Compute a quality score for a track, returning 0.0 for invalid geometry."""
         track_points = info.get('track_points', None)
         if track_points is None:
             return 0.0
 
-        steps = info.get('steps', 4000)
         finished = info.get('finished', False)
         points = np.asarray(track_points, dtype=float)
         curve_points = info.get('curve_points', None)
         if curve_points is None:
-            curve_points = interpolate_curves(
-                points,
-                samples_per_segment=10,
-                tension=None,
-                bias=None,
-                closed=bool(getattr(self, '_closed_loop', False)),
-            )
+            curve_points = interpolate_curves(points, samples_per_segment=10, closed=self._closed_loop)
         curve_points = np.asarray(curve_points, dtype=float)
 
-        # Soft boundary penalty (splines can overshoot even if control points are inside).
-        # Hard-returning 0.0 here makes evolutionary search collapse to a sea of zeros.
+        if len(points) == 0:
+            return 0.0
+
         margin = float(self._track_width) * 0.5 + 2.0
         oob_violation = 0.0
         if len(curve_points) > 0:
-            minx = float(np.min(curve_points[:, 0]))
-            maxx = float(np.max(curve_points[:, 0]))
-            miny = float(np.min(curve_points[:, 1]))
-            maxy = float(np.max(curve_points[:, 1]))
             oob_violation = max(
                 0.0,
-                margin - minx,
-                maxx - (self._width - margin),
-                margin - miny,
-                maxy - (self._height - margin),
+                margin - float(np.min(curve_points[:, 0])),
+                float(np.max(curve_points[:, 0])) - (self._width - margin),
+                margin - float(np.min(curve_points[:, 1])),
+                float(np.max(curve_points[:, 1])) - (self._height - margin),
             )
-        # 0 => in bounds, track_width/2 out => strong penalty
         oob_penalty = float(np.exp(-oob_violation / max(1e-6, float(self._track_width) * 0.5)))
+
         trajectory_end = info.get('trajectory_end', None)
         if trajectory_end is None:
-            trajectory_end = points[-1] if len(points) > 0 else None
-        if trajectory_end is None:
-            return 0.0
-        # Goal point: open tracks aim for the last control point; circuits aim
-        # to return to the start/finish point on the *curve* (the loop seam can
-        # be rotated for smoothness, so it may not coincide with control point 0).
-        if len(points) == 0:
-            return 0.0
-        if getattr(self, '_closed_loop', False) and len(curve_points) > 0:
+            trajectory_end = points[-1]
+        if self._closed_loop and len(curve_points) > 0:
             final_point = curve_points[0]
         else:
             final_point = points[-1]
         dist_to_goal = float(np.linalg.norm(final_point - np.asarray(trajectory_end, dtype=float)))
-        control_total_length = np.sum(np.linalg.norm(points[1:] - points[:-1], axis=1)) if len(points) > 1 else 1.0
-        curve_total_length = np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1)) if len(curve_points) > 1 else control_total_length
+        curve_total_length = float(np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1))) if len(curve_points) > 1 else 1.0
         completion_pct = 1.0 - min(dist_to_goal / (curve_total_length + 1e-6), 1.0)
         if finished:
             completion_pct = 1.0
 
-        diffs = curve_points[1:] - curve_points[:-1]
-        v1 = diffs[:-1]
-        v2 = diffs[1:]
-        v1_norm = np.linalg.norm(v1, axis=1, keepdims=True)
-        v2_norm = np.linalg.norm(v2, axis=1, keepdims=True)
-        valid = (v1_norm[:, 0] > 1e-3) & (v2_norm[:, 0] > 1e-3)
-        v1_unit = np.zeros_like(v1)
-        v2_unit = np.zeros_like(v2)
-        v1_unit[valid] = v1[valid] / v1_norm[valid]
-        v2_unit[valid] = v2[valid] / v2_norm[valid]
-        dots = np.einsum('ij,ij->i', v1_unit, v2_unit)
-        dots = np.clip(dots, -1.0, 1.0)
-        turn_angles = np.arccos(dots)
-        turn_angles = turn_angles[valid]
-        avg_curvature = np.mean(turn_angles) if turn_angles.size > 0 else 0.0
-        curvature_variety = np.std(turn_angles) if turn_angles.size > 0 else 0.0
+        turn_angles = self._compute_turn_angles(curve_points)
+        avg_curvature = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
+        curvature_variety = float(np.std(turn_angles)) if turn_angles.size > 0 else 0.0
 
         if len(points) > 1:
             control_segment_lengths = np.linalg.norm(points[1:] - points[:-1], axis=1)
-            mean_length = np.mean(control_segment_lengths)
-            std_length = np.std(control_segment_lengths)
+            mean_length = float(np.mean(control_segment_lengths))
+            std_length = float(np.std(control_segment_lengths))
 
             total_length = float(np.sum(control_segment_lengths))
             min_len = 1500.0
@@ -702,7 +570,7 @@ class RacingProblem(Problem):
             else:
                 length_score = 1.0
 
-            variance_penalty = np.exp(-std_length / (mean_length + 1e-6))
+            variance_penalty = float(np.exp(-std_length / (mean_length + 1e-6)))
 
             preferred_min = 180.0
             preferred_max = 520.0
@@ -714,48 +582,38 @@ class RacingProblem(Problem):
             length_score = 0.0
 
         min_curvature = np.deg2rad(8)
-        if avg_curvature < min_curvature:
-            curvature_penalty = (avg_curvature / min_curvature)
-        else:
-            curvature_penalty = 1.0
+        curvature_penalty = (avg_curvature / min_curvature) if avg_curvature < min_curvature else 1.0
 
         ideal_curvature = np.deg2rad(18)
-        curvature_score = np.exp(-((avg_curvature - ideal_curvature) ** 2) / (2 * (ideal_curvature/2) ** 2)) if avg_curvature > 0 else 0.0
-        sharp_turns = np.sum(np.array(turn_angles) > np.deg2rad(50))
+        curvature_score = float(np.exp(-((avg_curvature - ideal_curvature) ** 2) / (2 * (ideal_curvature / 2) ** 2))) if avg_curvature > 0 else 0.0
+
+        sharp_turns = int(np.sum(turn_angles > np.deg2rad(50)))
         sharp_turn_penalty = 1.0 - min((sharp_turns - 2) / 3.0, 1.0) if sharp_turns > 2 else 1.0
         max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
-        # Soft max-turn penalty (keep a very steep penalty, but not a hard 0).
-        # Hard rejection here also collapses search to all zeros.
-        max_turn_limit = np.deg2rad(120)
-        excess_turn = max(0.0, float(max_turn - max_turn_limit))
-        # Allow some violations early in search, but penalize quickly.
+        excess_turn = max(0.0, max_turn - np.deg2rad(120))
         turn_penalty = float(np.exp(-excess_turn / max(1e-6, np.deg2rad(12))))
         if max_turn > np.deg2rad(85):
             sharp_turn_penalty *= 0.25
+
         ideal_variety = np.deg2rad(10)
-        variety_score = np.exp(-((curvature_variety - ideal_variety) ** 2) / (2 * (ideal_variety/2) ** 2)) if avg_curvature > 0 else 0.0
+        variety_score = float(np.exp(-((curvature_variety - ideal_variety) ** 2) / (2 * (ideal_variety / 2) ** 2))) if avg_curvature > 0 else 0.0
 
-        # Geometry validity / overlap checks (steep penalty rather than hard-zero).
-        center_inters = int(count_self_intersections(curve_points, closed=bool(getattr(self, '_closed_loop', False))))
-        area_inters = int(
-            count_track_area_intersections(
-                curve_points,
-                track_width=float(self._track_width),
-                min_cross_index_gap=2,
-                closed=bool(getattr(self, '_closed_loop', False)),
-            )
-        )
-
+        center_inters = int(count_self_intersections(curve_points, closed=self._closed_loop))
+        area_inters = int(count_track_area_intersections(
+            curve_points,
+            track_width=float(self._track_width),
+            min_cross_index_gap=2,
+            closed=self._closed_loop,
+        ))
         geom_violations = max(0, center_inters) + max(0, area_inters)
         geom_penalty = float(np.exp(-1.5 * float(min(geom_violations, 50))))
-        intersection_score = 1.0
-        
+
         spatial_clustering_penalty = self._compute_spatial_clustering_penalty(points, min_segment_gap=3, threshold_multiplier=1.1)
         segment_proximity_penalty = self._compute_segment_proximity_penalty(curve_points, min_distance=self._track_width * 2.0)
 
+        steps = info.get('steps', 0)
         min_steps = 30 * (len(points) - 1)
         max_steps_for_scoring = 200 * (len(points) - 1)
-        steps = info.get('steps', 0)
         if not finished:
             time_score = 0.0
         elif steps < min_steps:
@@ -765,33 +623,20 @@ class RacingProblem(Problem):
         else:
             time_score = 1.0
 
-        w_completion = 0.20
-        w_curvature = 0.12
-        w_variety = 0.04
-        w_curvature_penalty = 0.10
-        w_sharp_turn_penalty = 0.10
-        w_variance_penalty = 0.10
-        w_out_of_range_penalty = 0.10
-        w_length_score = 0.08
-        w_intersection = 0.04
-        w_spatial_clustering = 0.01
-        w_segment_proximity = 0.20
-        w_time = 0.01
         quality = (
-            w_completion * completion_pct +
-            w_curvature * curvature_score +
-            w_variety * variety_score +
-            w_curvature_penalty * curvature_penalty +
-            w_sharp_turn_penalty * sharp_turn_penalty +
-            w_variance_penalty * variance_penalty +
-            w_out_of_range_penalty * out_of_range_penalty +
-            w_length_score * length_score +
-            w_intersection * intersection_score +
-            w_spatial_clustering * spatial_clustering_penalty +
-            w_segment_proximity * segment_proximity_penalty +
-            w_time * time_score
+            0.20 * completion_pct +
+            0.12 * curvature_score +
+            0.04 * variety_score +
+            0.10 * curvature_penalty +
+            0.10 * sharp_turn_penalty +
+            0.10 * variance_penalty +
+            0.10 * out_of_range_penalty +
+            0.08 * length_score +
+            0.01 * spatial_clustering_penalty +
+            0.20 * segment_proximity_penalty +
+            0.01 * time_score
         )
-        total_penalty = float(oob_penalty) * float(turn_penalty) * float(geom_penalty)
+        total_penalty = oob_penalty * turn_penalty * geom_penalty
         return float(quality) * total_penalty
 
     def diversity(self, info1, info2):
@@ -800,31 +645,47 @@ class RacingProblem(Problem):
     def controlability(self, info, control):
         return 1.0
 
-    def render(self, content=None, frame_sampling=5, skip=None):
-        """Return a list of PIL frames displaying the trajectory of the car."""
+    def render(
+        self,
+        content=None,
+        frame_sampling=2,
+        skip=None,
+        *,
+        fast=True,
+        show_hud=True,
+        progress=True,
+        progress_desc=None,
+        render_scale=1.0,
+    ):
         if skip is None:
             skip = self._skip_render
         if skip:
             return []
 
-        track_points, _tension, _bias = self._extract_content(content)
-        trajectory = self._get_cached_trajectory(track_points, tension=None, bias=None)
+        track_points = self._extract_content(content)
+        trajectory = self._get_cached_trajectory(track_points)
 
-        if trajectory is not None and len(trajectory) > 0:
-            adaptive_sampling = max(1, int(len(trajectory) // 250))
-            frame_sampling = max(int(frame_sampling), adaptive_sampling)
+        try:
+            frame_sampling = int(frame_sampling)
+        except Exception:
+            frame_sampling = 5
+        if frame_sampling < 1:
+            frame_sampling = 1
 
         track_points_np = self._normalize_track_points(track_points)
-        curve_points = interpolate_curves(
-            track_points_np,
-            samples_per_segment=10,
-            tension=None,
-            bias=None,
-            closed=bool(getattr(self, '_closed_loop', False)),
+        curve_np = np.asarray(
+            interpolate_curves(track_points_np, samples_per_segment=10, closed=self._closed_loop),
+            dtype=float,
         )
-        curve_np = np.asarray(curve_points, dtype=float)
 
-        scale = float(PX_PER_M)
+        try:
+            render_scale = float(render_scale)
+        except Exception:
+            render_scale = 1.0
+        if render_scale <= 1e-9:
+            render_scale = 1.0
+
+        scale = float(PX_PER_M) * float(render_scale)
         img_w = int(round(float(self._width) * scale))
         img_h = int(round(float(self._height) * scale))
         curve_px = curve_np * scale
@@ -841,83 +702,26 @@ class RacingProblem(Problem):
         scaled_curve = [(int(round(x)), int(round(y))) for (x, y) in curve_px]
         half_width = float(self._track_width) * scale * 0.5
 
-        def _segment_intersection_point(a1, a2, b1, b2):
-            ax1, ay1 = a1
-            ax2, ay2 = a2
-            bx1, by1 = b1
-            bx2, by2 = b2
-            dax = ax2 - ax1
-            day = ay2 - ay1
-            dbx = bx2 - bx1
-            dby = by2 - by1
-            denom = dax * dby - day * dbx
-            if abs(denom) < 1e-12:
-                return None
-            dx = bx1 - ax1
-            dy = by1 - ay1
-            t = (dx * dby - dy * dbx) / denom
-            u = (dx * day - dy * dax) / denom
-            if t <= 1e-9 or t >= 1.0 - 1e-9 or u <= 1e-9 or u >= 1.0 - 1e-9:
-                return None
-            return (ax1 + t * dax, ay1 + t * day)
-
-        def _trim_self_intersections(polyline, max_passes=6):
-            pts = [(float(x), float(y)) for (x, y) in polyline]
-            if len(pts) < 4:
-                return pts
-            for _ in range(max_passes):
-                m = len(pts) - 1
-                found = False
-                for i in range(m - 2):
-                    a1 = pts[i]
-                    a2 = pts[i + 1]
-                    for j in range(i + 2, m):
-                        if j - i <= 1:
-                            continue
-                        b1 = pts[j]
-                        b2 = pts[j + 1]
-                        p = _segment_intersection_point(a1, a2, b1, b2)
-                        if p is None:
-                            continue
-                        pts = pts[: i + 1] + [p] + pts[j + 1 :]
-                        found = True
-                        break
-                    if found:
-                        break
-                if not found:
-                    break
-            return pts
-
         left_edge_f = []
         right_edge_f = []
         n = len(curve_px)
         if n >= 2:
-            closed_loop = bool(getattr(self, '_closed_loop', False))
-            has_dup_close = closed_loop and n >= 3 and np.allclose(curve_px[0], curve_px[-1], atol=1e-9, rtol=0.0)
+            has_dup_close = self._closed_loop and n >= 3 and np.allclose(curve_px[0], curve_px[-1], atol=1e-9, rtol=0.0)
             base = curve_px[:-1] if has_dup_close else curve_px
             m = len(base)
             for j in range(m):
-                if closed_loop and m >= 3:
+                if self._closed_loop and m >= 3:
                     prev_i = (j - 1) % m
                     next_i = (j + 1) % m
                     dir_prev = base[j] - base[prev_i]
                     dir_next = base[next_i] - base[j]
                 else:
-                    if j == 0:
-                        dir_prev = base[1] - base[0]
-                    else:
-                        dir_prev = base[j] - base[j - 1]
-                    if j == m - 1:
-                        dir_next = base[j] - base[j - 1]
-                    else:
-                        dir_next = base[j + 1] - base[j]
+                    dir_prev = base[1] - base[0] if j == 0 else base[j] - base[j - 1]
+                    dir_next = base[j] - base[j - 1] if j == m - 1 else base[j + 1] - base[j]
 
                 avg_dir = dir_prev + dir_next
                 norm = float(np.linalg.norm(avg_dir))
-                if norm == 0.0:
-                    perp = np.array([0.0, 0.0], dtype=float)
-                else:
-                    perp = np.array([-avg_dir[1], avg_dir[0]], dtype=float) / norm
+                perp = np.array([-avg_dir[1], avg_dir[0]], dtype=float) / norm if norm > 0.0 else np.zeros(2)
 
                 left = base[j] + perp * half_width
                 right = base[j] - perp * half_width
@@ -928,41 +732,121 @@ class RacingProblem(Problem):
                 left_edge_f.append(left_edge_f[0])
                 right_edge_f.append(right_edge_f[0])
 
-            left_edge_f = _trim_self_intersections(left_edge_f)
-            right_edge_f = _trim_self_intersections(right_edge_f)
-            left_edge = [(int(round(x)), int(round(y))) for (x, y) in left_edge_f]
-            right_edge = [(int(round(x)), int(round(y))) for (x, y) in right_edge_f]
-
-        track_polygon = left_edge + right_edge[::-1]
-
         track_background = Image.new("RGB", (img_w, img_h), grass_color)
         bg_draw = ImageDraw.Draw(track_background)
-        if len(track_polygon) >= 3:
-            bg_draw.polygon(track_polygon, fill=road_color)
 
-        edge_line_width = 2
+        left_edge  = [(int(round(x)), int(round(y))) for (x, y) in left_edge_f]
+        right_edge = [(int(round(x)), int(round(y))) for (x, y) in right_edge_f]
         if len(left_edge) > 1:
-            bg_draw.line(left_edge, fill=edge_color, width=edge_line_width)
+            bg_draw.line(left_edge, fill=edge_color, width=4)
         if len(right_edge) > 1:
-            bg_draw.line(right_edge, fill=edge_color, width=edge_line_width)
+            bg_draw.line(right_edge, fill=edge_color, width=4)
+
+        for j in range(len(left_edge_f) - 1):
+            lj = (int(round(left_edge_f[j][0])),      int(round(left_edge_f[j][1])))
+            lk = (int(round(left_edge_f[j + 1][0])),  int(round(left_edge_f[j + 1][1])))
+            rj = (int(round(right_edge_f[j][0])),      int(round(right_edge_f[j][1])))
+            rk = (int(round(right_edge_f[j + 1][0])), int(round(right_edge_f[j + 1][1])))
+            bg_draw.polygon([lj, lk, rk, rj], fill=road_color)
 
         if len(scaled_curve) > 1:
             bg_draw.line(scaled_curve, fill=centerline_color, width=2)
 
-        def _rotated_rect(center_x, center_y, forward, right, half_len, half_wid):
-            fx, fy = forward
-            rx, ry = right
-            return [
-                (center_x + fx * half_len + rx * half_wid, center_y + fy * half_len + ry * half_wid),
-                (center_x + fx * half_len - rx * half_wid, center_y + fy * half_len - ry * half_wid),
-                (center_x - fx * half_len - rx * half_wid, center_y - fy * half_len - ry * half_wid),
-                (center_x - fx * half_len + rx * half_wid, center_y - fy * half_len + ry * half_wid),
-            ]
+        agent = None
+        font = None
+        dt = 0.1
+        mass = 1350.0
+        font_size = 24
+        if show_hud:
+            agent = SteeringAgent(
+                curve_np,
+                track_width=float(self._track_width),
+                enable_wander=bool(self._enable_wander),
+            )
+            agent.reset()
 
-        for i, state in enumerate(trajectory):
+            try:
+                dt = float(getattr(getattr(self, '_engine', None), 'time_step', 0.1))
+            except Exception:
+                dt = 0.1
+            if dt <= 1e-9:
+                dt = 0.1
+
+            try:
+                mass = float(getattr(getattr(self, '_engine', None), 'mass', 1350.0))
+            except Exception:
+                mass = 1350.0
+
+            base_font_size = 24
+            font_size = max(10, int(round(float(base_font_size) * float(render_scale))))
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+            except Exception:
+                try:
+                    font = ImageFont.truetype(r"C:\\Windows\\Fonts\\segoeui.ttf", font_size)
+                except Exception:
+                    try:
+                        font = ImageFont.truetype("arial.ttf", font_size)
+                    except Exception:
+                        font = ImageFont.load_default()
+
+        reuse_canvas = bool(fast)
+        img = None
+        prev_bbox = None
+        if reuse_canvas:
+            img = track_background.copy()
+        dirty_pad_px = max(2, int(round(12.0 * float(render_scale))))
+
+        iterator = enumerate(trajectory)
+        if progress:
+            try:
+                from tqdm import tqdm  # type: ignore
+                desc = progress_desc if progress_desc is not None else 'Rendering racing frames'
+                iterator = enumerate(
+                    tqdm(
+                        trajectory,
+                        total=len(trajectory),
+                        desc=str(desc),
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            except Exception:
+                iterator = enumerate(trajectory)
+
+        prev_angle = None
+        for i, state in iterator:
+            angle = state[2] if len(state) > 2 else 0.0
+
+            action = None
+            lookahead = None
+            yaw_rate = 0.0
+            if show_hud and agent is not None:
+                try:
+                    action = agent.act(state)
+                except Exception:
+                    action = {'steering': 0.0, 'throttle': 0.0}
+                lookahead = getattr(agent, 'last_lookahead_point', None)
+
+                if prev_angle is None:
+                    yaw_rate = 0.0
+                else:
+                    da = (float(angle) - float(prev_angle) + np.pi) % (2.0 * np.pi) - np.pi
+                    yaw_rate = float(da / dt)
+                prev_angle = float(angle)
+
             if i % frame_sampling != 0:
                 continue
-            img = track_background.copy()
+
+            if reuse_canvas:
+                if prev_bbox is not None:
+                    try:
+                        img.paste(track_background.crop(prev_bbox), prev_bbox)
+                    except Exception:
+                        pass
+            else:
+                img = track_background.copy()
+
             draw = ImageDraw.Draw(img)
 
             car_x = float(state[0]) * scale
@@ -988,9 +872,11 @@ class RacingProblem(Problem):
                 (car_x - forward[0] * wheel_base + right[0] * wheel_track, car_y - forward[1] * wheel_base + right[1] * wheel_track),
                 (car_x - forward[0] * wheel_base - right[0] * wheel_track, car_y - forward[1] * wheel_base - right[1] * wheel_track),
             ]
+            wheel_pts = []
             for wx, wy in wheel_centers:
                 wheel = _rotated_rect(wx, wy, forward, right, half_wheel_len, half_wheel_wid)
                 draw.polygon(wheel, fill=(25, 25, 25), outline=(0, 0, 0))
+                wheel_pts.extend(wheel)
 
             corners = [
                 (car_x + cos_a * dx - sin_a * dy, car_y + sin_a * dx + cos_a * dy),
@@ -1001,10 +887,85 @@ class RacingProblem(Problem):
             draw.polygon(corners, fill=(255, 0, 0), outline=(0, 0, 0))
             front_x = car_x + cos_a * dx
             front_y = car_y + sin_a * dx
-            draw.line([(car_x, car_y), (front_x, front_y)], fill=(0, 0, 255), width=3)
-            frames.append(img)
+            car_line_w = max(1, int(round(3.0 * float(render_scale))))
+            draw.line([(car_x, car_y), (front_x, front_y)], fill=(0, 0, 255), width=car_line_w)
+
+            bbox_xs = [p[0] for p in corners] + [car_x, front_x]
+            bbox_ys = [p[1] for p in corners] + [car_y, front_y]
+            if wheel_pts:
+                bbox_xs.extend([p[0] for p in wheel_pts])
+                bbox_ys.extend([p[1] for p in wheel_pts])
+
+            if lookahead is not None:
+                try:
+                    la_x = float(lookahead[0]) * scale
+                    la_y = float(lookahead[1]) * scale
+                    rr = max(2, int(round(6.0 * float(render_scale))))
+                    la_w = max(1, int(round(3.0 * float(render_scale))))
+                    la_line_w = max(1, int(round(2.0 * float(render_scale))))
+                    draw.ellipse([(la_x - rr, la_y - rr), (la_x + rr, la_y + rr)], outline=(0, 255, 255), width=la_w)
+                    draw.line([(car_x, car_y), (la_x, la_y)], fill=(0, 200, 200), width=la_line_w)
+                    bbox_xs.extend([la_x - rr, la_x + rr, car_x, la_x])
+                    bbox_ys.extend([la_y - rr, la_y + rr, car_y, la_y])
+                except Exception:
+                    pass
+
+            if show_hud and font is not None:
+                v = float(state[3]) if len(state) > 3 else 0.0
+                steer_angle_deg = float(state[4]) * (180.0 / np.pi) if len(state) > 4 else 0.0
+                steer_cmd = float(action.get('steering', 0.0)) if isinstance(action, dict) else 0.0
+                throttle_cmd = float(action.get('throttle', 0.0)) if isinstance(action, dict) else 0.0
+                a_lat = float(v * yaw_rate)
+                fy = float(mass * a_lat)
+
+                lines = [
+                    f"v: {v:5.1f} m/s  ({v * 3.6:5.0f} km/h)",
+                    f"steer cmd: {steer_cmd:+.2f}   steer ang: {steer_angle_deg:+5.1f} deg",
+                    f"throttle: {throttle_cmd:+.2f}",
+                    f"yaw rate: {yaw_rate:+6.2f} rad/s   a_lat: {a_lat:+6.2f} m/s^2",
+                    f"Fy est: {fy / 1000.0:+7.2f} kN",
+                ]
+
+                pad = max(2, int(round(6.0 * float(render_scale))))
+                x0, y0 = pad, pad
+                line_h = max(1, int(round(float(font_size) * 1.25)))
+                max_w = 0
+                for txt in lines:
+                    w = 0
+                    try:
+                        bbox = draw.textbbox((0, 0), txt, font=font)
+                        w = int(bbox[2] - bbox[0])
+                    except Exception:
+                        try:
+                            w, _h = draw.textsize(txt, font=font)
+                            w = int(w)
+                        except Exception:
+                            w = int(len(txt) * float(font_size) * 0.6)
+                    if w > max_w:
+                        max_w = w
+                box_w = max_w + pad * 2
+                box_h = pad * 2 + line_h * len(lines)
+
+                hud_outline_w = max(1, int(round(1.0 * float(render_scale))))
+                draw.rectangle([(x0, y0), (x0 + box_w, y0 + box_h)], fill=(255, 255, 255), outline=(0, 0, 0), width=hud_outline_w)
+                ty = y0 + pad
+                for txt in lines:
+                    draw.text((x0 + pad, ty), txt, fill=(0, 0, 0), font=font)
+                    ty += line_h
+
+                bbox_xs.extend([x0, x0 + box_w])
+                bbox_ys.extend([y0, y0 + box_h])
+
+            if reuse_canvas:
+                try:
+                    x0 = int(max(0, min(bbox_xs) - dirty_pad_px))
+                    y0 = int(max(0, min(bbox_ys) - dirty_pad_px))
+                    x1 = int(min(img_w, max(bbox_xs) + dirty_pad_px))
+                    y1 = int(min(img_h, max(bbox_ys) + dirty_pad_px))
+                    prev_bbox = (x0, y0, x1, y1)
+                except Exception:
+                    prev_bbox = None
+
+            frames.append(img.copy() if reuse_canvas else img)
 
         return frames
-
-
-
