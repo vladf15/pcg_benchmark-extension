@@ -4,7 +4,7 @@ import numpy as np
 import scipy.spatial
 
 
-def create_voronoi_grid(seed_points, width, height):
+def create_voronoi_grid(seed_points, width, height, voronoi_seed):
     """Build a Voronoi diagram from seed_points and return its finite edges.
 
     Each Voronoi edge is the boundary between two neighbouring cells.
@@ -25,7 +25,7 @@ def create_voronoi_grid(seed_points, width, height):
         voronoi = scipy.spatial.Voronoi(seed_array)
     except scipy.spatial.QhullError:
         #Tiny random jitter to de-align collinear points
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(voronoi_seed)
         jittered = seed_array + rng.normal(scale=1e-6, size=seed_array.shape)
         voronoi = scipy.spatial.Voronoi(jittered)
 
@@ -58,7 +58,37 @@ def create_voronoi_grid(seed_points, width, height):
     return voronoi_vertices, all_edges, all_edge_cell_pairs, cell_neighbours
 
 
-def build_voronoi_cell_graph(num_cells: int, width: float, height: float) -> dict:
+def lloyd_relaxation(cell_sites: np.ndarray, guard_points: np.ndarray, num_iterations: int) -> np.ndarray:
+    """Run Lloyd's Voronoi relaxation on cell_sites, guard points are not affected."""
+    num_cells = len(cell_sites)
+    relaxed_sites = cell_sites.copy()
+
+    for _ in range(num_iterations):
+        voronoi = scipy.spatial.Voronoi(np.vstack([relaxed_sites, guard_points]))
+        new_sites = relaxed_sites.copy()
+        for cell_index in range(num_cells):
+            region_vertex_indices = voronoi.regions[voronoi.point_region[cell_index]]
+            if -1 in region_vertex_indices or len(region_vertex_indices) < 3:
+                continue
+            polygon_vertices = voronoi.vertices[np.asarray(region_vertex_indices)]
+            x_coords, y_coords = polygon_vertices[:, 0], polygon_vertices[:, 1]
+            x_coords_next = np.roll(x_coords, -1)
+            y_coords_next = np.roll(y_coords, -1)
+            shoelace_cross = x_coords * y_coords_next - x_coords_next * y_coords
+            signed_area = 0.5 * shoelace_cross.sum()
+            if abs(signed_area) < 1e-10:
+                new_sites[cell_index] = polygon_vertices.mean(axis=0)
+            else:
+                new_sites[cell_index] = [
+                    ((x_coords + x_coords_next) * shoelace_cross).sum() / (6 * signed_area),
+                    ((y_coords + y_coords_next) * shoelace_cross).sum() / (6 * signed_area),
+                ]
+        relaxed_sites = new_sites
+
+    return relaxed_sites
+
+
+def build_voronoi_cell_graph(num_cells: int, width: float, height: float, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
     """Generate a complete Voronoi grid for racetrack cell selection.
 
     Places num_cells seed points randomly inside the inner 80% of the bounding
@@ -75,8 +105,8 @@ def build_voronoi_cell_graph(num_cells: int, width: float, height: float) -> dic
     """
     W, H = float(width), float(height)
 
-    margin = float(min(W, H)) * 0.20
-    cell_sites = np.random.default_rng().uniform(
+    margin = float(min(W, H)) * 0.025
+    cell_sites = np.random.default_rng(voronoi_seed).uniform(
         low=[margin, margin],
         high=[W - margin, H - margin],
         size=(num_cells, 2),
@@ -95,10 +125,14 @@ def build_voronoi_cell_graph(num_cells: int, width: float, height: float) -> dic
         [W + guard_offset,   H + guard_offset],
     ], dtype=float)
 
+    #optional Lloyd relaxation to avoid extremely small cells
+    cell_sites = lloyd_relaxation(cell_sites, guard_points, lloyd_iterations)
+    
+    
     all_sites = np.vstack([cell_sites, guard_points])
 
     voronoi_vertices, all_edges_full, all_edge_pairs_full, cell_neighbours_all = (
-        create_voronoi_grid(all_sites, W, H)
+        create_voronoi_grid(all_sites, W, H, voronoi_seed)
     )
 
     voronoi_vertices    = np.asarray(voronoi_vertices,    dtype=float)

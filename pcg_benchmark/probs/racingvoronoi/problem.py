@@ -26,11 +26,13 @@ class RacingVoronoiProblem(RacingProblem):
 
         num_cells = int(kwargs.pop('num_cells', 50))
         num_selected = int(kwargs.pop('num_selected_cells', 15))
+        voronoi_seed = int(kwargs.pop('voronoi_seed', 0))
 
         super().__init__(**kwargs)
 
         self._num_cells = num_cells
         self._num_selected_cells = num_selected
+        self._voronoi_seed = voronoi_seed
 
         self._content_space = DictionarySpace({
             "cell_scores": ArraySpace((self._num_cells,), FloatSpace(0.0, 1.0)),
@@ -77,7 +79,7 @@ class RacingVoronoiProblem(RacingProblem):
     def _ensure_fixed_cell_graph(self):
         if self._fixed_cell_sites is not None:
             return
-        graph = build_voronoi_cell_graph(self._num_cells, self._width, self._height)
+        graph = build_voronoi_cell_graph(self._num_cells, self._width, self._height, self._voronoi_seed)
         self._fixed_cell_sites             = graph['cell_sites']
         self._fixed_voronoi_vertices       = graph['voronoi_vertices']
         self._fixed_voronoi_all_edges_full = graph['all_edges_full']
@@ -458,7 +460,7 @@ class RacingVoronoiProblem(RacingProblem):
     # Render
     # ------------------------------------------------------------------
 
-    def render(
+    def _iter_render_frames(
         self,
         content=None,
         frame_sampling=2,
@@ -473,7 +475,7 @@ class RacingVoronoiProblem(RacingProblem):
         if skip is None:
             skip = self._skip_render
         if skip:
-            return []
+            return
 
         track_points = self._extract_content(content)
         trajectory = self._get_cached_trajectory(track_points)
@@ -601,7 +603,6 @@ class RacingVoronoiProblem(RacingProblem):
         img = track_background.copy() if reuse_canvas else None
         prev_bbox = None
         dirty_pad = max(2, int(round(12.0 * render_scale)))
-        frames = []
 
         iterator = enumerate(trajectory)
         if progress:
