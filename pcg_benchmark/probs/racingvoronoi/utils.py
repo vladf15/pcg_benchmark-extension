@@ -4,67 +4,13 @@ import numpy as np
 import scipy.spatial
 
 
-def create_voronoi_grid(seed_points, width, height, voronoi_seed):
-    """Build a Voronoi diagram from seed_points and return its finite edges.
-
-    Each Voronoi edge is the boundary between two neighbouring cells.
-    Semi-infinite edges (one endpoint at infinity) are discarded.
-
-    Returns:
-        voronoi_vertices    (V, 2) float        - coordinates of every finite vertex.
-        all_edges           (E, 2) int          - vertex-index pairs for every finite edge.
-        all_edge_cell_pairs (E, 2) int          - the two cell indices sharing each edge.
-        cell_neighbours     list[list[int]]     - for each cell, sorted neighbour cell indices.
-    """
-    seed_array = np.asarray(seed_points, dtype=float)
-    if seed_array.ndim == 1:
-        seed_array = seed_array.reshape(-1, 2)
-    num_cells = len(seed_array)
-
-    try:
-        voronoi = scipy.spatial.Voronoi(seed_array)
-    except scipy.spatial.QhullError:
-        #Tiny random jitter to de-align collinear points
-        rng = np.random.default_rng(voronoi_seed)
-        jittered = seed_array + rng.normal(scale=1e-6, size=seed_array.shape)
-        voronoi = scipy.spatial.Voronoi(jittered)
-
-    voronoi_vertices = np.asarray(voronoi.vertices, dtype=float)
-
-    #remove duplicates using dict keyed by (lower_idx, higher_idx).
-    edges_dict: dict[tuple[int, int], tuple[int, int]] = {}
-    for (vertex_a_idx, vertex_b_idx), (cell_left, cell_right) in zip(
-        voronoi.ridge_vertices, voronoi.ridge_points
-    ):
-        if vertex_a_idx < 0 or vertex_b_idx < 0:
-            continue
-        edge_key = (min(vertex_a_idx, vertex_b_idx), max(vertex_a_idx, vertex_b_idx))
-        edges_dict[edge_key] = (int(cell_left), int(cell_right))
-
-    sorted_edge_keys = sorted(edges_dict)
-    if sorted_edge_keys:
-        all_edges           = np.array(sorted_edge_keys,                                dtype=int)
-        all_edge_cell_pairs = np.array([edges_dict[k] for k in sorted_edge_keys],       dtype=int)
-    else:
-        all_edges           = np.zeros((0, 2), dtype=int)
-        all_edge_cell_pairs = np.zeros((0, 2), dtype=int)
-
-    neighbour_sets: list[set[int]] = [set() for _ in range(num_cells)]
-    for cell_a, cell_b in all_edge_cell_pairs:
-        neighbour_sets[cell_a].add(cell_b)
-        neighbour_sets[cell_b].add(cell_a)
-    cell_neighbours = [sorted(neighbours) for neighbours in neighbour_sets]
-
-    return voronoi_vertices, all_edges, all_edge_cell_pairs, cell_neighbours
-
-
-def lloyd_relaxation(cell_sites: np.ndarray, guard_points: np.ndarray, num_iterations: int) -> np.ndarray:
-    """Run Lloyd's Voronoi relaxation on cell_sites, guard points are not affected."""
+def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int) -> np.ndarray:
+    """Run Lloyd's Voronoi relaxation. Cells with infinite regions are left in place."""
     num_cells = len(cell_sites)
     relaxed_sites = cell_sites.copy()
 
     for _ in range(num_iterations):
-        voronoi = scipy.spatial.Voronoi(np.vstack([relaxed_sites, guard_points]))
+        voronoi = scipy.spatial.Voronoi(relaxed_sites)
         new_sites = relaxed_sites.copy()
         for cell_index in range(num_cells):
             region_vertex_indices = voronoi.regions[voronoi.point_region[cell_index]]
@@ -88,90 +34,116 @@ def lloyd_relaxation(cell_sites: np.ndarray, guard_points: np.ndarray, num_itera
     return relaxed_sites
 
 
-def build_voronoi_cell_graph(num_cells: int, width: float, height: float, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
-    """Generate a complete Voronoi grid for racetrack cell selection.
+def _ray_bbox_intersect(
+    start: np.ndarray, direction: np.ndarray,
+    xmin: float, xmax: float, ymin: float, ymax: float,
+) -> np.ndarray | None:
+    """Return the first point where a ray from `start` in `direction` crosses the bbox."""
+    x0, y0 = float(start[0]), float(start[1])
+    dx, dy = float(direction[0]), float(direction[1])
+    t_hits: list[float] = []
+    if abs(dx) > 1e-12:
+        for xb in (xmin, xmax):
+            t = (xb - x0) / dx
+            if t > 1e-9 and ymin - 1e-9 <= y0 + t * dy <= ymax + 1e-9:
+                t_hits.append(t)
+    if abs(dy) > 1e-12:
+        for yb in (ymin, ymax):
+            t = (yb - y0) / dy
+            if t > 1e-9 and xmin - 1e-9 <= x0 + t * dx <= xmax + 1e-9:
+                t_hits.append(t)
+    if not t_hits:
+        return None
+    t = min(t_hits)
+    return np.array([x0 + t * dx, y0 + t * dy], dtype=float)
 
-    Places num_cells seed points randomly inside the inner 80% of the bounding
-    box, 8 guard points just outside each edge of the box.  
-    Cells with any edges that go out of bounds are discarded from selection but still rendered.
+
+def build_voronoi_cell_graph(num_cells: int, width: float, height: float, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
+    """Generate a Voronoi grid without guard/boundary points.
+
+    Cells with semi-infinite edges are added to boundary_cells (ineligible for selection).
+    Each semi-infinite edge is clipped to the bounding box and appended to the vertex/edge
+    arrays so the full diagram renders correctly.
 
     Returns a dict with:
-        cell_sites          (N, 2) float     - seed positions of the N cells.
-        voronoi_vertices    (V, 2) float     - all Voronoi vertex positions.
-        all_edges_full      (E, 2) int       - every finite edge incl. guard-cell edges.
-        all_edge_pairs_full (E, 2) int       - cell-index pairs for all_edges_full.
-        cell_neighbours     list[list[int]]  - real-cell neighbour indices per cell.
-        boundary_cells      set[int]         - cells excluded from selection.
+        cell_sites          (N, 2) float
+        voronoi_vertices    (V, 2) float     - finite vertices + clipped ray endpoints.
+        all_edges_full      (E, 2) int
+        all_edge_pairs_full (E, 2) int
+        cell_neighbours     list[list[int]]
+        boundary_cells      set[int]
     """
     W, H = float(width), float(height)
 
-    margin = float(min(W, H)) * 0.025
+    margin = float(min(W, H)) * 0.02
     cell_sites = np.random.default_rng(voronoi_seed).uniform(
         low=[margin, margin],
         high=[W - margin, H - margin],
         size=(num_cells, 2),
     ).astype(float)
 
-    # Guard point creation, small offset to keep most of the geometry in bounds
-    guard_offset = float(min(W, H)) * 0.05
-    guard_points = np.array([
-        [-guard_offset,     -guard_offset    ],
-        [W / 2,             -guard_offset    ],
-        [W + guard_offset,  -guard_offset    ],
-        [-guard_offset,      H / 2           ],
-        [W + guard_offset,   H / 2           ],
-        [-guard_offset,      H + guard_offset],
-        [W / 2,              H + guard_offset],
-        [W + guard_offset,   H + guard_offset],
-    ], dtype=float)
+    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations)
 
-    #optional Lloyd relaxation to avoid extremely small cells
-    cell_sites = lloyd_relaxation(cell_sites, guard_points, lloyd_iterations)
-    
-    
-    all_sites = np.vstack([cell_sites, guard_points])
+    try:
+        voronoi = scipy.spatial.Voronoi(cell_sites) 
+    except scipy.spatial.QhullError:
+        rng = np.random.default_rng(voronoi_seed)
+        cell_sites = cell_sites + rng.normal(scale=1e-6, size=cell_sites.shape)
+        voronoi = scipy.spatial.Voronoi(cell_sites)
 
-    voronoi_vertices, all_edges_full, all_edge_pairs_full, cell_neighbours_all = (
-        create_voronoi_grid(all_sites, W, H, voronoi_seed)
-    )
+    center   = cell_sites.mean(axis=0)
+    vertices = list(np.asarray(voronoi.vertices, dtype=float))
 
-    voronoi_vertices    = np.asarray(voronoi_vertices,    dtype=float)
-    all_edges_full      = np.asarray(all_edges_full,      dtype=int)
-    all_edge_pairs_full = np.asarray(all_edge_pairs_full, dtype=int)
+    edges_dict:     dict[tuple[int, int], tuple[int, int]] = {}
+    boundary_cells: set[int]                               = set()
+    neighbour_sets: list[set[int]]                         = [set() for _ in range(num_cells)]
 
-    cell_neighbours = [
-        [nb for nb in neighbours if nb < num_cells]
-        for neighbours in cell_neighbours_all[:num_cells]
-    ]
+    for (va, vb), (p1, p2) in zip(voronoi.ridge_vertices, voronoi.ridge_points):
+        p1, p2 = int(p1), int(p2)
 
-    # Mark boundary cells (with edges out of bounds) as ineligible for selection.
-    boundary_cells: set[int] = set()
-    for (vert_a_idx, vert_b_idx), (cell_a, cell_b) in zip(all_edges_full, all_edge_pairs_full):
-        cell_a, cell_b = int(cell_a), int(cell_b)
-        is_guard_edge = (cell_a < num_cells) != (cell_b < num_cells)
-        if not is_guard_edge:
-            continue
-        real_cell = cell_a if cell_a < num_cells else cell_b
-        for vert_idx in (int(vert_a_idx), int(vert_b_idx)):
-            x, y = voronoi_vertices[vert_idx]
-            if x < 0.0 or x > W or y < 0.0 or y > H:
-                boundary_cells.add(real_cell)
-                break
+        if va >= 0 and vb >= 0:
+            edges_dict[(min(va, vb), max(va, vb))] = (p1, p2)
+            neighbour_sets[p1].add(p2)
+            neighbour_sets[p2].add(p1)
+        else:
+            boundary_cells.add(p1)
+            boundary_cells.add(p2)
+            finite_v = va if va >= 0 else vb
+            tangent  = cell_sites[p2] - cell_sites[p1]
+            normal   = np.array([-tangent[1], tangent[0]], dtype=float)
+            nlen     = np.linalg.norm(normal)
+            if nlen < 1e-10:
+                continue
+            normal /= nlen
+            if np.dot(normal, (cell_sites[p1] + cell_sites[p2]) * 0.5 - center) < 0:
+                normal = -normal
+            clipped = _ray_bbox_intersect(voronoi.vertices[finite_v], normal, 0.0, W, 0.0, H)
+            if clipped is not None:
+                new_idx = len(vertices)
+                vertices.append(clipped)
+                edges_dict[(finite_v, new_idx)] = (p1, p2)
+
+    voronoi_vertices = np.array(vertices, dtype=float)
+    sorted_keys      = sorted(edges_dict)
+    if sorted_keys:
+        all_edges_full      = np.array(sorted_keys,                          dtype=int)
+        all_edge_pairs_full = np.array([edges_dict[k] for k in sorted_keys], dtype=int)
+    else:
+        all_edges_full      = np.zeros((0, 2), dtype=int)
+        all_edge_pairs_full = np.zeros((0, 2), dtype=int)
 
     return {
         'cell_sites':          cell_sites,
         'voronoi_vertices':    voronoi_vertices,
         'all_edges_full':      all_edges_full,
         'all_edge_pairs_full': all_edge_pairs_full,
-        'cell_neighbours':     cell_neighbours,
+        'cell_neighbours':     [sorted(s) for s in neighbour_sets],
         'boundary_cells':      boundary_cells,
     }
 
 
 def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray) -> list[int] | None:
-    """Find the longest closed loop in a set of Voronoi boundary edges.
-    This is to use the outside boundary in cases where the Voronoi cells form a loop.
-    """
+    """Find the longest closed loop in a set of Voronoi boundary edges."""
     edges = np.asarray(boundary_edges, dtype=int)
     if edges.ndim == 1:
         edges = edges.reshape(-1, 2)
@@ -186,12 +158,12 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
         adjacency.setdefault(vert_a, []).append(vert_b)
         adjacency.setdefault(vert_b, []).append(vert_a)
 
-    voronoi_vertices = np.asarray(voronoi_vertices, dtype=float)
-    visited:          set[int]       = set()
-    best_cycle:       list[int] | None = None
-    longest_perimeter: float          = -1.0
+    voronoi_vertices   = np.asarray(voronoi_vertices, dtype=float)
+    visited:            set[int]        = set()
+    best_cycle:         list[int] | None = None
+    longest_perimeter:  float            = -1.0
 
-    for start_vertex in list(adjacency):
+    for start_vertex in adjacency:
         if start_vertex in visited:
             continue
 
@@ -214,8 +186,8 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
         prev_vertex, current_vertex, cycle = None, first_vertex, []
         for _ in range(len(component) + 2):
             cycle.append(current_vertex)
-            neighbours   = adjacency[current_vertex]
-            next_vertex  = neighbours[0] if prev_vertex is None or neighbours[0] != prev_vertex else neighbours[1]
+            neighbours  = adjacency[current_vertex]
+            next_vertex = neighbours[0] if prev_vertex is None or neighbours[0] != prev_vertex else neighbours[1]
             prev_vertex, current_vertex = current_vertex, int(next_vertex)
             if current_vertex == first_vertex:
                 break
@@ -232,16 +204,50 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
     return best_cycle
 
 
-def remove_spike_vertices(polygon_points: np.ndarray, threshold_deg: float = 168.0) -> np.ndarray:
-    """Remove vertices that cause extreme hairpin turns in a closed polygon.
+def smooth_corners(points: np.ndarray, max_radius: float = 20.0, passes: int = 2) -> np.ndarray:
+    """Angle-adaptive corner cutting with a flat world-unit cap, repeated `passes` times.
 
-    A spike occurs when three consecutive vertices are nearly collinear, forming
-    a turn angle close to 180°.  On a racetrack this looks like a dead-end
-    needle that the car cannot navigate.  Vertices are removed iteratively
-    until no remaining turn exceeds threshold_deg or fewer than four vertices
-    remain.  The threshold cosine is negative (cos(168°) ≈ -0.978), so only
-    very straight-through vertices are removed and genuine corners are kept.
+    cut = min(angle_factor * edge_length, max_radius, 0.45 * edge_length)
+    angle_factor in [0, 0.45]: 0 for straight-through, 0.45 for full hairpin.
     """
+    pts = np.asarray(points, dtype=float)
+    for _ in range(passes):
+        n = len(pts)
+        if n < 3:
+            return pts
+
+        new_pts: list[np.ndarray] = []
+        for i in range(n):
+            prev = pts[(i - 1) % n]
+            curr = pts[i]
+            nxt  = pts[(i + 1) % n]
+
+            v_in,  v_out  = curr - prev, nxt - curr
+            len_in, len_out = float(np.linalg.norm(v_in)), float(np.linalg.norm(v_out))
+            if len_in < 1e-9 or len_out < 1e-9:
+                new_pts.append(curr)
+                continue
+
+            cos_a        = float(np.clip(np.dot(v_in / len_in, v_out / len_out), -1.0, 1.0))
+            angle_factor = 0.45 * float(np.arccos(cos_a)) / np.pi
+
+            if angle_factor < 1e-4:
+                new_pts.append(curr)
+                continue
+
+            cut_in  = min(angle_factor * len_in,  max_radius, len_in  * 0.45)
+            cut_out = min(angle_factor * len_out, max_radius, len_out * 0.45)
+
+            new_pts.append(curr - (v_in  / len_in)  * cut_in)
+            new_pts.append(curr + (v_out / len_out) * cut_out)
+
+        pts = np.array(new_pts, dtype=float)
+
+    return pts
+
+
+def remove_spike_vertices(polygon_points: np.ndarray, threshold_deg: float = 168.0) -> np.ndarray:
+    """Remove vertices forming near-180° hairpin turns from a closed polygon."""
     points = list(np.asarray(polygon_points, dtype=float))
     spike_cos_threshold = np.cos(np.deg2rad(threshold_deg))
 
@@ -253,16 +259,14 @@ def remove_spike_vertices(polygon_points: np.ndarray, threshold_deg: float = 168
         for i in range(n):
             incoming = np.array(points[i],            dtype=float) - np.array(points[(i - 1) % n], dtype=float)
             outgoing = np.array(points[(i + 1) % n], dtype=float) - np.array(points[i],            dtype=float)
-            incoming_len = np.linalg.norm(incoming)
-            outgoing_len = np.linalg.norm(outgoing)
-            if incoming_len < 1e-9 or outgoing_len < 1e-9:
+            in_len, out_len = np.linalg.norm(incoming), np.linalg.norm(outgoing)
+            if in_len < 1e-9 or out_len < 1e-9:
                 spike_indices.append(i)
                 continue
-            cos_angle = float(np.dot(incoming / incoming_len, outgoing / outgoing_len))
-            if cos_angle < spike_cos_threshold:
+            if float(np.dot(incoming / in_len, outgoing / out_len)) < spike_cos_threshold:
                 spike_indices.append(i)
         if spike_indices:
-            for idx in reversed(sorted(set(spike_indices))):
+            for idx in reversed(spike_indices):
                 points.pop(idx)
             changed = True
 

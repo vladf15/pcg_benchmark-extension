@@ -1,7 +1,7 @@
 from .engine import CarPhysicsEngine
 from .agent import SteeringAgent
 from pcg_benchmark.probs import Problem
-from pcg_benchmark.spaces import ArraySpace, FloatSpace, DictionarySpace
+from pcg_benchmark.spaces import ArraySpace, FloatSpace, IntegerSpace, DictionarySpace
 import numpy as np
 import time
 from PIL import Image, ImageDraw, ImageFont
@@ -10,6 +10,7 @@ from pcg_benchmark.probs.racing.utils import (
     count_self_intersections,
     count_track_area_intersections,
 )
+from pcg_benchmark.probs.utils import get_range_reward
 
 PX_PER_M = 5.0
 
@@ -196,6 +197,7 @@ class RacingProblem(Problem):
         self._track_width = float(kwargs.get("track_width", 16.0))
         self._width = float(kwargs.get("width", 500.0))
         self._height = float(kwargs.get("height", 500.0))
+        self._diversity = float(kwargs.get("diversity", 0.4))
         self._default_max_steps = kwargs.get("max_steps", 4000)
         self._skip_render = kwargs.get("skip_render", False)
 
@@ -236,8 +238,8 @@ class RacingProblem(Problem):
             "track_points": ArraySpace((self.num_points, 2), FloatSpace(0, min(self._width, self._height))),
         })
         self._control_space = DictionarySpace({
-            "steering": FloatSpace(-1, 1),
-            "throttle": FloatSpace(-1, 1),
+            "length":    FloatSpace(500.0, self._width * 16.0),
+            "num_turns": IntegerSpace(1, self.num_points * 2),
         })
 
     def reset(self, track_points=None):
@@ -371,6 +373,7 @@ class RacingProblem(Problem):
                 'avg_turn': 0.0,
                 'max_turn': 0.0,
                 'min_turn': 0.0,
+                'num_turns': 0,
                 'steps': 0,
                 'finished': False,
                 'track_points': track_points,
@@ -393,6 +396,7 @@ class RacingProblem(Problem):
         avg_turn = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
         max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
         min_turn = float(np.min(turn_angles)) if turn_angles.size > 0 else 0.0
+        num_turns = int(np.sum(turn_angles > np.deg2rad(20))) if turn_angles.size > 0 else 0
 
         curve_points = interpolate_curves(track_points, samples_per_segment=10, closed=self._closed_loop)
         if trajectory is None:
@@ -412,6 +416,7 @@ class RacingProblem(Problem):
             "avg_turn": avg_turn,
             "max_turn": max_turn,
             "min_turn": min_turn,
+            "num_turns": num_turns,
             "steps": steps,
             "finished": finished,
             "track_points": track_points,
@@ -639,11 +644,65 @@ class RacingProblem(Problem):
         total_penalty = oob_penalty * turn_penalty * geom_penalty
         return float(quality) * total_penalty
 
+    def _track_to_grid(self, curve_points: np.ndarray, grid_size: int = 20) -> np.ndarray:
+        pts = np.asarray(curve_points, dtype=float)
+        if len(pts) == 0:
+            return np.zeros(grid_size * grid_size, dtype=float)
+        xi = np.clip((pts[:, 0] / self._width  * grid_size).astype(int), 0, grid_size - 1)
+        yi = np.clip((pts[:, 1] / self._height * grid_size).astype(int), 0, grid_size - 1)
+        grid = np.zeros((grid_size, grid_size), dtype=float)
+        grid[yi, xi] = 1.0
+        return grid.ravel()
+
     def diversity(self, info1, info2):
-        return 0.0
+        grid_size = 20
+        _cp1 = info1.get('curve_points')
+        _cp2 = info2.get('curve_points')
+        g1 = self._track_to_grid(np.asarray(_cp1 if _cp1 is not None else [], dtype=float), grid_size)
+        g2 = self._track_to_grid(np.asarray(_cp2 if _cp2 is not None else [], dtype=float), grid_size)
+        spatial_frac = float(np.abs(g1 - g2).sum()) / (grid_size * grid_size)
+
+        a1 = float(info1.get('avg_turn', 0.0))
+        a2 = float(info2.get('avg_turn', 0.0))
+        angle_frac = min(abs(a1 - a2) / np.pi, 1.0)
+
+        blended = 0.7 * spatial_frac + 0.3 * angle_frac
+        return get_range_reward(blended, 0, self._diversity, 1.0)
 
     def controlability(self, info, control):
-        return 1.0
+        length_err = self._width * 0.6
+        l_score = get_range_reward(
+            info.get('total_length', 0.0), 0,
+            control['length'] - length_err,
+            control['length'] + length_err,
+            self._width * 16.0,
+        )
+        turns_err = 2
+        t_score = get_range_reward(
+            info.get('num_turns', 0), 0,
+            control['num_turns'] - turns_err,
+            control['num_turns'] + turns_err,
+            self.num_points * 2,
+        )
+        return (l_score + t_score) / 2.0
+
+    def _render_track_bg(self, img_w, img_h, left_edge_f, right_edge_f, scaled_curve,
+                         grass_color, edge_color, road_color, centerline_color):
+        bg      = Image.new("RGB", (img_w, img_h), grass_color)
+        bg_draw = ImageDraw.Draw(bg)
+        left_edge  = [(int(round(x)), int(round(y))) for x, y in left_edge_f]
+        right_edge = [(int(round(x)), int(round(y))) for x, y in right_edge_f]
+        if len(left_edge)  > 1: bg_draw.line(left_edge,  fill=edge_color, width=4)
+        if len(right_edge) > 1: bg_draw.line(right_edge, fill=edge_color, width=4)
+        for j in range(len(left_edge_f) - 1):
+            lj = (int(round(left_edge_f[j][0])),      int(round(left_edge_f[j][1])))
+            lk = (int(round(left_edge_f[j+1][0])),    int(round(left_edge_f[j+1][1])))
+            rj = (int(round(right_edge_f[j][0])),     int(round(right_edge_f[j][1])))
+            rk = (int(round(right_edge_f[j+1][0])),   int(round(right_edge_f[j+1][1])))
+            bg_draw.polygon([lj, lk, rk, rj], fill=road_color)
+        if len(scaled_curve) > 1:
+            bg_draw.line(scaled_curve, fill=centerline_color, width=2)
+        return bg
 
     def render(
         self,
@@ -732,25 +791,10 @@ class RacingProblem(Problem):
                 left_edge_f.append(left_edge_f[0])
                 right_edge_f.append(right_edge_f[0])
 
-        track_background = Image.new("RGB", (img_w, img_h), grass_color)
-        bg_draw = ImageDraw.Draw(track_background)
-
-        left_edge  = [(int(round(x)), int(round(y))) for (x, y) in left_edge_f]
-        right_edge = [(int(round(x)), int(round(y))) for (x, y) in right_edge_f]
-        if len(left_edge) > 1:
-            bg_draw.line(left_edge, fill=edge_color, width=4)
-        if len(right_edge) > 1:
-            bg_draw.line(right_edge, fill=edge_color, width=4)
-
-        for j in range(len(left_edge_f) - 1):
-            lj = (int(round(left_edge_f[j][0])),      int(round(left_edge_f[j][1])))
-            lk = (int(round(left_edge_f[j + 1][0])),  int(round(left_edge_f[j + 1][1])))
-            rj = (int(round(right_edge_f[j][0])),      int(round(right_edge_f[j][1])))
-            rk = (int(round(right_edge_f[j + 1][0])), int(round(right_edge_f[j + 1][1])))
-            bg_draw.polygon([lj, lk, rk, rj], fill=road_color)
-
-        if len(scaled_curve) > 1:
-            bg_draw.line(scaled_curve, fill=centerline_color, width=2)
+        track_background = self._render_track_bg(
+            img_w, img_h, left_edge_f, right_edge_f, scaled_curve,
+            grass_color, edge_color, road_color, centerline_color,
+        )
 
         agent = None
         font = None

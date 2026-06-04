@@ -54,8 +54,11 @@ def sort_chromosomes(chromosomes: list[dict], sort_by: str) -> list[dict]:
     return list(chromosomes)
 
 def infer_problem_type(chromosomes: list[dict]) -> str:
-    if chromosomes and "cell_scores" in (chromosomes[0].get("content") or {}):
+    content = chromosomes[0].get("content") or {} if chromosomes else {}
+    if "cell_scores" in content:
         return "RacingVoronoi"
+    if "bl_rows" in content and "bl_cols" in content:
+        return "RacingTile"
     return "Racing"
 
 def numpy_content(content: dict) -> dict:
@@ -80,6 +83,9 @@ def build_problem(problem_type: str, num_cells: int = 50):
     if problem_type == "RacingVoronoi":
         from pcg_benchmark.probs.racingvoronoi.problem import RacingVoronoiProblem
         return RacingVoronoiProblem(num_cells=num_cells, num_selected_cells=15)
+    if problem_type == "RacingTile":
+        from pcg_benchmark.probs.racingtile.problem import RacingTileProblem
+        return RacingTileProblem()
     from pcg_benchmark.probs.racing.problem import RacingProblem
     return RacingProblem()
 
@@ -93,11 +99,12 @@ def _score_to_color(score: float) -> tuple[int, int, int]:
 
 def _extract_cell_polygons(problem) -> dict[int, np.ndarray]:
     """Return {cell_index: ordered vertex positions} for selectable Voronoi cells (boundary cells excluded)."""
-    vertices      = problem._fixed_voronoi_vertices
-    edges         = problem._fixed_voronoi_all_edges_full
-    pairs         = problem._fixed_voronoi_all_pairs_full
+    vertices      = problem._voronoi_vertices
+    edges         = problem._voronoi_all_edges
+    pairs         = problem._voronoi_all_pairs
     num_cells     = problem._num_cells
-    boundary_skip = getattr(problem, "_fixed_boundary_cells", set()) or set()
+    boundary_skip = getattr(problem, "_ineligible_cells", None) \
+                    or getattr(problem, "_boundary_cells", set()) or set()
     polygons      = {}
     for cell_idx in range(num_cells):
         if cell_idx in boundary_skip:
@@ -202,6 +209,72 @@ class RaceViewer:
         cl = [(int(round(x)), int(round(y))) for x, y in curve_px]
         if len(cl) > 1:
             pygame.draw.lines(surface, (120, 120, 120), False, cl, 2)
+        self._track_surface = surface
+
+    def build_tile_surface(self, types, rotations):
+        """Draw the tile grid as the static track background (for RacingTile problems)."""
+        import math as _m
+        grid_h, grid_w = types.shape
+        surface = pygame.Surface((self._img_w, self._img_h))
+        surface.fill((34, 139, 34))
+        cw = self._img_w / grid_w
+        ch = self._img_h / grid_h
+        ROAD = (210, 210, 210)
+        EDGE = (25,  25,  25)
+        GRASS_C = (34, 139, 34)
+        GRASS, STRAIGHT, CORNER = 0, 1, 2
+
+        for r in range(grid_h):
+            for c in range(grid_w):
+                x0, y0 = c * cw, r * ch
+                t, rot = int(types[r, c]), int(rotations[r, c])
+                pygame.draw.rect(surface, GRASS_C, (int(x0), int(y0), int(cw) + 1, int(ch) + 1))
+                if t == GRASS:
+                    continue
+                rw, rh = cw * 0.5, ch * 0.5
+                if t == STRAIGHT:
+                    if rot in (0, 2):
+                        ry = int(y0 + (ch - rh) / 2)
+                        pygame.draw.rect(surface, ROAD, (int(x0), ry, int(cw), int(rh)))
+                        pygame.draw.line(surface, EDGE, (int(x0), ry),         (int(x0+cw), ry),         2)
+                        pygame.draw.line(surface, EDGE, (int(x0), ry+int(rh)), (int(x0+cw), ry+int(rh)), 2)
+                    else:
+                        rx = int(x0 + (cw - rw) / 2)
+                        pygame.draw.rect(surface, ROAD, (rx, int(y0), int(rw), int(ch)))
+                        pygame.draw.line(surface, EDGE, (rx,         int(y0)), (rx,         int(y0+ch)), 2)
+                        pygame.draw.line(surface, EDGE, (rx+int(rw), int(y0)), (rx+int(rw), int(y0+ch)), 2)
+                else:
+                    _C = {0: (x0+cw, y0,    90,  180),
+                          1: (x0+cw, y0+ch, 180, 270),
+                          2: (x0,    y0+ch, 270, 360),
+                          3: (x0,    y0,    0,   90)}
+                    cx, cy, s, e = _C[rot]
+                    r_in, r_out, steps = cw / 4, cw * 3 / 4, 24
+                    pts = []
+                    for i in range(steps + 1):
+                        a = _m.radians(s + (e - s) * i / steps)
+                        pts.append((int(cx + r_out * _m.cos(a)), int(cy + r_out * _m.sin(a))))
+                    for i in range(steps + 1):
+                        a = _m.radians(e - (e - s) * i / steps)
+                        pts.append((int(cx + r_in * _m.cos(a)), int(cy + r_in * _m.sin(a))))
+                    if len(pts) >= 3:
+                        pygame.draw.polygon(surface, ROAD, pts)
+                    for ar in (r_in, r_out):
+                        prev = None
+                        for i in range(steps + 1):
+                            a  = _m.radians(s + (e - s) * i / steps)
+                            pt = (int(cx + ar * _m.cos(a)), int(cy + ar * _m.sin(a)))
+                            if prev:
+                                pygame.draw.line(surface, EDGE, prev, pt, 2)
+                            prev = pt
+
+        for i in range(grid_h + 1):
+            y = int(i * ch)
+            pygame.draw.line(surface, (20, 100, 20), (0, y), (self._img_w, y), 1)
+        for j in range(grid_w + 1):
+            x = int(j * cw)
+            pygame.draw.line(surface, (20, 100, 20), (x, 0), (x, self._img_h), 1)
+
         self._track_surface = surface
 
     def draw_frame(self, state, action=None, lookahead=None, yaw_rate=0.0, mass=1350.0):
@@ -349,6 +422,7 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         return chrom_cache[idx]
 
     is_voronoi = problem_type == "RacingVoronoi"
+    is_tile    = problem_type == "RacingTile"
     num_cells  = 50
     if is_voronoi:
         seed = get_iter_chroms(start_iter)
@@ -359,9 +433,10 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
 
     problem = build_problem(problem_type, num_cells=num_cells)
     if is_voronoi:
-        problem._ensure_fixed_cell_graph()
-    cell_polygons = _extract_cell_polygons(problem) if is_voronoi else None
-    color_cells   = config.get("color_cells", False)
+        problem._build_cell_graph()
+    cell_polygons    = _extract_cell_polygons(problem) if is_voronoi else None
+    show_structure   = config.get("show_structure", False)
+    current_content  = None
 
     scale   = _TARGET_WINDOW_PX / max(problem._width, problem._height)
     viewer  = RaceViewer(problem._width, problem._height, scale=scale,
@@ -380,22 +455,32 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
     dt        = 0.1
 
     def load_track():
-        content      = numpy_content(get_iter_chroms(iter_index)[chrom_index]["content"])
-        track_points = problem._extract_content(content)
+        nonlocal current_content
+        current_content = numpy_content(get_iter_chroms(iter_index)[chrom_index]["content"])
+        track_points    = problem._extract_content(current_content)
         problem.reset(track_points)
 
     def rebuild_surface():
+        if is_tile and show_structure and current_content is not None:
+            if hasattr(problem, "_decode_genome") and "bl_rows" in current_content:
+                types, rotations = problem._decode_genome(
+                    np.asarray(current_content["bl_rows"],  dtype=int),
+                    np.asarray(current_content["bl_cols"],  dtype=int),
+                    np.asarray(current_content["bl_tiles"], dtype=int),
+                )
+                viewer.build_tile_surface(types, rotations)
+            return
         scores = None
-        if color_cells and cell_polygons is not None:
+        if show_structure and cell_polygons is not None:
             raw = (get_iter_chroms(iter_index)[chrom_index].get("content") or {}).get("cell_scores")
             if raw is not None:
                 scores = np.asarray(raw, dtype=float)
         viewer.build_track_surface(
             problem._curve_points, problem._track_width,
             closed_loop=problem._closed_loop,
-            voronoi_edges=getattr(problem, "_fixed_voronoi_all_edges_full", None) if is_voronoi else None,
-            voronoi_vertices=getattr(problem, "_fixed_voronoi_vertices", None)    if is_voronoi else None,
-            cell_polygons=cell_polygons if color_cells else None,
+            voronoi_edges=getattr(problem, "_voronoi_all_edges", None) if is_voronoi else None,
+            voronoi_vertices=getattr(problem, "_voronoi_vertices", None) if is_voronoi else None,
+            cell_polygons=cell_polygons if show_structure else None,
             cell_scores=scores,
         )
 
@@ -468,8 +553,8 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
                 elif cmd["cmd"] == "next":        switch_to(iter_index + 1, 0)
                 elif cmd["cmd"] == "prev":        switch_to(iter_index - 1, 0)
                 elif cmd["cmd"] == "restart":     switch_to(iter_index, chrom_index)
-                elif cmd["cmd"] == "color_cells":
-                    color_cells = cmd["value"]
+                elif cmd["cmd"] == "show_structure":
+                    show_structure = cmd["value"]
                     if len(problem._curve_points) >= 2: rebuild_surface()
         except Empty:
             pass
@@ -597,15 +682,15 @@ class ConfigWindow:
                                       variable=self._speed_var,
                                       command=lambda _: self._on_speed_changed())
         self._field(parent, "Speed", speed_slider, self._speed_label)
-        ttk.Label(parent, text="Speed, HUD and cell colours update live without restarting",
+        ttk.Label(parent, text="Speed, HUD and structure toggle update live without restarting",
                   foreground="gray", font=("", 8)).grid(row=self._row, column=0, columnspan=3, sticky="w")
         self._row += 1
         self._hud_var = tk.BooleanVar(value=d.get("show_hud", True))
         self._hud_var.trace_add("write", lambda *_: self._on_hud_changed())
         self._field(parent, "Show HUD", ttk.Checkbutton(parent, variable=self._hud_var))
-        self._color_cells_var = tk.BooleanVar(value=d.get("color_cells", False))
-        self._color_cells_var.trace_add("write", lambda *_: self._on_color_cells_changed())
-        self._field(parent, "Colour cells", ttk.Checkbutton(parent, variable=self._color_cells_var))
+        self._show_structure_var = tk.BooleanVar(value=d.get("show_structure", False))
+        self._show_structure_var.trace_add("write", lambda *_: self._on_show_structure_changed())
+        self._field(parent, "Show structure", ttk.Checkbutton(parent, variable=self._show_structure_var))
         self._loop_var = tk.BooleanVar(value=d.get("loop_track", True))
         self._field(parent, "Auto-cycle", ttk.Checkbutton(parent, variable=self._loop_var))
 
@@ -690,8 +775,8 @@ class ConfigWindow:
         self._speed_label.config(text=f"{v:.2f}×")
         self._send_cmd({"cmd": "speed", "value": v})
 
-    def _on_color_cells_changed(self):
-        self._send_cmd({"cmd": "color_cells", "value": bool(self._color_cells_var.get())})
+    def _on_show_structure_changed(self):
+        self._send_cmd({"cmd": "show_structure", "value": bool(self._show_structure_var.get())})
 
     def _on_hud_changed(self): self._send_cmd({"cmd": "hud", "value": bool(self._hud_var.get())})
 
@@ -708,8 +793,8 @@ class ConfigWindow:
             "sort_by":        self._sort_var.get(),
             "fps":            self._fps_var.get(),
             "speed":          round(float(self._speed_var.get()), 2),
-            "show_hud":       bool(self._hud_var.get()),
-            "color_cells":    bool(self._color_cells_var.get()),
+            "show_hud":        bool(self._hud_var.get()),
+            "show_structure":  bool(self._show_structure_var.get()),
             "loop_track":     bool(self._loop_var.get()),
         }
 
@@ -724,8 +809,8 @@ _DEFAULTS = {
     "sort_by":        "Quality (best first)",
     "fps":            60,
     "speed":          0.5,
-    "show_hud":       True,
-    "color_cells":    False,
+    "show_hud":        True,
+    "show_structure":  False,
     "loop_track":     True,
 }
 
