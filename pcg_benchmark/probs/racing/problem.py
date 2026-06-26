@@ -516,21 +516,68 @@ class RacingProblem(Problem):
 
         return float(max(0.0, min_ratio) ** 8)
 
-    def quality(self, info):
+    # ── Quality ────────────────────────────────────────────────────────
+    # All racing variants share the same quality structure, following the
+    # benchmark house style (see zelda/sokoban/ddave): an equally-weighted
+    # average of track-shape statistics, plus a simulation group that only
+    # counts once the geometry is sound (in bounds, no extreme turns, no
+    # self-intersection) — analogous to zelda only scoring playability once
+    # player/key/door exist.  Subclasses tune behaviour by overriding
+    # _QUALITY_PARAMS (thresholds) and _QUALITY_STAT_TERMS (which terms make
+    # up the stats group), and add terms via _extra_quality_terms().
+
+    _QUALITY_PARAMS = {
+        "min_curvature_deg":    8.0,   # below this avg curvature → linear ramp penalty
+        "ideal_curvature_deg": 18.0,   # gaussian target for avg curvature
+        "ideal_variety_deg":   10.0,   # gaussian target for curvature std
+        "sharp_turn_deg":      50.0,   # angle that counts as a sharp turn
+        "sharp_turn_allowance":   2,   # sharp turns tolerated before penalty
+        "sharp_turn_window":    3.0,   # extra sharp turns until score hits zero
+        "harsh_turn_deg":      85.0,   # single turn above this slashes sharp score (None = off)
+        "max_turn_deg":       120.0,   # soft cap on the single largest turn
+        "max_turn_soft_deg":   12.0,   # exp falloff width beyond the cap
+        "min_length":        1500.0,   # total track length scoring range (metres)
+        "max_length":        6500.0,
+        "seg_min_pref":       180.0,   # preferred control-segment length range (None = off)
+        "seg_max_pref":       520.0,
+        "angles_on_curve":     True,   # angles/geometry on dense curve vs control points
+        "geom_area_check":     True,   # also count track-area overlap intersections
+        "geom_severity":        1.5,
+        "max_steps_per_point":  200,
+        "straight_thresh_deg":  4.0,   # per-sample angle below this = straight section
+        "straight_ideal_frac":  0.20,  # longest-straight arc fraction for score 1.0
+        "curve_min_frac":       0.20,  # min curved fraction for non-zero diversity score
+        "curve_ideal_frac":     0.50,  # upper bound of ideal curved fraction
+        "sim_gate_min_straight": 0.0,  # minimum straight_score to unlock simulation bonus
+    }
+
+    # Five terms that measure track quality across all three racing representations.
+    # Validity/penalty terms (oob, geom, curvature_penalty, etc.) are handled
+    # exclusively by the simulation gate in quality(), not averaged into stats,
+    # so the formula is meaningful and comparable across racing, tile, and voronoi.
+    _QUALITY_STAT_TERMS = (
+        "curvature_score", "variety_score",
+        "length_score", "straight_score", "curvature_diversity_score",
+    )
+
+    def _quality_terms(self, info):
+        """Compute the quality terms shared by all racing variants.
+        Returns a dict of terms, each in [0, 1], or None when the info does
+        not describe a usable track."""
+        P = self._QUALITY_PARAMS
         track_points = info.get('track_points', None)
         if track_points is None:
-            return 0.0
-
-        finished = info.get('finished', False)
+            return None
         points = np.asarray(track_points, dtype=float)
+        if len(points) == 0:
+            return None
+
         curve_points = info.get('curve_points', None)
         if curve_points is None:
             curve_points = interpolate_curves(points, samples_per_segment=10, closed=self._closed_loop)
         curve_points = np.asarray(curve_points, dtype=float)
 
-        if len(points) == 0:
-            return 0.0
-
+        # Out-of-bounds (multiplicative)
         margin = float(self._track_width) * 0.5 + 2.0
         oob_violation = 0.0
         if len(curve_points) > 0:
@@ -543,82 +590,129 @@ class RacingProblem(Problem):
             )
         oob_penalty = float(np.exp(-oob_violation / max(1e-6, float(self._track_width) * 0.5)))
 
+        # Completion: how far around the track the agent got.
+        # For closed loops distance-to-goal is degenerate (start == goal, so a
+        # car that crashes at the spawn point would score 1.0); use the
+        # arc-position of the trajectory end along the curve instead.
+        finished = info.get('finished', False)
         trajectory_end = info.get('trajectory_end', None)
         if trajectory_end is None:
             trajectory_end = points[-1]
-        if self._closed_loop and len(curve_points) > 0:
-            final_point = curve_points[0]
-        else:
-            final_point = points[-1]
-        dist_to_goal = float(np.linalg.norm(final_point - np.asarray(trajectory_end, dtype=float)))
-        curve_total_length = float(np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1))) if len(curve_points) > 1 else 1.0
-        completion_pct = 1.0 - min(dist_to_goal / (curve_total_length + 1e-6), 1.0)
+        trajectory_end = np.asarray(trajectory_end, dtype=float)
         if finished:
-            completion_pct = 1.0
+            completion = 1.0
+        elif self._closed_loop and len(curve_points) > 1:
+            nearest = int(np.argmin(np.linalg.norm(curve_points - trajectory_end, axis=1)))
+            completion = nearest / len(curve_points)
+        else:
+            dist_to_goal = float(np.linalg.norm(points[-1] - trajectory_end))
+            curve_total_length = float(np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1))) if len(curve_points) > 1 else 1.0
+            completion = 1.0 - min(dist_to_goal / (curve_total_length + 1e-6), 1.0)
 
-        turn_angles = self._compute_turn_angles(curve_points)
+        # Curvature terms — variants measure on dense curve or raw vertices
+        angle_pts = curve_points if P["angles_on_curve"] else points
+        turn_angles = self._compute_turn_angles(angle_pts)
         avg_curvature = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
-        curvature_variety = float(np.std(turn_angles)) if turn_angles.size > 0 else 0.0
+        curvature_std = float(np.std(turn_angles)) if turn_angles.size > 0 else 0.0
 
+        min_curvature = np.deg2rad(P["min_curvature_deg"])
+        curvature_penalty = (avg_curvature / min_curvature) if avg_curvature < min_curvature else 1.0
+
+        ideal_curvature = np.deg2rad(P["ideal_curvature_deg"])
+        curvature_score = float(np.exp(-((avg_curvature - ideal_curvature) ** 2) / (2 * (ideal_curvature / 2) ** 2))) if avg_curvature > 0 else 0.0
+
+        ideal_variety = np.deg2rad(P["ideal_variety_deg"])
+        variety_score = float(np.exp(-((curvature_std - ideal_variety) ** 2) / (2 * (ideal_variety / 2) ** 2))) if avg_curvature > 0 else 0.0
+
+        # Sharp and extreme turns
+        sharp_turns = int(np.sum(turn_angles > np.deg2rad(P["sharp_turn_deg"])))
+        allowance = P["sharp_turn_allowance"]
+        sharp_turn_penalty = 1.0 - min((sharp_turns - allowance) / P["sharp_turn_window"], 1.0) if sharp_turns > allowance else 1.0
+        max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
+        if P["harsh_turn_deg"] is not None and max_turn > np.deg2rad(P["harsh_turn_deg"]):
+            sharp_turn_penalty *= 0.25
+        excess_turn = max(0.0, max_turn - np.deg2rad(P["max_turn_deg"]))
+        turn_penalty = float(np.exp(-excess_turn / max(1e-6, np.deg2rad(P["max_turn_soft_deg"]))))
+
+        # Control-segment statistics
         if len(points) > 1:
-            control_segment_lengths = np.linalg.norm(points[1:] - points[:-1], axis=1)
-            mean_length = float(np.mean(control_segment_lengths))
-            std_length = float(np.std(control_segment_lengths))
+            seg_lens = np.linalg.norm(points[1:] - points[:-1], axis=1)
+            mean_length = float(np.mean(seg_lens))
+            std_length = float(np.std(seg_lens))
+            variance_penalty = float(np.exp(-std_length / (mean_length + 1e-6)))
 
-            total_length = float(np.sum(control_segment_lengths))
-            min_len = 1500.0
-            max_len = 6500.0
-            if total_length < min_len:
-                length_score = total_length / min_len
-            elif total_length > max_len:
-                length_score = max_len / total_length
+            total_length = float(np.sum(seg_lens))
+            if total_length < P["min_length"]:
+                length_score = total_length / P["min_length"]
+            elif total_length > P["max_length"]:
+                length_score = P["max_length"] / total_length
             else:
                 length_score = 1.0
 
-            variance_penalty = float(np.exp(-std_length / (mean_length + 1e-6)))
-
-            preferred_min = 180.0
-            preferred_max = 520.0
-            out_of_range = np.sum((control_segment_lengths < preferred_min) | (control_segment_lengths > preferred_max))
-            out_of_range_penalty = 1.0 - min(out_of_range / max(1, len(control_segment_lengths)), 1.0)
+            if P["seg_min_pref"] is not None:
+                out_of_range = np.sum((seg_lens < P["seg_min_pref"]) | (seg_lens > P["seg_max_pref"]))
+                spacing_penalty = 1.0 - min(out_of_range / max(1, len(seg_lens)), 1.0)
+            else:
+                spacing_penalty = 1.0
         else:
             variance_penalty = 1.0
-            out_of_range_penalty = 1.0
+            spacing_penalty = 1.0
             length_score = 0.0
 
-        min_curvature = np.deg2rad(8)
-        curvature_penalty = (avg_curvature / min_curvature) if avg_curvature < min_curvature else 1.0
+        # Self-intersection (multiplicative)
+        geom_pts = curve_points if P["angles_on_curve"] else points
+        geom_violations = int(count_self_intersections(geom_pts, closed=self._closed_loop))
+        if P["geom_area_check"]:
+            geom_violations += int(count_track_area_intersections(
+                curve_points,
+                track_width=float(self._track_width),
+                min_cross_index_gap=2,
+                closed=self._closed_loop,
+            ))
+        geom_penalty = float(np.exp(-P["geom_severity"] * float(min(geom_violations, 50))))
 
-        ideal_curvature = np.deg2rad(18)
-        curvature_score = float(np.exp(-((avg_curvature - ideal_curvature) ** 2) / (2 * (ideal_curvature / 2) ** 2))) if avg_curvature > 0 else 0.0
+        # Straight section and curvature diversity (always on dense curve, all variants)
+        cp_d     = curve_points[1:] - curve_points[:-1]
+        cp_len   = np.linalg.norm(cp_d, axis=1)
+        cp_total = float(np.sum(cp_len))
+        if cp_total > 1e-6 and len(curve_points) >= 3:
+            cv1 = cp_d[:-1]; cv2 = cp_d[1:]
+            cn1 = np.linalg.norm(cv1, axis=1, keepdims=True)
+            cn2 = np.linalg.norm(cv2, axis=1, keepdims=True)
+            ok  = (cn1[:, 0] > 1e-3) & (cn2[:, 0] > 1e-3)
+            dt  = np.ones(len(cv1))
+            if ok.any():
+                dt[ok] = np.clip(
+                    np.einsum('ij,ij->i', cv1[ok] / cn1[ok], cv2[ok] / cn2[ok]),
+                    -1.0, 1.0,
+                )
+            cp_ang = np.arccos(dt)   # turn angle at each interior curve point
+            n_cs   = len(cp_len)
+            seg_a  = np.zeros(n_cs)
+            seg_a[:-1] = np.maximum(seg_a[:-1], cp_ang)  # end-angle of each segment
+            seg_a[1:]  = np.maximum(seg_a[1:],  cp_ang)  # start-angle of each segment
+            is_str   = seg_a < np.deg2rad(P["straight_thresh_deg"])
+            changes  = np.diff(is_str.astype(int), prepend=0, append=0)
+            r_starts = np.where(changes == 1)[0]
+            r_ends   = np.where(changes == -1)[0]
+            max_s    = max((float(np.sum(cp_len[s:e])) for s, e in zip(r_starts, r_ends)), default=0.0)
+            straight_score = min(1.0, max_s / (cp_total * max(1e-9, P["straight_ideal_frac"])))
+            curved_frac    = float(np.sum(cp_len[~is_str])) / cp_total
+            curvature_diversity_score = get_range_reward(
+                curved_frac, 0.0, P["curve_min_frac"], P["curve_ideal_frac"], 1.0
+            )
+        else:
+            straight_score = 0.0
+            curvature_diversity_score = 0.0
 
-        sharp_turns = int(np.sum(turn_angles > np.deg2rad(50)))
-        sharp_turn_penalty = 1.0 - min((sharp_turns - 2) / 3.0, 1.0) if sharp_turns > 2 else 1.0
-        max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
-        excess_turn = max(0.0, max_turn - np.deg2rad(120))
-        turn_penalty = float(np.exp(-excess_turn / max(1e-6, np.deg2rad(12))))
-        if max_turn > np.deg2rad(85):
-            sharp_turn_penalty *= 0.25
+        clustering_penalty = self._compute_spatial_clustering_penalty(points, min_segment_gap=3, threshold_multiplier=1.1)
+        proximity_penalty = self._compute_segment_proximity_penalty(geom_pts, min_distance=self._track_width * 2.0)
 
-        ideal_variety = np.deg2rad(10)
-        variety_score = float(np.exp(-((curvature_variety - ideal_variety) ** 2) / (2 * (ideal_variety / 2) ** 2))) if avg_curvature > 0 else 0.0
-
-        center_inters = int(count_self_intersections(curve_points, closed=self._closed_loop))
-        area_inters = int(count_track_area_intersections(
-            curve_points,
-            track_width=float(self._track_width),
-            min_cross_index_gap=2,
-            closed=self._closed_loop,
-        ))
-        geom_violations = max(0, center_inters) + max(0, area_inters)
-        geom_penalty = float(np.exp(-1.5 * float(min(geom_violations, 50))))
-
-        spatial_clustering_penalty = self._compute_spatial_clustering_penalty(points, min_segment_gap=3, threshold_multiplier=1.1)
-        segment_proximity_penalty = self._compute_segment_proximity_penalty(curve_points, min_distance=self._track_width * 2.0)
-
+        # Lap time
         steps = info.get('steps', 0)
-        min_steps = 30 * (len(points) - 1)
-        max_steps_for_scoring = 200 * (len(points) - 1)
+        n_segments = max(len(points) - 1, 1)
+        min_steps = 30 * n_segments
+        max_steps_for_scoring = P["max_steps_per_point"] * n_segments
         if not finished:
             time_score = 0.0
         elif steps < min_steps:
@@ -628,21 +722,49 @@ class RacingProblem(Problem):
         else:
             time_score = 1.0
 
-        quality = (
-            0.20 * completion_pct +
-            0.12 * curvature_score +
-            0.04 * variety_score +
-            0.10 * curvature_penalty +
-            0.10 * sharp_turn_penalty +
-            0.10 * variance_penalty +
-            0.10 * out_of_range_penalty +
-            0.08 * length_score +
-            0.01 * spatial_clustering_penalty +
-            0.20 * segment_proximity_penalty +
-            0.01 * time_score
-        )
-        total_penalty = oob_penalty * turn_penalty * geom_penalty
-        return float(quality) * total_penalty
+        return {
+            "completion":         completion,
+            "curvature_score":    curvature_score,
+            "curvature_penalty":  curvature_penalty,
+            "variety_score":      variety_score,
+            "sharp_turn_penalty": sharp_turn_penalty,
+            "variance_penalty":   variance_penalty,
+            "spacing_penalty":    spacing_penalty,
+            "length_score":       length_score,
+            "clustering_penalty":        clustering_penalty,
+            "proximity_penalty":         proximity_penalty,
+            "oob_penalty":               oob_penalty,
+            "turn_penalty":              turn_penalty,
+            "geom_penalty":              geom_penalty,
+            "straight_score":            straight_score,
+            "curvature_diversity_score": curvature_diversity_score,
+            "time_score":                time_score,
+        }
+
+    def _extra_quality_terms(self, info):
+        """Hook for subclasses to add problem-specific quality terms."""
+        return {}
+
+    def quality(self, info):
+        terms = self._quality_terms(info)
+        if terms is None:
+            return 0.0
+        terms.update(self._extra_quality_terms(info))
+
+        # Track-shape statistics: five quality terms, equally weighted
+        stats = sum(terms[k] for k in self._QUALITY_STAT_TERMS) / len(self._QUALITY_STAT_TERMS)
+
+        # Simulation bonus only counts once the track is geometrically sound
+        # and meets the minimum straight-section requirement (parameterised so
+        # tile can set a stricter threshold while racing/voronoi use 0.0).
+        added = 0.0
+        P = self._QUALITY_PARAMS
+        if (terms["oob_penalty"] >= 1.0
+                and terms["geom_penalty"] >= 1.0
+                and terms["straight_score"] >= P["sim_gate_min_straight"]):
+            added = (terms["completion"] + terms["time_score"]) / 2.0
+
+        return (stats + added) / 2.0
 
     def _track_to_grid(self, curve_points: np.ndarray, grid_size: int = 20) -> np.ndarray:
         pts = np.asarray(curve_points, dtype=float)

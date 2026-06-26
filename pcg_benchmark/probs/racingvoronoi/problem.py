@@ -7,7 +7,6 @@ from pcg_benchmark.probs.racing.problem import (
     RacingProblem,
     _rotated_rect,
 )
-from pcg_benchmark.probs.racing.utils import count_self_intersections
 from pcg_benchmark.probs.racingvoronoi.utils import (
     build_voronoi_cell_graph,
     find_boundary_cycle,
@@ -331,133 +330,31 @@ class RacingVoronoiProblem(RacingProblem):
         solidity_score = float(np.exp(-((solidity - 0.6) ** 2) / (2 * 0.2 ** 2)))
         return (aspect_score + solidity_score) / 2.0
 
-    def quality(self, info):
-        track_points = info.get('track_points')
-        if track_points is None:
-            return 0.0
-        points = np.asarray(track_points, dtype=float)
-        if len(points) == 0:
-            return 0.0
+    # Voronoi tracks are polygons with naturally sharper corners, so the angle
+    # thresholds are looser and curvature/geometry are measured on the sparse
+    # polygon vertices instead of the interpolated curve.  Everything else is
+    # shared with RacingProblem._quality_terms.
+    _QUALITY_PARAMS = {
+        **RacingProblem._QUALITY_PARAMS,
+        "min_curvature_deg":   15.0,
+        "ideal_curvature_deg": 35.0,
+        "ideal_variety_deg":   15.0,
+        "sharp_turn_deg":      90.0,
+        "sharp_turn_allowance":   4,
+        "sharp_turn_window":    4.0,
+        "harsh_turn_deg":      None,
+        "max_turn_deg":       150.0,
+        "max_turn_soft_deg":   15.0,
+        "seg_min_pref":        None,   # voronoi edge lengths are dictated by the diagram
+        "angles_on_curve":    False,
+        "geom_area_check":    False,
+        "max_steps_per_point":  300,
+    }
 
-        finished = info.get('finished', False)
-        curve_points = info.get('curve_points')
-        if curve_points is None:
-            curve_points = self._densify_polyline(
-                points, max_step=float(self._track_width) * 0.35, closed=self._closed_loop
-            )
-        curve_points = np.asarray(curve_points, dtype=float)
-
-        # Out-of-bounds penalty
-        margin = float(self._track_width) * 0.5 + 2.0
-        oob_violation = 0.0
-        if len(curve_points) > 0:
-            oob_violation = max(
-                0.0,
-                margin - float(np.min(curve_points[:, 0])),
-                float(np.max(curve_points[:, 0])) - (self._width - margin),
-                margin - float(np.min(curve_points[:, 1])),
-                float(np.max(curve_points[:, 1])) - (self._height - margin),
-            )
-        oob_penalty = float(np.exp(-oob_violation / max(1e-6, float(self._track_width) * 0.5)))
-
-        # Completion
-        trajectory_end = info.get('trajectory_end')
-        if trajectory_end is None and len(points) > 0:
-            trajectory_end = points[-1]
-        if trajectory_end is None:
-            return 0.0
-        final_point = curve_points[0] if (self._closed_loop and len(curve_points) > 0) else points[-1]
-        dist_to_goal = float(np.linalg.norm(final_point - np.asarray(trajectory_end, dtype=float)))
-        curve_len = (
-            float(np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1)))
-            if len(curve_points) > 1 else 1.0
-        )
-        completion_pct = 1.0 if finished else (1.0 - min(dist_to_goal / (curve_len + 1e-6), 1.0))
-
-        # Curvature — measured at actual Voronoi corners, not diluted by interpolation
-        turn_angles = self._compute_turn_angles(points)
-        avg_curvature = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
-        curvature_variety = float(np.std(turn_angles)) if turn_angles.size > 0 else 0.0
-
-        min_curvature = np.deg2rad(15)
-        curvature_penalty = (avg_curvature / min_curvature) if avg_curvature < min_curvature else 1.0
-
-        ideal_curvature = np.deg2rad(35)
-        curvature_score = (
-            float(np.exp(-((avg_curvature - ideal_curvature) ** 2) / (2 * (ideal_curvature / 2) ** 2)))
-            if avg_curvature > 0 else 0.0
-        )
-
-        # Voronoi polygons naturally have sharper corners — threshold at 90 deg
-        sharp_turns = int(np.sum(turn_angles > np.deg2rad(90)))
-        sharp_turn_penalty = 1.0 - min((sharp_turns - 4) / 4.0, 1.0) if sharp_turns > 4 else 1.0
-        max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
-        excess_turn = max(0.0, max_turn - np.deg2rad(150))
-        turn_penalty = float(np.exp(-excess_turn / max(1e-6, np.deg2rad(15))))
-
-        ideal_variety = np.deg2rad(15)
-        variety_score = (
-            float(np.exp(-((curvature_variety - ideal_variety) ** 2) / (2 * (ideal_variety / 2) ** 2)))
-            if avg_curvature > 0 else 0.0
-        )
-
-        # Segment variance and total length
-        if len(points) > 1:
-            seg_lens = np.linalg.norm(points[1:] - points[:-1], axis=1)
-            mean_len = float(np.mean(seg_lens))
-            std_len = float(np.std(seg_lens))
-            variance_penalty = float(np.exp(-std_len / (mean_len + 1e-6)))
-            total_length = float(np.sum(seg_lens))
-            min_len, max_len = 1500.0, 6500.0
-            if total_length < min_len:
-                length_score = total_length / min_len
-            elif total_length > max_len:
-                length_score = max_len / total_length
-            else:
-                length_score = 1.0
-        else:
-            variance_penalty = 1.0
-            length_score = 0.0
-
-        # For now the geometry penalties use the sparse polygon vertices, not the interpolated curve.
-        center_inters = int(count_self_intersections(points, closed=self._closed_loop))
-        #Self-intersection penalty is less strict here since Voronoi tracks are more prone to tight turns
-        geom_penalty = float(np.exp(-1.5 * float(min(center_inters, 50))))
-
-        segment_proximity_penalty = self._compute_segment_proximity_penalty(
-            points, min_distance=self._track_width * 2.0
-        )
-
-        # Time score
-        steps = info.get('steps', 0)
-        min_steps = int(30 * max(len(points), 1))
-        max_steps_for_scoring = int(300 * max(len(points), 1))
-        if not finished:
-            time_score = 0.0
-        elif steps < min_steps:
-            time_score = max(0.0, 1.0 - (min_steps - steps) / min_steps)
-        elif steps > max_steps_for_scoring:
-            time_score = max(0.0, 1.0 - (steps - max_steps_for_scoring) / max_steps_for_scoring)
-        else:
-            time_score = 1.0
-
-        # Cluster shape
+    def _extra_quality_terms(self, info):
         selected = info.get('selected_cells')
         shape_score = self._compute_cluster_shape_score(selected) if selected else 0.5
-
-        quality = (
-            0.25 * completion_pct +
-            0.15 * segment_proximity_penalty +
-            0.15 * shape_score +
-            0.12 * curvature_score +
-            0.10 * curvature_penalty +
-            0.10 * sharp_turn_penalty +
-            0.08 * variance_penalty +
-            0.03 * variety_score +
-            0.01 * length_score +
-            0.01 * time_score
-        )
-        return float(quality) * oob_penalty * turn_penalty * geom_penalty
+        return {"shape_score": shape_score}
 
     # ------------------------------------------------------------------
     # Diversity & Controlability

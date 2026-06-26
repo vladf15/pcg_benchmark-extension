@@ -57,7 +57,7 @@ def infer_problem_type(chromosomes: list[dict]) -> str:
     content = chromosomes[0].get("content") or {} if chromosomes else {}
     if "cell_scores" in content:
         return "RacingVoronoi"
-    if "bl_rows" in content and "bl_cols" in content:
+    if "tile_prefs" in content:
         return "RacingTile"
     return "Racing"
 
@@ -462,11 +462,9 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
 
     def rebuild_surface():
         if is_tile and show_structure and current_content is not None:
-            if hasattr(problem, "_decode_genome") and "bl_rows" in current_content:
+            if hasattr(problem, "_decode_genome") and "tile_prefs" in current_content:
                 types, rotations = problem._decode_genome(
-                    np.asarray(current_content["bl_rows"],  dtype=int),
-                    np.asarray(current_content["bl_cols"],  dtype=int),
-                    np.asarray(current_content["bl_tiles"], dtype=int),
+                    np.asarray(current_content["tile_prefs"], dtype=int),
                 )
                 viewer.build_tile_surface(types, rotations)
             return

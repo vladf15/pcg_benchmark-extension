@@ -1,17 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
-from pcg_benchmark.probs.racing.engine import CarPhysicsEngine
-from pcg_benchmark.probs.racing.agent import SteeringAgent
-from pcg_benchmark.probs.racing.problem import (
-    PX_PER_M,
-    RacingProblem,
-    _rotated_rect,
-)
-from pcg_benchmark.probs.racing.utils import count_self_intersections
-from pcg_benchmark.spaces import ArraySpace, FloatSpace, IntegerSpace, DictionarySpace
-from pcg_benchmark.probs.utils import get_range_reward
-from PIL import Image, ImageDraw, ImageFont
+from pcg_benchmark.probs.racing.problem import RacingProblem
+from pcg_benchmark.spaces import ArraySpace, IntegerSpace, DictionarySpace
+from PIL import Image, ImageDraw
 
 
 GRID_H = 12
@@ -50,31 +42,26 @@ _EDGES_TO_TILE = {
 }
 
 
-N_BLACKLIST  = 16  # number of blacklist constraint slots in the genome
-_N_WFC_TILES = 7   # len(_WFC_TILES): 0=grass … 6=corner_WN
-_INACTIVE_TI = _N_WFC_TILES  # sentinel: this slot carries no constraint
-_WFC_SEED_MAX = 32768  # exclusive upper bound for the wfc_seed gene
+_N_WFC_TILES    = 7     # len(_WFC_TILES): 0=grass … 6=corner_WN
+_ROAD_GENE_RATE = 0.15  # fraction of cells with an active road request in random genomes
 
 
 class _TileGridSpace(DictionarySpace):
-    """Genome = three parallel blacklist arrays + an explicit WFC seed.
+    """Genome = a partial tile map (Genetic-WFC style, Bailly & Levieux 2022).
 
-    Each slot i says: at cell (bl_rows[i], bl_cols[i]) WFC must not use
-    tile variant bl_tiles[i].  bl_tiles[i] == _INACTIVE_TI means unused.
-    wfc_seed is an independent integer mixed into the RNG seed so that two
-    chromosomes with identical blacklists but different wfc_seeds produce
-    different WFC layouts.  This keeps the population varied even after the
-    GA converges on a good constraint pattern.
-    contentSwap on all four fields acts as both crossover and mutation."""
+    tile_prefs[r*GRID_W+c] == 0 means "no preference" — WFC decides the cell
+    freely.  Values 1-6 request that road tile variant at cell (r,c); requests
+    are stamped as hard pre-collapse observations before WFC fills the rest,
+    and silently skipped if they contradict earlier stamps.  Each active gene
+    therefore maps directly to one tile of the layout, so crossover and
+    mutation via contentSwap make small, local changes to the track."""
 
     def __init__(self, problem_ref):
         super().__init__({
-            "bl_rows":  ArraySpace((N_BLACKLIST,), IntegerSpace(0, GRID_H)),
-            "bl_cols":  ArraySpace((N_BLACKLIST,), IntegerSpace(0, GRID_W)),
-            # 0-6 = specific tile variant to forbid; _N_WFC_TILES = inactive
-            "bl_tiles": ArraySpace((N_BLACKLIST,), IntegerSpace(0, _N_WFC_TILES + 1)),
-            # Explicit WFC seed — evolved independently of the blacklist
-            "wfc_seed": ArraySpace((1,), IntegerSpace(0, _WFC_SEED_MAX)),
+            "tile_prefs": ArraySpace(
+                (GRID_H * GRID_W,),
+                IntegerSpace(0, _N_WFC_TILES),
+            ),
         })
         self._prob = problem_ref
 
@@ -89,7 +76,35 @@ class RacingTileProblem(RacingProblem):
         kwargs.setdefault('max_steps', 2000)
         super().__init__(**kwargs)
         self._content_space = _TileGridSpace(self)
-        self._decode_cache: dict = {}   # genome bytes → (types, rotations)
+        # genome bytes → (types, rotations, wave_array)
+        # wave_array is a (GRID_H, GRID_W) int array of WFC tile indices;
+        # stored for localised repair (Bailly & Levieux 2022).
+        self._decode_cache: dict = {}
+
+        # Tile tracks live on a fixed grid, so the generic length/spacing
+        # targets must be expressed in cell units: waypoints are tile-edge
+        # midpoints spaced ~1 cell apart, and a good loop uses 24-60 tiles.
+        # Grid construction guarantees the track never overlaps itself (each
+        # cell holds its own disjoint road piece), so the area-overlap check
+        # is disabled — it only fires on artifacts of the corner-cutting
+        # waypoint polyline.
+        cell = float(self._width) / GRID_W
+        self._QUALITY_PARAMS = {
+            **self._QUALITY_PARAMS,
+            "min_length":   24.0 * cell,
+            "max_length":   60.0 * cell,
+            "seg_min_pref":  0.4 * cell,
+            "seg_max_pref":  3.0 * cell,
+            "geom_area_check": False,
+            # Tile corners spread 90° over ~10 dense-curve samples → max avg ≈ 9°/sample.
+            # Recalibrate curvature targets to this scale so the scores are meaningful.
+            "min_curvature_deg":    1.0,
+            "ideal_curvature_deg":  5.0,
+            "ideal_variety_deg":    3.0,
+            # Simulation bonus only unlocks once the track has a real straight section.
+            # WFC alone doesn't reliably produce long runs of consecutive straight tiles.
+            "sim_gate_min_straight": 0.5,
+        }
 
     # ── WFC tile index constants (used internally) ────────────────────
     # Indices into _WFC_TILES: 0=grass, 1=straight_H, 2=straight_V,
@@ -101,11 +116,12 @@ class RacingTileProblem(RacingProblem):
     ]
     # Grass weighted heavily so road tiles form sparse loops rather than filling the grid
     _WFC_WEIGHTS = np.array([6.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    _WFC_COMPAT  = None  # populated once on first use; never changes
 
     @classmethod
     def _wfc_compat(cls):
-        """Precompute compatibility table: compat[dir][tile_i] = set of tile indices
-        that can appear on the other side of tile_i in that direction."""
+        if cls._WFC_COMPAT is not None:
+            return cls._WFC_COMPAT
         compat = {}
         for d in (N, E, S, W):
             opp = _OPPOSITE[d]
@@ -117,6 +133,7 @@ class RacingTileProblem(RacingProblem):
                     if (opp in _OPEN_EDGES[(t2, r2)]) == a_open
                 )
                 compat[d].append(allowed)
+        cls._WFC_COMPAT = compat
         return compat
 
     def _wfc_propagate(self, wave, stack, compat):
@@ -201,15 +218,10 @@ class RacingTileProblem(RacingProblem):
     def _run_wfc(self, wave, rng, compat):
         """Merrell's model-synthesis observe-collapse loop.
 
-        Observe: pick the uncollapsed cell with minimum Shannon entropy
-                 (= fewest remaining possibilities), break ties randomly.
+        Observe: pick the uncollapsed cell with fewest remaining possibilities,
+                 break ties randomly.
         Collapse: draw a tile weighted by _WFC_WEIGHTS.
-        Propagate: AC-3 arc-consistency after each collapse.
-
-        Because the seed is placed and propagated before this is called,
-        the seed's neighbours already have the most-constrained waves and
-        are therefore selected first.  Road naturally spreads outward from
-        the seed without any extra steering.
+        Propagate: AC-3 after each collapse.
 
         Returns (types, rotations) or None on contradiction.
         """
@@ -241,80 +253,201 @@ class RacingTileProblem(RacingProblem):
                 types[r, c], rotations[r, c] = self._WFC_TILES[ti]
         return types, rotations
 
-    def _decode_genome(self, bl_rows, bl_cols, bl_tiles, wfc_seed=0):
-        """Decode a blacklist genome to (types, rotations) via deterministic WFC.
+    # ── Wave ↔ tile-array conversion helpers ─────────────────────────
 
-        The same genome (including wfc_seed) always produces the same tile grid.
-        wfc_seed is an independent genome gene that shifts the RNG base so two
-        chromosomes with identical blacklists but different seeds produce different
-        WFC layouts — the primary mechanism for maintaining variety in later GA
-        iterations once the blacklist constraints have converged.
-        Results are cached keyed on the full genome bytes.
-        Returns (types, rotations) — falls back to a rectangle on total failure.
+    _WFC_TILE_IDX: dict | None = None  # (type, rotation) → WFC tile index
+
+    @classmethod
+    def _tile_to_idx(cls):
+        if cls._WFC_TILE_IDX is None:
+            cls._WFC_TILE_IDX = {(t, r): i for i, (t, r) in enumerate(cls._WFC_TILES)}
+        return cls._WFC_TILE_IDX
+
+    def _wave_to_types(self, wave_arr):
+        """Convert a (GRID_H, GRID_W) tile-index array to (types, rotations)."""
+        types = np.zeros((GRID_H, GRID_W), dtype=int)
+        rots  = np.zeros((GRID_H, GRID_W), dtype=int)
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                types[r, c], rots[r, c] = self._WFC_TILES[int(wave_arr[r, c])]
+        return types, rots
+
+    def _types_to_wave(self, types, rotations):
+        """Convert (types, rotations) to a (GRID_H, GRID_W) tile-index array."""
+        idx      = self._tile_to_idx()
+        wave_arr = np.zeros((GRID_H, GRID_W), dtype=int)
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                wave_arr[r, c] = idx.get((int(types[r, c]), int(rotations[r, c])), 0)
+        return wave_arr
+
+    # ── Localised repair (Bailly & Levieux 2022, §3.2) ───────────────
+
+    def _localised_repair(self, new_prefs, old_prefs, old_wave):
+        """Repair a wave by only re-collapsing cells whose preferences changed.
+
+        Start from old_wave (a valid collapsed track).  Un-collapse the cells
+        whose genome preference differs, propagate constraints outward via AC-3
+        from their still-collapsed neighbours, re-stamp the new preferences,
+        then re-run WFC on the remaining uncollapsed cells only.
+
+        Returns (types, rotations, new_wave) or None if repair fails (caller
+        falls back to a full WFC pass).
         """
-        _wfc_seed = int(np.asarray(wfc_seed).flat[0]) if hasattr(wfc_seed, '__len__') else int(wfc_seed)
-        key = (np.asarray(bl_rows).tobytes()
-               + np.asarray(bl_cols).tobytes()
-               + np.asarray(bl_tiles).tobytes()
-               + _wfc_seed.to_bytes(4, 'little'))
-        if key in self._decode_cache:
-            return self._decode_cache[key]
-
-        # Deterministic seed: polynomial hash over blacklist values, then shifted
-        # by wfc_seed so the gene independently steers the WFC outcome.
-        vals    = np.array([*bl_rows, *bl_cols, *bl_tiles], dtype=np.int64)
-        weights = np.arange(1, len(vals) + 1, dtype=np.int64) * np.int64(2654435761)
-        seed    = int((np.sum(vals * weights) + np.int64(_wfc_seed) * np.int64(999983))
-                      % np.int64(2**31))
-
-        # Build blacklist dict: (r, c) → set of forbidden WFC tile indices
-        blacklist: dict = {}
-        for i in range(N_BLACKLIST):
-            ti = int(bl_tiles[i])
-            if ti >= _INACTIVE_TI:
-                continue
-            r, c = int(bl_rows[i]) % GRID_H, int(bl_cols[i]) % GRID_W
-            blacklist.setdefault((r, c), set()).add(ti)
-
         compat  = self._wfc_compat()
         n_tiles = len(self._WFC_TILES)
-        grass_i = 0
+        new_p2d = new_prefs.reshape(GRID_H, GRID_W)
+        old_p2d = old_prefs.reshape(GRID_H, GRID_W)
+
+        # Reconstruct set-based wave from collapsed tile indices; borders stay {0}.
+        wave = [[{int(old_wave[r, c])} for c in range(GRID_W)]
+                for r in range(GRID_H)]
+
+        # Interior cells whose genome preference changed → need re-collapsing.
+        diff_cells = [
+            (r, c)
+            for r in range(1, GRID_H - 1)
+            for c in range(1, GRID_W - 1)
+            if int(new_p2d[r, c]) != int(old_p2d[r, c])
+        ]
+
+        if not diff_cells:
+            # Nothing changed — reconstruct directly without any WFC work.
+            t, ro = self._wave_to_types(old_wave)
+            return t, ro, old_wave.copy()
+
+        # Un-collapse changed cells to the full set of possibilities.
+        uncollapsed = set(diff_cells)
+        for r, c in diff_cells:
+            wave[r][c] = set(range(n_tiles))
+
+        # Propagate constraints inward from the still-collapsed neighbours.
+        seed: list = []
+        seen_seed: set = set()
+        for r, c in uncollapsed:
+            for dr, dc in _DIR_DELTA.values():
+                nr, nc = r + dr, c + dc
+                if (0 <= nr < GRID_H and 0 <= nc < GRID_W
+                        and (nr, nc) not in uncollapsed
+                        and (nr, nc) not in seen_seed):
+                    seed.append((nr, nc))
+                    seen_seed.add((nr, nc))
+
+        if not self._wfc_propagate(wave, seed, compat):
+            return None  # Contradiction → fall back to full WFC
+
+        # Stamp new preferences for changed cells (skip on conflict).
+        for r, c in diff_cells:
+            pref = int(new_p2d[r, c])
+            if pref == 0 or pref not in wave[r][c] or len(wave[r][c]) == 1:
+                continue
+            snapshot = [[set(cell) for cell in row] for row in wave]
+            wave[r][c] = {pref}
+            if not self._wfc_propagate(wave, [(r, c)], compat):
+                wave = snapshot  # Preference contradicts context — skip it
+
+        # Re-run WFC on the (now small) set of uncollapsed cells.
+        # _run_wfc skips cells already collapsed (len == 1), so only the
+        # repaired region gets new random choices.
+        base_repair = wave  # keep base so we can retry with different seeds
+        for attempt in range(20):
+            wave_copy = [[set(cell) for cell in row] for row in base_repair]
+            result = self._run_wfc(wave_copy, np.random.default_rng(attempt * 7_919), compat)
+            if result is None:
+                continue
+            types, rotations = self._keep_largest_component(*result)
+            if self._extract_loop(types, rotations) is not None:
+                new_wave = self._types_to_wave(types, rotations)
+                return types, rotations, new_wave
+
+        return None  # All repair attempts failed → caller uses full WFC
+
+    def _decode_genome(self, tile_prefs):
+        """Decode a partial-map genome to (types, rotations) via Genetic-WFC.
+
+        tile_prefs is a flat int array of length GRID_H*GRID_W.  Value 0 means
+        "no preference"; values 1-6 request that road tile variant at the cell.
+        Requests are stamped as hard pre-collapse observations in row-major
+        order — each is propagated immediately and skipped (wave restored) if
+        it contradicts earlier stamps.  WFC then fills the remaining cells.
+        Deterministic (fixed per-attempt RNG) and cached per genome.
+        Returns (types, rotations) — falls back to a rectangle on total failure.
+        """
+        tile_prefs = np.asarray(tile_prefs, dtype=int)
+        key = tile_prefs.tobytes()
+        if key in self._decode_cache:
+            t, r_, _ = self._decode_cache[key]
+            return t, r_
+
+        compat   = self._wfc_compat()
+        n_tiles  = len(self._WFC_TILES)
+        grass_i  = 0
+        prefs_2d = tile_prefs.reshape(GRID_H, GRID_W)
+
+        # ── Localised repair (Bailly & Levieux 2022) ──────────────────────
+        # Before doing a full WFC pass, check whether any cached genome is
+        # "close enough" to this one (≤ 50 cells differ — typical after
+        # contentSwap mutation at rate 0.15 on 144 cells gives ~22 changes).
+        # If so, re-collapse only the changed cells and their propagation
+        # neighbourhood rather than starting from an empty wave.
+        if self._decode_cache:
+            best_diff, best_old_prefs, best_old_wave = len(tile_prefs) + 1, None, None
+            for ckey, entry in self._decode_cache.items():
+                old_arr = np.frombuffer(ckey, dtype=tile_prefs.dtype)
+                diff    = int(np.count_nonzero(tile_prefs != old_arr))
+                if diff < best_diff:
+                    best_diff      = diff
+                    best_old_prefs = old_arr
+                    best_old_wave  = entry[2]
+            if best_diff <= 50:
+                repaired = self._localised_repair(tile_prefs, best_old_prefs, best_old_wave)
+                if repaired is not None:
+                    types, rotations, new_wave = repaired
+                    self._decode_cache[key] = (types, rotations, new_wave)
+                    return types, rotations
+
+        # ── Full WFC from scratch ──────────────────────────────────────────
+        # Build the stamped wave once — stamping is deterministic, only the
+        # WFC fill afterwards varies between attempts.
+        base_wave = [[set(range(n_tiles)) for _ in range(GRID_W)]
+                     for _ in range(GRID_H)]
+        border = []
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                if r == 0 or r == GRID_H - 1 or c == 0 or c == GRID_W - 1:
+                    base_wave[r][c] = {grass_i}
+                    border.append((r, c))
+        self._wfc_propagate(base_wave, border, compat)
+
+        # Stamp the genome's road requests as hard observations
+        stamped = 0
+        for r in range(1, GRID_H - 1):
+            for c in range(1, GRID_W - 1):
+                pref = int(prefs_2d[r, c])
+                if pref == 0 or pref not in base_wave[r][c]:
+                    continue
+                if len(base_wave[r][c]) == 1:
+                    stamped += 1  # already forced to the requested tile
+                    continue
+                snapshot = [[set(cell) for cell in row] for row in base_wave]
+                base_wave[r][c] = {pref}
+                if self._wfc_propagate(base_wave, [(r, c)], compat):
+                    stamped += 1
+                else:
+                    base_wave = snapshot
+
+        # A genome with no expressible requests still needs a road seed,
+        # otherwise grass-heavy WFC tends to produce an empty grid.
+        if stamped == 0:
+            sr, sc = GRID_H // 2, GRID_W // 2
+            straight_h = 1
+            if straight_h in base_wave[sr][sc]:
+                base_wave[sr][sc] = {straight_h}
+                self._wfc_propagate(base_wave, [(sr, sc)], compat)
 
         for attempt in range(100):
-            rng = np.random.default_rng((seed + attempt * 1_000_003) % (2**31))
-
-            wave = [[set(range(n_tiles)) for _ in range(GRID_W)]
-                    for _ in range(GRID_H)]
-
-            # Apply blacklist constraints before propagation
-            for (r, c), forbidden in blacklist.items():
-                remaining = wave[r][c] - forbidden
-                wave[r][c] = remaining if remaining else {grass_i}
-
-            # Border = grass
-            border = []
-            for r in range(GRID_H):
-                for c in range(GRID_W):
-                    if r == 0 or r == GRID_H - 1 or c == 0 or c == GRID_W - 1:
-                        wave[r][c] = {grass_i}
-                        border.append((r, c))
-
-            # Single straight-tile seed in the inner 80% of the grid.
-            # Using a STRAIGHT tile (not a random road tile) avoids biasing
-            # the WFC toward corners at the seed, which helps it grow a single
-            # connected loop rather than spawning isolated corner clusters.
-            sr = int(rng.integers(2, GRID_H - 2))  # rows 2-9 (well inside border)
-            sc = int(rng.integers(2, GRID_W - 2))  # cols 2-9
-            straight_idxs = [i for i, (t, _) in enumerate(self._WFC_TILES)
-                             if t == STRAIGHT]
-            seed_tile = straight_idxs[int(rng.integers(len(straight_idxs)))]
-            available = wave[sr][sc] - {grass_i}
-            if seed_tile in available:
-                wave[sr][sc] = {seed_tile}
-                border.append((sr, sc))
-
-            if not self._wfc_propagate(wave, border, compat):
-                continue
+            rng  = np.random.default_rng(attempt * 1_000_003)
+            wave = [[set(cell) for cell in row] for row in base_wave]
 
             result = self._run_wfc(wave, rng, compat)
             if result is None:
@@ -322,44 +455,35 @@ class RacingTileProblem(RacingProblem):
 
             types, rotations = self._keep_largest_component(*result)
             if self._extract_loop(types, rotations) is not None:
-                self._decode_cache[key] = (types, rotations)
+                new_wave = self._types_to_wave(types, rotations)
+                self._decode_cache[key] = (types, rotations, new_wave)
                 return types, rotations
 
         # Total failure — deterministic rectangle as last resort
-        rng = np.random.default_rng(seed % (2**31))
+        rng = np.random.default_rng(int(np.sum(tile_prefs)) % (2**31))
         fb  = self._rectangular_fallback(rng)
         t   = np.asarray(fb["types"],     dtype=int)
         r_  = np.asarray(fb["rotations"], dtype=int)
-        self._decode_cache[key] = (t, r_)
+        w   = self._types_to_wave(t, r_)
+        self._decode_cache[key] = (t, r_, w)
         return t, r_
 
     def init_content(self, rng=None):
-        """Return a random genome that decodes to a valid single-loop track.
-        Genome fields: bl_rows, bl_cols, bl_tiles (blacklist constraints) plus
-        wfc_seed (steers the WFC RNG independently of the constraint pattern).
-        contentSwap on all four fields acts as crossover and mutation."""
+        """Return a random sparse partial-map genome.
+
+        Only ~_ROAD_GENE_RATE of cells carry an active road request — a loop
+        uses 16-40 of the 144 cells, so denser genomes just produce conflicting
+        stamps that get skipped.  Sparseness also keeps contentSwap mutation
+        sparse, since it swaps cells with a fresh sample from this function.
+        No WFC pre-validation: _decode_genome handles failures internally."""
         if rng is None:
             rng = np.random.default_rng()
         elif isinstance(rng, int):
             rng = np.random.default_rng(rng)
-
-        for _ in range(200):
-            bl_rows  = rng.integers(0, GRID_H,           size=N_BLACKLIST).astype(int)
-            bl_cols  = rng.integers(0, GRID_W,           size=N_BLACKLIST).astype(int)
-            bl_tiles = rng.integers(0, _N_WFC_TILES + 1, size=N_BLACKLIST).astype(int)
-            wfc_seed = rng.integers(0, _WFC_SEED_MAX,    size=1).astype(int)
-            types, rotations = self._decode_genome(bl_rows, bl_cols, bl_tiles, wfc_seed)
-            if self._extract_loop(types, rotations) is not None:
-                return {"bl_rows": bl_rows, "bl_cols": bl_cols,
-                        "bl_tiles": bl_tiles, "wfc_seed": wfc_seed}
-
-        # Absolute fallback: empty blacklist, fresh random seed
-        bl_rows  = rng.integers(0, GRID_H, size=N_BLACKLIST).astype(int)
-        bl_cols  = rng.integers(0, GRID_W, size=N_BLACKLIST).astype(int)
-        bl_tiles = np.full(N_BLACKLIST, _INACTIVE_TI, dtype=int)
-        wfc_seed = rng.integers(0, _WFC_SEED_MAX, size=1).astype(int)
-        return {"bl_rows": bl_rows, "bl_cols": bl_cols,
-                "bl_tiles": bl_tiles, "wfc_seed": wfc_seed}
+        n = GRID_H * GRID_W
+        active = rng.random(n) < _ROAD_GENE_RATE
+        tile_prefs = np.where(active, rng.integers(1, _N_WFC_TILES, size=n), 0).astype(int)
+        return {"tile_prefs": tile_prefs}
 
     def _rectangular_fallback(self, rng):
         min_dim = 3
@@ -520,16 +644,11 @@ class RacingTileProblem(RacingProblem):
     # work transparently with tile-grid content dicts.
 
     def _genome_to_tiles(self, content):
-        """Decode a blacklist genome dict to (types, rotations)."""
-        return self._decode_genome(
-            np.asarray(content["bl_rows"],  dtype=int),
-            np.asarray(content["bl_cols"],  dtype=int),
-            np.asarray(content["bl_tiles"], dtype=int),
-            wfc_seed=content.get("wfc_seed", [0]),
-        )
+        """Decode a tile-preference genome dict to (types, rotations)."""
+        return self._decode_genome(np.asarray(content["tile_prefs"], dtype=int))
 
     def _extract_content(self, content):
-        if isinstance(content, dict) and "bl_rows" in content:
+        if isinstance(content, dict) and "tile_prefs" in content:
             types, rotations = self._genome_to_tiles(content)
             pts = self._grid_to_track_points(types, rotations) \
                or self._best_effort_path(types, rotations)
@@ -558,13 +677,10 @@ class RacingTileProblem(RacingProblem):
             use_cache=use_cache,
         )
 
-    def quality(self, info):
-        return super().quality(info)
-
     # ── Tile rendering ────────────────────────────────────────────────
 
     def render(self, content=None, **kwargs):
-        if isinstance(content, dict) and "bl_rows" in content:
+        if isinstance(content, dict) and "tile_prefs" in content:
             self._tile_render_content = content
         else:
             self._tile_render_content = None

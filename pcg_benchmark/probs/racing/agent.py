@@ -71,6 +71,7 @@ class SteeringAgent:
         self.lat_accel_max = 10.401453052397617
 
         self.current_idx = 0
+        self._prev_desired_speed = None
 
         self._precompute_path_geometry()
     
@@ -136,6 +137,7 @@ class SteeringAgent:
         self.current_idx = 0
         self.last_lookahead_point = None
         self._lat_setpoint = 0.0
+        self._prev_desired_speed = None
 
     def _find_projection(self, point, start_idx):
         """Project `point` onto a local window of the polyline.
@@ -507,12 +509,10 @@ class SteeringAgent:
         turning_into_bend = (bend_sign != 0.0) and ((float(bend_sign) * float(heading_err)) > 0.03) and (abs_he > 0.06)
         non_hairpin = bend_factor < 0.55
 
-        # Corner slowdown: keep it conservative on real turns, but avoid unnecessary
-        # braking on very soft bends.
-        if bend_factor < 0.28:
-            desired_speed_turn *= (1.0 - 0.60 * float(bend_factor))
-        else:
-            desired_speed_turn *= (1.0 - 0.70 * float(bend_factor))
+        # Small conservative margin on top of the physics-based circumcircle speed.
+        # The circumcircle formula already accounts for lateral acceleration, so only
+        # a modest additional factor is needed here.
+        desired_speed_turn *= max(0.88, 1.0 - 0.18 * float(bend_factor))
         if non_hairpin and (not turning_into_bend) and (abs_he < 0.20) and (abs_off < 0.70 * corridor):
             desired_speed_turn *= 1.03
         if desired_speed_turn < float(self.turn_speed):
@@ -575,30 +575,40 @@ class SteeringAgent:
                 desired_speed = float(self.min_speed)
 
         # Exit recovery: once we are unwinding out of a bend, ramp target speed up
-        # aggressively to start throttle application much earlier.
+        # to start throttle application earlier and avoid sudden snap-to-full-throttle.
+        # Conditions are deliberately relaxed so recovery begins gradually rather than
+        # all at once when a tight threshold is crossed.
         exit_recover = (
             (not turning_into_bend)
             and non_hairpin
-            and (abs_he < 0.18)
-            and (bend_factor < 0.48)
-            and (abs_steer < 0.90)
-            and (abs_off < 0.75 * corridor)
+            and (abs_he < 0.35)       # was 0.18 — activate well before fully straight
+            and (bend_factor < 0.65)  # was 0.48
+            and (abs_steer < 0.98)    # was 0.90 — steering still winding down is fine
+            and (abs_off < 0.85 * corridor)  # was 0.75
         )
         if exit_recover:
-            straight_t = 1.0 - (abs_he / 0.18)
+            straight_t = 1.0 - (abs_he / 0.35)   # was /0.18
             if straight_t < 0.0:
                 straight_t = 0.0
             elif straight_t > 1.0:
                 straight_t = 1.0
-            unwind_t = 1.0 - (bend_factor / 0.48)
+            unwind_t = 1.0 - (bend_factor / 0.65)  # was /0.48
             if unwind_t < 0.0:
                 unwind_t = 0.0
             elif unwind_t > 1.0:
                 unwind_t = 1.0
             exit_t = 0.65 * straight_t + 0.35 * unwind_t
-            min_exit_speed = float(self.max_speed) * (0.60 + 0.18 * exit_t)
+            min_exit_speed = float(self.max_speed) * (0.52 + 0.20 * exit_t)  # gentler ramp
             if desired_speed < min_exit_speed:
                 desired_speed = min_exit_speed
+
+        # Rate-limit desired_speed increases to prevent sudden snap-to-throttle on
+        # corner exit.  Decreases are unrestricted so braking remains responsive.
+        if self._prev_desired_speed is not None:
+            max_ds_rise = 0.6  # m/s per timestep ≈ 6 m/s²
+            if desired_speed > self._prev_desired_speed + max_ds_rise:
+                desired_speed = self._prev_desired_speed + max_ds_rise
+        self._prev_desired_speed = desired_speed
 
         throttle = (desired_speed - float(speed)) / (self.max_speed if self.max_speed > 1.0 else 1.0)
 
@@ -610,7 +620,7 @@ class SteeringAgent:
             elif v_norm > 1.0:
                 v_norm = 1.0
             bend_brake = float(bend_factor) ** 1.35
-            brake_scale = 1.0 + 2.05 * bend_brake * v_norm
+            brake_scale = 1.0 + 0.70 * bend_brake * v_norm
             if non_hairpin and (not turning_into_bend):
                 brake_scale *= 0.88
             throttle *= brake_scale
