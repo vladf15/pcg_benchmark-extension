@@ -4,8 +4,15 @@ import numpy as np
 import scipy.spatial
 
 
-def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int) -> np.ndarray:
-    """Run Lloyd's Voronoi relaxation. Cells with infinite regions are left in place."""
+def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int,
+                     bounds: tuple[float, float, float, float] | None = None) -> np.ndarray:
+    """Run Lloyd's Voronoi relaxation. Cells with infinite regions are left in place.
+
+    Boundary-adjacent cells can have finite regions whose centroid lies far
+    outside the map (their Voronoi vertices are unbounded in practice), which
+    would drag sites — and with them the whole diagram — off the canvas.
+    `bounds` (xmin, ymin, xmax, ymax) clamps every relaxed site back inside.
+    """
     num_cells = len(cell_sites)
     relaxed_sites = cell_sites.copy()
 
@@ -29,6 +36,10 @@ def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int) -> np.ndarray:
                     ((x_coords + x_coords_next) * shoelace_cross).sum() / (6 * signed_area),
                     ((y_coords + y_coords_next) * shoelace_cross).sum() / (6 * signed_area),
                 ]
+        if bounds is not None:
+            xmin, ymin, xmax, ymax = bounds
+            new_sites[:, 0] = np.clip(new_sites[:, 0], xmin, xmax)
+            new_sites[:, 1] = np.clip(new_sites[:, 1], ymin, ymax)
         relaxed_sites = new_sites
 
     return relaxed_sites
@@ -82,7 +93,8 @@ def build_voronoi_cell_graph(num_cells: int, width: float, height: float, vorono
         size=(num_cells, 2),
     ).astype(float)
 
-    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations)
+    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations,
+                                  bounds=(margin, margin, W - margin, H - margin))
 
     try:
         voronoi = scipy.spatial.Voronoi(cell_sites) 
@@ -179,15 +191,27 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
                     stack.append(neighbour)
         visited.update(component)
 
-        if not component or any(len(adjacency.get(v, [])) != 2 for v in component):
+        # A clean cycle needs every vertex to have exactly two neighbours.
+        is_clean_cycle = len(component) > 0
+        for v in component:
+            if len(adjacency.get(v, [])) != 2:
+                is_clean_cycle = False
+                break
+        if not is_clean_cycle:
             continue
 
+        # Walk the cycle: from each vertex, continue to whichever of its two
+        # neighbours we did not just come from.  (next(iter(...)) just takes
+        # an arbitrary element from the set; sets cannot be indexed.)
         first_vertex = next(iter(component))
         prev_vertex, current_vertex, cycle = None, first_vertex, []
         for _ in range(len(component) + 2):
             cycle.append(current_vertex)
-            neighbours  = adjacency[current_vertex]
-            next_vertex = neighbours[0] if prev_vertex is None or neighbours[0] != prev_vertex else neighbours[1]
+            neighbours = adjacency[current_vertex]
+            if prev_vertex is None or neighbours[0] != prev_vertex:
+                next_vertex = neighbours[0]
+            else:
+                next_vertex = neighbours[1]
             prev_vertex, current_vertex = current_vertex, int(next_vertex)
             if current_vertex == first_vertex:
                 break

@@ -16,7 +16,6 @@ class CarPhysicsEngine:
         B_lon, C_lon, D_lon, E_lon = 1.9, 1.95, 1.0, 0.97
 
         slip_angles = np.linspace(-np.deg2rad(25), np.deg2rad(25), 101)
-        self.lut_slip_angles = slip_angles
         self._lut_sa_min = float(slip_angles[0])
         self._lut_sa_max = float(slip_angles[-1])
         self._lut_sa_step = float(slip_angles[1] - slip_angles[0])
@@ -24,7 +23,6 @@ class CarPhysicsEngine:
         self.lut_lateral = D_lat * np.sin(C_lat * np.arctan(x_lat - E_lat * (x_lat - np.arctan(x_lat))))
         
         slip_ratios = np.linspace(-1.0, 1.0, 101)
-        self.lut_slip_ratios = slip_ratios
         self._lut_sr_min = float(slip_ratios[0])
         self._lut_sr_max = float(slip_ratios[-1])
         self._lut_sr_step = float(slip_ratios[1] - slip_ratios[0])
@@ -77,50 +75,52 @@ class CarPhysicsEngine:
         start_position,
         start_angle=0.0,
         time_step=0.1,
-        friction_coef=0.0,
         max_steering=np.deg2rad(30.0),
-        max_speed=55.0,
-        max_throttle=1.0,
-        max_brake=-1.0,
+        max_speed=83.0,
         steering_rate=np.deg2rad(180.0),
-        length=5.0,
+        length=3.0,
         lateral_friction=1.2,
     ):
         self.time_step = time_step
-        self.friction_coef = friction_coef
         self.max_steering = max_steering
-        self.max_throttle = max_throttle
-        self.max_brake = max_brake
-        self.max_speed = max_speed
-        self.length = length
+        self.max_speed = max_speed          # 83 m/s ~ 300 km/h top speed
+        self.length = length                # wheelbase (m)
         self.steering_rate = steering_rate
         self.lateral_friction = lateral_friction
         self.start_position = np.array(start_position, dtype=float)
         self.start_angle = start_angle
 
-        self.mass = 1350.0
-        self.lf = self.length * 0.55
-        self.lr = self.length * 0.45
+        # Car spec: rounded Porsche 911 (rear-engine sports car on track
+        # tires).  1500 kg, 3.0 m wheelbase, 40/60 front/rear weight, ~1.3 g
+        # of grip, 0-100 km/h in ~3.5 s, 100-0 km/h in ~35 m.
+        self.mass = 1500.0
+        self.lf = self.length * 0.60        # cg sits nearer the rear axle
+        self.lr = self.length * 0.40
         self.inertia_z = self.mass * (self.length ** 2) * 0.34
-        self.c_rr = 0.016
+        self.c_rr = 0.015
         self.rho_air = 1.225
-        self.cd_a = 1.35
+        self.cd_a = 0.65                    # Cd ~0.32 x frontal area ~2.0 m^2
 
-        self.max_drive_force = 25000.0
-        self.max_brake_force = 13500.0
+        self.max_drive_force = 12500.0      # tuned for 0-100 km/h ~ 3.5 s
+        self.max_brake_force = 16000.0      # ~1.1 g, 100-0 km/h ~ 35 m
 
         self._throttle_state = 0.0
         self.throttle_slew_rate = 6.0
 
-        self.tire_mu = 1.45
+        self.tire_mu = 1.3                  # track-day tires, ~1.3 g
+        # 0: the tires' slip angles already damp yaw naturally, giving a
+        # realistic ~15-20% yaw overshoot on a step-steer.  Any exponential
+        # yaw damping on top starves steady-state cornering (holding a
+        # corner then needs a constant surplus yaw moment).
+        self.yaw_damping = 0.0
 
         self.max_slip_angle = np.deg2rad(10.0)
         self.max_slip_ratio = 1.0
 
         self.g = 9.81
         self.normal_load = self.mass * self.g
-        self.load_front = self.normal_load * 0.55  # 55% front, 45% rear typical
-        self.load_rear = self.normal_load * 0.45
+        self.load_front = self.normal_load * 0.40  # rear-engine: 40/60
+        self.load_rear = self.normal_load * 0.60
 
         self.max_tire_force_front = self.load_front * self.tire_mu
         self.max_tire_force_rear = self.load_rear * self.tire_mu
@@ -136,16 +136,18 @@ class CarPhysicsEngine:
         self.velocity = np.zeros(2, dtype=float)
         self.yaw_rate = 0.0
         self.steering_angle = 0.0
-        self._wheel_omega = 0.0
         self._throttle_state = 0.0
         return self.get_state()
 
     def step(self, action):
-        """Advance the physics by one time step using a control dict."""
+        """Advance the physics by one time step using a control dict.
+
+        Stages: read and rate-limit the inputs, compute per-axle slip and
+        tire forces (Pacejka + friction circle), then integrate the body.
+        """
         time_step = self.time_step
-        cos_a0 = math.cos(self.angle)
-        sin_a0 = math.sin(self.angle)
-        v_forward0 = cos_a0 * self.velocity[0] + sin_a0 * self.velocity[1]
+
+        # ── Inputs: steering lock, pedal slew, steering rate limit ────────
         # Use total speed to blend steering lock between low-speed and high-speed limits.
         v0 = math.hypot(float(self.velocity[0]), float(self.velocity[1]))
         max_steer_low = math.radians(75.0)
@@ -196,6 +198,7 @@ class CarPhysicsEngine:
         elif self.steering_angle > max_steering:
             self.steering_angle = max_steering
 
+        # ── Body-frame velocities and resistance forces ───────────────────
         cos_a = math.cos(self.angle)
         sin_a = math.sin(self.angle)
 
@@ -209,24 +212,19 @@ class CarPhysicsEngine:
         drag_force = 0.5 * self.rho_air * self.cd_a * (speed_abs ** 2)
         resist_force = (rolling_force + drag_force) * (1.0 if v_forward >= 0.0 else -1.0)
 
-        if throttle_input >= 0.0:
-            drive_force = throttle_input * self.max_drive_force
-            brake_force = 0.0
-        else:
-            drive_force = 0.0
-            brake_force = (-throttle_input) * self.max_brake_force
-
-        Fx_req = drive_force - brake_force
-
         v = abs(v_forward)
         t = (v - 6.0) / 24.0
         if t < 0.0:
             t = 0.0
         elif t > 1.0:
             t = 1.0
-        steering_gain = (1.75 * (1.0 - t)) + (0.70 * t)
+        # Speed-scheduled steering assist.  These gains are scaled to the
+        # wheelbase (yaw response goes as delta / wheelbase) so the car's
+        # steering feel matches what the agent was tuned for.
+        steering_gain = (1.05 * (1.0 - t)) + (0.45 * t)
         delta = self.steering_angle * steering_gain
 
+        # ── Lateral tire forces from per-axle slip angles ─────────────────
         vxf = v_forward
         vyf = v_lateral + self.lf * yaw_rate
         vxr = v_forward
@@ -260,24 +258,24 @@ class CarPhysicsEngine:
         Fy0_f *= v_lat_scale
         Fy0_r *= v_lat_scale
 
+        # ── Longitudinal tire force from the pedal ────────────────────────
+        # The pedal demands a slip ratio directly and the Pacejka curve turns
+        # it into longitudinal force.  (The previous integrating wheel-speed
+        # state wound up under sustained throttle and kept driving at full
+        # force for seconds after the pedal lifted; a direct demand has no
+        # such memory, and response time is set by the throttle slew rate.)
         Fx_cap_total = (self.max_tire_force_front + self.max_tire_force_rear)
-        wheel_omega = float(getattr(self, '_wheel_omega', 0.0))
-        omega_rate = (Fx_req / max(self.mass, 1.0)) * 0.6
-        wheel_omega += omega_rate * time_step
-        if wheel_omega < 0.0:
-            wheel_omega = 0.0
-
-        v_ref = 2.0
-        denom = speed_abs if speed_abs > v_ref else v_ref
-        kappa = (wheel_omega - v_forward) / denom
-        if kappa < -self.max_slip_ratio:
-            kappa = -self.max_slip_ratio
-        elif kappa > self.max_slip_ratio:
-            kappa = self.max_slip_ratio
+        kappa = throttle_input * self.max_slip_ratio
+        if v_forward <= 0.1 and throttle_input < 0.0:
+            kappa = 0.0  # standing still: brakes hold, they do not reverse
 
         lon_coeff = self._get_longitudinal_force_coeff(kappa)
         Fx0_total = float(lon_coeff) * Fx_cap_total
-        self._wheel_omega = wheel_omega
+        # Respect the drivetrain force ceilings (engine and brake hardware).
+        if Fx0_total > self.max_drive_force:
+            Fx0_total = self.max_drive_force
+        elif Fx0_total < -self.max_brake_force:
+            Fx0_total = -self.max_brake_force
 
         Fx0_f = Fx0_total * (self.load_front / self.normal_load)
         Fx0_r = Fx0_total * (self.load_rear / self.normal_load)
@@ -316,6 +314,7 @@ class CarPhysicsEngine:
         Fx_body = Fx_f + Fx_r - resist_force
         Fy_body = Fy_f_b + Fy_r_b
 
+        # ── Integrate the body (velocities, yaw, pose) ────────────────────
         ax = Fx_body / self.mass + yaw_rate * v_lateral
         ay = Fy_body / self.mass - yaw_rate * v_forward
         v_forward += ax * time_step
@@ -329,10 +328,14 @@ class CarPhysicsEngine:
         elif v_forward > self.max_speed:
             v_forward = self.max_speed
 
+        # Lateral scrub and yaw damping are separate: damping the sideways
+        # velocity models tire relaxation, but damping the yaw rate directly
+        # fights the steady-state cornering moment (the tires already damp
+        # yaw physically through the slip angles), so it stays much smaller.
         if self.lateral_friction > 0.0:
-            damp = math.exp(-self.lateral_friction * time_step)
-            v_lateral *= damp
-            yaw_rate *= damp
+            v_lateral *= math.exp(-self.lateral_friction * time_step)
+        if self.yaw_damping > 0.0:
+            yaw_rate *= math.exp(-self.yaw_damping * time_step)
 
         self.yaw_rate = yaw_rate
 

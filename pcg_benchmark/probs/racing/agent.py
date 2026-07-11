@@ -4,207 +4,217 @@ import numpy as np
 
 
 class SteeringAgent:
-    """Path-following agent using a Stanley-style steering law.
+    """Path-following agent: lookahead + Stanley steering, and a speed target
+    taken from a precomputed physical speed profile.
 
+    The speed profile is the standard approach used in racing AI and
+    trajectory planning, computed once per track in three steps:
+
+      1. Corner limit: at every path point the lateral acceleration bound
+         gives a maximum cornering speed  v = sqrt(a_lat_max / curvature).
+      2. Backward pass: driving toward a corner, speed may exceed the corner
+         limit only by what braking can shed over the remaining distance
+         (v^2 <= v_next^2 + 2 * a_brake * ds), so the car brakes *before*
+         corners instead of reacting inside them.
+      3. Forward pass: speed may rise out of a corner only as fast as the
+         engine accelerates (v^2 <= v_prev^2 + 2 * a_accel * ds), so corner
+         exits ramp up smoothly instead of snapping to full throttle.
+
+    act() then only has to steer at a lookahead point and track the profile,
+    which keeps the per-step work small and the behavior explainable.
     Steering output is normalized to [-1, 1] for the engine.
     """
 
-    def __init__(
-        self,
-        curve_points,
-        track_width=12.0,
-        line_strategy=None,
-        max_speed=25.128261272942474,
-        enable_wander=False,
-    ):
+    def __init__(self, curve_points, track_width=12.0, max_speed=25.0):
         """Create a steering agent for the given path."""
-        self.path_points = np.array(curve_points, dtype=float)
         self.track_width = float(track_width)
         self.max_speed = float(max_speed)
-        self.enable_wander = bool(enable_wander)
 
         self.last_lookahead_point = None
 
-        self.look_ahead_dist = 8.299299919527938
-        self.curvature_lookahead = 55.0
-        self.predict_time_base = 0.40
-        self.predict_time_speed_gain = 0.012
+        # Physical limits used by the speed profile (m/s^2).  The engine's
+        # tires allow ~12.8 m/s^2 (mu 1.3).  Racing-game bots (TORCS/Speed
+        # Dreams) plan corner speed at 80-90% of available grip, leaving a
+        # margin for control error; 11 is ~86% of grip, which is as much as
+        # this steering law holds cleanly (higher runs wide on tight tile
+        # corners).
+        self.lat_accel_max = 11.0   # cornering
+        self.brake_decel   = 6.0    # braking before corners
+        self.accel_max     = 4.0    # acceleration out of corners
+        self.min_speed     = 4.0    # never plan slower than this
+
+        # Steering law.
+        self.lookahead_base = 8.0    # metres at standstill
+        self.lookahead_gain = 0.35   # extra metres per m/s of speed
+        self.lookahead_max  = 30.0
+        self.stanley_k      = 0.35   # cross-track gain (trim only; the
+        self.stanley_v0     = 1.5    # lookahead aim does the main work)
+        self.nominal_max_steer_rad = math.radians(28.0)
+
+        # Slow down when the car drifts outside the usable corridor
+        # (half width minus a margin).
+        self.corridor_margin = max(1.0, 0.18 * self.track_width)
+
+        # Speed tracking: full throttle / full brake at these speed errors
+        # (m/s).  Braking is stiffer than accelerating so the car does not
+        # lag behind a falling profile and enter corners too fast.
+        self.accel_deficit_full = 5.0
+        self.brake_excess_full  = 2.5
+        self.react_time         = 0.3
+
+        # Projection window (path indices), same scheme as before: search a
+        # window around the last known segment so progress stays monotonic.
         self.search_ahead = 55
         self.search_back = 15
         self.max_index_advance = 12
 
-        self.corridor_margin = max(1.0, 0.18 * float(self.track_width))
-        # NOTE: We intentionally avoid any default-to-center behavior.
-        # Lateral position is controlled by a persistent setpoint and edge containment only.
-        self.centering_gain_rad = 0.0
-        self.containment_gain_rad = math.radians(79.80565380471872)
-
-        # Persistent lateral setpoint (signed offset from centerline) that we keep unless
-        # a racing-line strategy (or edge containment) changes it.
-        self._lat_setpoint = 0.0
-        self.lat_setpoint_hold_alpha = 0.21479116970541606
-        self.lat_setpoint_turn_alpha = 0.5491085743829589
-        self.lat_setpoint_edge_push = 0.65
-
-        # Entry/apex fractions are measured relative to half-track corridor width.
-        # Slightly wider outside-before-turn entry (still clamped for safety).
-        self.racing_line_max_frac = 0.82
-        self.racing_line_entry_frac = 1.12
-        self.racing_line_apex_frac = 0.019266969270553408
-        self.racing_line_enable = True
-
-        self.nominal_max_steer_rad = math.radians(28.0)
-        self.stanley_k = 0.23482655615044332
-        self.stanley_v0 = 1.5
-        self.curvature_ff_gain = 0.43593169971431184
-        self.curvature_ff_gain_line = 0.1392239380926806
-
-        self.lookahead_base = 7.623782135263054
-        self.lookahead_speed_gain = 0.1033620201029109
-        self.lookahead_low_speed_cutoff = 13.985505684631006
-        self.lookahead_low_speed_scale = 0.5592245566254428
-        self.lookahead_min = 7.623782135263054
-        self.lookahead_max = 40.76421249709552
-
-        self.min_speed = 2.8032007263857475
-        self.turn_speed = 7.0
-        self.lat_accel_max = 10.401453052397617
-
         self.current_idx = 0
-        self._prev_desired_speed = None
+        self.curve_points = curve_points  # setter precomputes everything
 
-        self._precompute_path_geometry()
-    
+    # ── Path geometry and speed profile (once per track) ─────────────────
+
     def _precompute_path_geometry(self):
-        """Precompute per-segment geometry for fast projection/lookahead queries."""
+        """Precompute segment geometry and the speed profile for the path."""
         pts = np.asarray(self.path_points, dtype=float)
         n = len(pts)
         if n < 2:
-            self._seg_vec = np.zeros((0, 2), dtype=float)
-            self._seg_len = np.zeros((0,), dtype=float)
-            self._seg_tan = np.zeros((0, 2), dtype=float)
-            self._seg_norm = np.zeros((0, 2), dtype=float)
-            self._seg_a = np.zeros((0, 2), dtype=float)
-            self._seg_b = np.zeros((0, 2), dtype=float)
-            self._seg_ab = np.zeros((0, 2), dtype=float)
-            self._seg_ab2 = np.zeros((0,), dtype=float)
-            self._scratch_t = np.zeros((0,), dtype=float)
-            self._scratch_d2 = np.zeros((0,), dtype=float)
-            self._seg_s0 = np.zeros((0,), dtype=float)
-            self._cum_s = np.zeros((0,), dtype=float)
+            self._seg_a = np.zeros((0, 2))
+            self._seg_ab = np.zeros((0, 2))
+            self._seg_ab2 = np.zeros((0,))
+            self._seg_len = np.zeros((0,))
+            self._seg_norm = np.zeros((0, 2))
+            self._seg_s0 = np.zeros((0,))
+            self._cum_s = np.zeros((1,))
+            self._speed_profile = np.zeros((0,))
             return
 
-        seg_a = pts[:-1].copy()
-        seg_b = pts[1:].copy()
-        seg = seg_b - seg_a
+        seg = pts[1:] - pts[:-1]
         seg_len = np.linalg.norm(seg, axis=1)
         seg_tan = np.zeros_like(seg)
         nonzero = seg_len > 1e-9
-        seg_tan[nonzero] = seg[nonzero] / seg_len[nonzero, None]
-        seg_norm = np.stack([-seg_tan[:, 1], seg_tan[:, 0]], axis=1)
+        # Unit tangent per segment: divide each (x, y) by the segment length.
+        # reshape(-1, 1) turns the lengths into a column so numpy divides the
+        # x and y of each row by that row's length.
+        seg_tan[nonzero] = seg[nonzero] / seg_len[nonzero].reshape(-1, 1)
 
-        seg_ab2 = np.einsum('ij,ij->i', seg, seg)
-
-        seg_s0 = np.zeros((len(seg_len),), dtype=float)
-        if len(seg_len) > 0:
-            seg_s0[1:] = np.cumsum(seg_len[:-1])
-        cum_s = np.concatenate(([0.0], np.cumsum(seg_len)))
-
-        self._seg_vec = seg
-        self._seg_len = seg_len
-        self._seg_tan = seg_tan
-        self._seg_norm = seg_norm
-
-        self._seg_a = seg_a
-        self._seg_b = seg_b
+        self._seg_a = pts[:-1]
         self._seg_ab = seg
-        self._seg_ab2 = seg_ab2
-        self._seg_s0 = seg_s0
-        self._cum_s = cum_s
+        # Squared length of each segment (x*x + y*y per row).
+        self._seg_ab2 = seg[:, 0] * seg[:, 0] + seg[:, 1] * seg[:, 1]
+        self._seg_len = seg_len
+        self._seg_norm = np.stack([-seg_tan[:, 1], seg_tan[:, 0]], axis=1)
 
-        m = len(seg_ab2)
-        self._scratch_t = np.zeros((m,), dtype=float)
-        self._scratch_d2 = np.zeros((m,), dtype=float)
+        # Arc length at the start of each segment / at each vertex.
+        self._seg_s0 = np.concatenate(([0.0], np.cumsum(seg_len[:-1])))
+        self._cum_s = np.concatenate(([0.0], np.cumsum(seg_len)))
 
-        self._scratch_pos = np.zeros((2,), dtype=float)
-        self._scratch_proj = np.zeros((2,), dtype=float)
-        self._scratch_pred = np.zeros((2,), dtype=float)
+        self._closed = bool(n >= 4 and np.allclose(pts[0], pts[-1], atol=1e-6))
+        self._speed_profile = self._compute_speed_profile(pts, seg_tan, seg_len)
 
-        self._scratch_vel = np.zeros((2,), dtype=float)
-    
+    def _compute_speed_profile(self, pts, seg_tan, seg_len):
+        """Per-vertex speed limits: corner limit, then brake and accel passes."""
+        n = len(pts)
+        m = len(seg_len)  # = n - 1 segments
+
+        # Curvature at each interior vertex: turn angle between the two
+        # adjacent segments divided by the local arc length.
+        v_corner = np.full(n, self.max_speed, dtype=float)
+        for i in range(1, m):
+            t0, t1 = seg_tan[i - 1], seg_tan[i]
+            dot = float(np.clip(np.dot(t0, t1), -1.0, 1.0))
+            angle = math.acos(dot)
+            ds = 0.5 * float(seg_len[i - 1] + seg_len[i])
+            if ds > 1e-9 and angle > 1e-9:
+                curvature = angle / ds
+                v_corner[i] = math.sqrt(self.lat_accel_max / curvature)
+        if self._closed and m >= 2:
+            # The seam vertex (0 == n-1) also has a turn angle.
+            t0, t1 = seg_tan[-1], seg_tan[0]
+            dot = float(np.clip(np.dot(t0, t1), -1.0, 1.0))
+            angle = math.acos(dot)
+            ds = 0.5 * float(seg_len[-1] + seg_len[0])
+            if ds > 1e-9 and angle > 1e-9:
+                v_corner[0] = math.sqrt(self.lat_accel_max / (angle / ds))
+                v_corner[-1] = v_corner[0]
+
+        profile = np.clip(v_corner, self.min_speed, self.max_speed)
+
+        # Backward pass: entering point i at profile[i] must allow braking
+        # down to profile[i+1] over segment i.  For closed loops run the pass
+        # twice so the constraint propagates across the seam.
+        rounds = 2 if self._closed else 1
+        for _ in range(rounds):
+            for i in range(m - 1, -1, -1):
+                v_allowed = math.sqrt(profile[i + 1] ** 2 + 2.0 * self.brake_decel * float(seg_len[i]))
+                if profile[i] > v_allowed:
+                    profile[i] = v_allowed
+            if self._closed:
+                profile[-1] = profile[0] = min(profile[0], profile[-1])
+
+        # Forward pass: speed can only build up at accel_max.
+        for _ in range(rounds):
+            for i in range(m):
+                v_reachable = math.sqrt(profile[i] ** 2 + 2.0 * self.accel_max * float(seg_len[i]))
+                if profile[i + 1] > v_reachable:
+                    profile[i + 1] = v_reachable
+            if self._closed:
+                profile[-1] = profile[0] = min(profile[0], profile[-1])
+
+        return profile
+
     def reset(self):
         """Reset agent to start of path."""
         self.current_idx = 0
         self.last_lookahead_point = None
-        self._lat_setpoint = 0.0
-        self._prev_desired_speed = None
+
+    # ── Path queries ──────────────────────────────────────────────────────
 
     def _find_projection(self, point, start_idx):
-        """Project `point` onto a local window of the polyline.
+        """Project `point` onto a window of the polyline around `start_idx`.
 
-        Returns `(seg_idx, proj_point)` where `seg_idx` is the best segment index.
+        Returns `(seg_idx, proj_point)` for the closest segment in the window.
         """
         nseg = len(self.path_points) - 1
         if nseg <= 0:
             return 0, np.asarray(point, dtype=float)
 
-        i0 = int(max(0, min(start_idx - int(self.search_back), nseg - 1)))
-        i1 = int(min(nseg - 1, max(i0, start_idx) + int(self.search_ahead)))
+        i0 = int(max(0, min(start_idx - self.search_back, nseg - 1)))
+        i1 = int(min(nseg - 1, max(i0, start_idx) + self.search_ahead))
         sl = slice(i0, i1 + 1)
 
         p = np.asarray(point, dtype=float)
-
         a = self._seg_a[sl]
         ab = self._seg_ab[sl]
         ab2 = self._seg_ab2[sl]
-        t = self._scratch_t[sl]
-        d2 = self._scratch_d2[sl]
 
-        # Dot-product numerator reused for projection parameter t on each segment.
-        pab = self._scratch_d2[sl]
-        pab[:] = p[0] * ab[:, 0] + p[1] * ab[:, 1]
-        pab -= (a[:, 0] * ab[:, 0] + a[:, 1] * ab[:, 1])
-        denom = np.where(ab2 > 1e-12, ab2, 1.0)
-        t[:] = pab / denom
-        np.clip(t, 0.0, 1.0, out=t)
-
-        proj_x = a[:, 0] + ab[:, 0] * t
-        proj_y = a[:, 1] + ab[:, 1] * t
-        dx = p[0] - proj_x
-        dy = p[1] - proj_y
-        d2[:] = dx * dx + dy * dy
+        # Fraction t of the way along each segment where the point projects,
+        # clamped to [0, 1] so the projection stays on the segment.
+        t = (p - a)[:, 0] * ab[:, 0] + (p - a)[:, 1] * ab[:, 1]
+        t = np.clip(t / np.where(ab2 > 1e-12, ab2, 1.0), 0.0, 1.0)
+        proj = a + ab * t.reshape(-1, 1)
+        diff = p - proj
+        d2 = diff[:, 0] * diff[:, 0] + diff[:, 1] * diff[:, 1]  # squared distances
 
         j = int(np.argmin(d2))
-        best_i = i0 + j
-        out = self._scratch_proj
-        out[0] = float(proj_x[j])
-        out[1] = float(proj_y[j])
-        return best_i, out
+        return i0 + j, proj[j]
 
     def _point_at_distance_ahead(self, seg_idx, from_point, distance):
-        """Return a point `distance` ahead along the polyline from `from_point`."""
+        """Return the point `distance` metres further along the polyline."""
         pts = self.path_points
         nseg = len(pts) - 1
         if nseg <= 0:
             return np.asarray(from_point, dtype=float)
 
         i = int(max(0, min(seg_idx, nseg - 1)))
-        p = np.asarray(from_point, dtype=float)
-
-        a = self._seg_a[i]
-        ab = self._seg_ab[i]
-        ab2 = float(self._seg_ab2[i])
-        if ab2 > 1e-12:
-            t = float(np.dot(p - a, ab) / ab2)
-            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-        else:
-            t = 0.0
-        s_here = float(self._seg_s0[i] + t * self._seg_len[i])
+        s_here = self._arc_position(i, from_point)
         s_target = s_here + float(distance)
 
-        total_len = float(self._cum_s[-1]) if len(self._cum_s) else 0.0
+        total_len = float(self._cum_s[-1])
         if s_target >= total_len:
-            return pts[-1].copy()
+            if self._closed and total_len > 1e-9:
+                s_target = s_target % total_len
+            else:
+                return pts[-1].copy()
 
         j = int(np.searchsorted(self._cum_s, s_target, side='right') - 1)
         j = int(max(0, min(j, nseg - 1)))
@@ -212,432 +222,105 @@ class SteeringAgent:
         seg_len = float(self._seg_len[j])
         if seg_len < 1e-9:
             return pts[j].copy()
-        u = ds / seg_len
-        return self._seg_a[j] + self._seg_ab[j] * u
+        return self._seg_a[j] + self._seg_ab[j] * (ds / seg_len)
+
+    def _arc_position(self, seg_idx, point):
+        """Arc length of `point` projected onto segment `seg_idx`."""
+        a = self._seg_a[seg_idx]
+        ab = self._seg_ab[seg_idx]
+        ab2 = float(self._seg_ab2[seg_idx])
+        t = 0.0
+        if ab2 > 1e-12:
+            t = float(np.clip(np.dot(np.asarray(point, dtype=float) - a, ab) / ab2, 0.0, 1.0))
+        return float(self._seg_s0[seg_idx] + t * self._seg_len[seg_idx])
 
     def _signed_lateral_offset(self, point, seg_idx):
-        """Signed lateral offset from centerline at `seg_idx` (positive = left)."""
-        pts = self.path_points
-        nseg = len(pts) - 1
+        """Signed offset from the centerline at `seg_idx` (positive = left)."""
+        nseg = len(self.path_points) - 1
         if nseg <= 0:
             return 0.0
         i = int(max(0, min(seg_idx, nseg - 1)))
-        a = pts[i]
-        n = self._seg_norm[i] if len(self._seg_norm) > 0 else np.array([0.0, 0.0])
-        return float(np.dot(point - a, n))
-    
+        return float(np.dot(np.asarray(point, dtype=float) - self._seg_a[i], self._seg_norm[i]))
+
     @property
     def curve_points(self):
         return self.path_points
-    
+
     @curve_points.setter
     def curve_points(self, points):
         self.path_points = np.array(points, dtype=float)
+        self._closed = False
         self._precompute_path_geometry()
-    
+
+    # ── Control ───────────────────────────────────────────────────────────
+
     def act(self, car_state):
-        """Return an action dict `{steering, throttle}` for the current `car_state`.
+        """Return an action dict `{steering, throttle}` for the current state.
 
         `car_state` is `[x, y, angle, speed, steering_angle]`.
         """
-        x, y, angle, speed, _steering_angle = car_state
-        pos = self._scratch_pos
-        pos[0] = float(x)
-        pos[1] = float(y)
-        cos_a = math.cos(float(angle))
-        sin_a = math.sin(float(angle))
-        vel = self._scratch_vel
-        spd = float(speed)
-        vel[0] = cos_a * spd
-        vel[1] = sin_a * spd
-
+        x, y, angle, speed, _steer = car_state
         if len(self.path_points) < 2:
             return {'steering': 0.0, 'throttle': 0.0}
+        pos = np.array([float(x), float(y)])
+        spd = float(speed)
 
-        predict_t = self.predict_time_base + self.predict_time_speed_gain * float(speed)
-        predicted = self._scratch_pred
-        predicted[0] = pos[0] + vel[0] * predict_t
-        predicted[1] = pos[1] + vel[1] * predict_t
-        seg_idx, proj = self._find_projection(predicted, start_idx=self.current_idx)
-
-        seg_idx = int(seg_idx)
+        # Track progress: project onto the path near the last known segment,
+        # never jumping backward past the window or too far forward at once.
+        seg_idx, proj = self._find_projection(pos, start_idx=self.current_idx)
         cur = int(self.current_idx)
         if seg_idx < cur:
-            seg_idx = max(seg_idx, cur - int(self.search_back))
+            seg_idx = max(seg_idx, cur - self.search_back)
         else:
-            seg_idx = min(seg_idx, cur + int(self.max_index_advance))
+            seg_idx = min(seg_idx, cur + self.max_index_advance)
         self.current_idx = int(seg_idx)
 
-        half_width = self.track_width * 0.5
-        corridor = max(1.0, half_width - self.corridor_margin)
-        lat_off = self._signed_lateral_offset(predicted, self.current_idx)
-        abs_off = abs(lat_off)
-
-        lookahead_speed_gain = float(self.lookahead_speed_gain)
-        if spd < float(self.lookahead_low_speed_cutoff):
-            # Taper speed contribution at low speed to force earlier turn-in.
-            low_t = spd / float(self.lookahead_low_speed_cutoff)
-            if low_t < 0.0:
-                low_t = 0.0
-            elif low_t > 1.0:
-                low_t = 1.0
-            speed_scale = float(self.lookahead_low_speed_scale) + (1.0 - float(self.lookahead_low_speed_scale)) * low_t
-            lookahead = float(self.lookahead_base) + lookahead_speed_gain * spd * speed_scale
-        else:
-            lookahead = float(self.lookahead_base) + lookahead_speed_gain * spd
-        if abs_off > corridor:
-            lookahead *= 0.45
-        elif abs_off > 0.85 * corridor:
-            lookahead *= 0.65
-        if lookahead < self.lookahead_min:
-            lookahead = self.lookahead_min
-        elif lookahead > self.lookahead_max:
-            lookahead = self.lookahead_max
+        # ── Steering: aim the car at a lookahead point + Stanley term ──
+        # Aiming from the car (not from its projection) means that when the
+        # car is pushed off the road, the heading error itself points back
+        # toward the track, so recovery needs no special case.
+        # lookahead_base already equals the smallest useful lookahead, so
+        # only the upper end needs clamping.
+        lookahead = self.lookahead_base + self.lookahead_gain * spd
+        lookahead = min(lookahead, self.lookahead_max)
         look_pt = self._point_at_distance_ahead(self.current_idx, proj, lookahead)
-
-        t_dx = float(look_pt[0] - proj[0])
-        t_dy = float(look_pt[1] - proj[1])
-        t2 = t_dx * t_dx + t_dy * t_dy
-        if t2 > 1e-12:
-            path_heading = math.atan2(t_dy, t_dx)
-        else:
-            tan = self._seg_tan[self.current_idx] if len(self._seg_tan) > 0 else (1.0, 0.0)
-            path_heading = math.atan2(float(tan[1]), float(tan[0]))
-
-        heading_err = path_heading - float(angle)
-        heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
-        abs_he = abs(float(heading_err))
-
-        near_pt = self._point_at_distance_ahead(self.current_idx, proj, max(20.0, 0.45 * lookahead))
-        far_pt = self._point_at_distance_ahead(self.current_idx, proj, max(60.0, float(self.curvature_lookahead), lookahead + 35.0))
-        n_dx = float(near_pt[0] - proj[0])
-        n_dy = float(near_pt[1] - proj[1])
-        f_dx = float(far_pt[0] - proj[0])
-        f_dy = float(far_pt[1] - proj[1])
-        n2 = n_dx * n_dx + n_dy * n_dy
-        f2 = f_dx * f_dx + f_dy * f_dy
-        if n2 > 1e-12 and f2 > 1e-12:
-            invn = 1.0 / math.sqrt(n2)
-            invf = 1.0 / math.sqrt(f2)
-            nux, nuy = n_dx * invn, n_dy * invn
-            fux, fuy = f_dx * invf, f_dy * invf
-            dot = nux * fux + nuy * fuy
-            if dot < -1.0:
-                dot = -1.0
-            elif dot > 1.0:
-                dot = 1.0
-            bend = math.acos(dot)
-            cross = nux * fuy - nuy * fux
-            bend_sign = -1.0 if cross < 0.0 else (1.0 if cross > 0.0 else 0.0)
-        else:
-            bend = 0.0
-            bend_sign = 0.0
-
-        bend_factor = bend / 1.1
-        if bend_factor < 0.0:
-            bend_factor = 0.0
-        elif bend_factor > 1.0:
-            bend_factor = 1.0
-
-        # Default behavior: keep your current lateral position (no centering).
-        max_lat = 0.98 * float(corridor)
-        if self._lat_setpoint < -max_lat:
-            self._lat_setpoint = -max_lat
-        elif self._lat_setpoint > max_lat:
-            self._lat_setpoint = max_lat
-
-        # Gently track the current lateral offset to avoid stale setpoints.
-        hold_alpha = float(self.lat_setpoint_hold_alpha)
-        if hold_alpha < 0.0:
-            hold_alpha = 0.0
-        elif hold_alpha > 1.0:
-            hold_alpha = 1.0
-        self._lat_setpoint = (1.0 - hold_alpha) * float(self._lat_setpoint) + hold_alpha * float(lat_off)
-
-        # Edge containment: if we're getting too close to the corridor edge, nudge the
-        # setpoint back inward (still not toward center unless necessary).
-        edge_soft = 0.92 * float(corridor)
-        if abs_off > edge_soft and corridor > 1e-6:
-            over = (abs_off - edge_soft) / (float(corridor) - edge_soft + 1e-9)
-            if over < 0.0:
-                over = 0.0
-            elif over > 1.0:
-                over = 1.0
-            inward = (1.0 - over) * abs_off + over * edge_soft
-            self._lat_setpoint = math.copysign(inward, float(lat_off))
-
-        desired_lat_off = float(self._lat_setpoint)
-        racing_line_enable = bool(self.racing_line_enable)
-        using_racing_line = bool(racing_line_enable and bend_factor > 0.02 and bend_sign != 0.0)
-        if using_racing_line:
-            outside_lat = (-float(bend_sign)) * (self.racing_line_entry_frac * corridor)
-            inside_lat = (float(bend_sign)) * (self.racing_line_apex_frac * corridor)
-
-            he_entry = 0.58
-            he_apex = 0.98
-            if abs_he <= he_entry:
-                phase_he = 0.0
-            elif abs_he >= he_apex:
-                phase_he = 1.0
-            else:
-                phase_he = (abs_he - he_entry) / (he_apex - he_entry)
-
-            bf_entry = 0.48
-            bf_apex = 0.94
-            if bend_factor <= bf_entry:
-                phase_bf = 0.0
-            elif bend_factor >= bf_apex:
-                phase_bf = 1.0
-            else:
-                phase_bf = (bend_factor - bf_entry) / (bf_apex - bf_entry)
-
-            # Hairpins: don't let curvature alone force an early apex.
-            if bend_factor > 0.65:
-                phase_bf *= 0.65
-            else:
-                phase_bf *= 0.96
-
-            # Combine heading- and curvature-based phase with the more advanced one.
-            phase_t = phase_he if phase_he > phase_bf else phase_bf
-
-            desired_lat_off = outside_lat * (1.0 - phase_t) + inside_lat * phase_t
-
-            if bend_factor > 0.55 and spd < 14.0:
-                late_entry = 0.94
-                late_apex = 1.10
-                if abs_he <= late_entry:
-                    late_t = 0.0
-                elif abs_he >= late_apex:
-                    late_t = 1.0
-                else:
-                    late_t = (abs_he - late_entry) / (late_apex - late_entry)
-                desired_lat_off = outside_lat * (1.0 - late_t) + desired_lat_off * late_t
-
-            # Keep racing-line desire within bounds, but never collapse back to center.
-            max_off = min(float(self.racing_line_max_frac) * float(corridor), 0.98 * float(corridor))
-            if desired_lat_off < -max_off:
-                desired_lat_off = -max_off
-            elif desired_lat_off > max_off:
-                desired_lat_off = max_off
-
-            # Blend setpoint toward the racing-line request.
-            turn_alpha = float(self.lat_setpoint_turn_alpha)
-            if turn_alpha < 0.0:
-                turn_alpha = 0.0
-            elif turn_alpha > 1.0:
-                turn_alpha = 1.0
-            self._lat_setpoint = (1.0 - turn_alpha) * float(self._lat_setpoint) + turn_alpha * float(desired_lat_off)
-            desired_lat_off = float(self._lat_setpoint)
-
-        if using_racing_line and desired_lat_off != 0.0:
-            if len(self._seg_norm) > 0:
-                nrm = self._seg_norm[self.current_idx]
-                look_pt = look_pt + nrm * float(desired_lat_off)
-
         self.last_lookahead_point = (float(look_pt[0]), float(look_pt[1]))
 
-        cross_track_err = -float(lat_off - desired_lat_off)
-        stanley = math.atan2(self.stanley_k * cross_track_err, (spd + self.stanley_v0))
+        heading_err = math.atan2(look_pt[1] - pos[1], look_pt[0] - pos[0]) - float(angle)
+        heading_err = (heading_err + math.pi) % (2.0 * math.pi) - math.pi
 
-        ff_gain = float(self.curvature_ff_gain_line) if using_racing_line else float(self.curvature_ff_gain)
-        ff = ff_gain * float(bend_sign) * float(bend_factor)
+        lat_off = self._signed_lateral_offset(pos, self.current_idx)
+        stanley = math.atan2(self.stanley_k * (-lat_off), spd + self.stanley_v0)
 
-        lat_norm = float(lat_off) / float(corridor)
-        if lat_norm < -1.0:
-            lat_norm_clamped = -1.0
-        elif lat_norm > 1.0:
-            lat_norm_clamped = 1.0
-        else:
-            lat_norm_clamped = lat_norm
+        steering = (heading_err + stanley) / self.nominal_max_steer_rad
+        steering = min(max(steering, -1.0), 1.0)
 
-        center_term = 0.0
-        contain_term = 0.0
+        # ── Throttle: track the speed profile over a short horizon ──
+        # Taking the minimum over now / react_time / 2*react_time ahead makes
+        # braking start early enough that the proportional controller does
+        # not lag behind a falling profile.
+        s_here = self._arc_position(self.current_idx, proj)
+        total_len = float(self._cum_s[-1])
+        target = self.max_speed
+        for dt_ahead in (0.0, self.react_time, 2.0 * self.react_time):
+            s = s_here + spd * dt_ahead
+            if self._closed and total_len > 1e-9:
+                s = s % total_len
+            target = min(target, float(np.interp(s, self._cum_s, self._speed_profile)))
+
+        # Off the corridor the plan no longer applies: slow down instead.
+        half_width = 0.5 * self.track_width
+        corridor = max(1.0, half_width - self.corridor_margin)
+        abs_off = abs(lat_off)
         if abs_off > corridor:
-            outside_denom = float(half_width - corridor)
-            if outside_denom < 1e-6:
-                outside_weight = 1.0
-            else:
-                outside_weight = (abs_off - corridor) / outside_denom
-                if outside_weight < 0.0:
-                    outside_weight = 0.0
-                elif outside_weight > 1.0:
-                    outside_weight = 1.0
-            contain_term = -float(self.containment_gain_rad) * lat_norm_clamped * outside_weight
+            over = min((abs_off - corridor) / max(half_width - corridor, 1e-6), 1.0)
+            target = max(self.min_speed, target * (1.0 - 0.8 * over))
 
-        delta_cmd = heading_err + stanley + ff + contain_term
-        steering = delta_cmd / (self.nominal_max_steer_rad if self.nominal_max_steer_rad > 1e-6 else 1.0)
-        if steering < -1.0:
-            steering = -1.0
-        elif steering > 1.0:
-            steering = 1.0
-
-
-        speed_floor = max(1.0, 0.60 * self.min_speed)
-
-        if abs_off <= corridor:
-            desired_speed_dist = self.max_speed
+        err = target - spd
+        if err >= 0.0:
+            throttle = err / self.accel_deficit_full
         else:
-            hard_brake_off = max(corridor * 2.2, corridor + 1.0)
-            t = (abs_off - corridor) / (hard_brake_off - corridor)
-            if t < 0.0:
-                t = 0.0
-            elif t > 1.0:
-                t = 1.0
-            desired_speed_dist = self.max_speed * (1.0 - t) + self.min_speed * t
-
-        ax = float(near_pt[0] - proj[0])
-        ay = float(near_pt[1] - proj[1])
-        cx = float(far_pt[0] - proj[0])
-        cy = float(far_pt[1] - proj[1])
-        bx = float(far_pt[0] - near_pt[0])
-        by = float(far_pt[1] - near_pt[1])
-        ab = math.hypot(ax, ay)
-        bc = math.hypot(bx, by)
-        ca = math.hypot(cx, cy)
-        cross = abs(ax * cy - ay * cx)
-        if cross <= 1e-6 or ab <= 1e-6 or bc <= 1e-6 or ca <= 1e-6:
-            desired_speed_turn = float(self.max_speed)
-        else:
-            # Circumcircle radius from (proj, near, far) controls corner speed.
-            radius = (ab * bc * ca) / (2.0 * cross)
-            desired_speed_turn = math.sqrt(max(0.0, float(self.lat_accel_max)) * float(radius))
-        if desired_speed_turn > float(self.max_speed):
-            desired_speed_turn = float(self.max_speed)
-        if desired_speed_turn < float(self.turn_speed):
-            desired_speed_turn = float(self.turn_speed)
-
-        turning_into_bend = (bend_sign != 0.0) and ((float(bend_sign) * float(heading_err)) > 0.03) and (abs_he > 0.06)
-        non_hairpin = bend_factor < 0.55
-
-        # Small conservative margin on top of the physics-based circumcircle speed.
-        # The circumcircle formula already accounts for lateral acceleration, so only
-        # a modest additional factor is needed here.
-        desired_speed_turn *= max(0.88, 1.0 - 0.18 * float(bend_factor))
-        if non_hairpin and (not turning_into_bend) and (abs_he < 0.20) and (abs_off < 0.70 * corridor):
-            desired_speed_turn *= 1.03
-        if desired_speed_turn < float(self.turn_speed):
-            desired_speed_turn = float(self.turn_speed)
-
-        if corridor > 1e-6 and abs_off > 0.60 * corridor:
-            edge_ratio = abs_off / corridor
-            t_edge = (edge_ratio - 0.60) / 0.40
-            if t_edge < 0.0:
-                t_edge = 0.0
-            elif t_edge > 1.0:
-                t_edge = 1.0
-            desired_speed_turn *= (1.0 - 0.74 * t_edge)
-            if desired_speed_turn < float(self.min_speed):
-                desired_speed_turn = float(self.min_speed)
-
-        desired_speed = desired_speed_dist
-        if desired_speed_turn < desired_speed:
-            desired_speed = desired_speed_turn
-        if desired_speed < speed_floor:
-            desired_speed = speed_floor
-
-        if spd < 11.0 and abs_he > 0.25:
-            # Extra slowdown for tight low-speed corners to protect exit width.
-            hairpin_speed_t = (11.0 - spd) / 7.0
-            if hairpin_speed_t < 0.0:
-                hairpin_speed_t = 0.0
-            elif hairpin_speed_t > 1.0:
-                hairpin_speed_t = 1.0
-            hairpin_heading_t = (abs_he - 0.25) / 0.45
-            if hairpin_heading_t < 0.0:
-                hairpin_heading_t = 0.0
-            elif hairpin_heading_t > 1.0:
-                hairpin_heading_t = 1.0
-            hairpin_t = hairpin_speed_t if hairpin_speed_t > hairpin_heading_t else hairpin_heading_t
-            desired_speed *= (1.0 - 0.64 * hairpin_t)
-            if desired_speed < float(self.min_speed):
-                desired_speed = float(self.min_speed)
-
-        abs_steer = abs(float(steering))
-        if abs_steer > 0.85:
-            t_steer = (abs_steer - 0.85) / 0.15
-            if t_steer < 0.0:
-                t_steer = 0.0
-            elif t_steer > 1.0:
-                t_steer = 1.0
-        else:
-            t_steer = 0.0
-
-        # Steering-based speed penalty. We keep it for safety, but reduce it on soft
-        # bends when we're clearly unwinding (helps earlier exit acceleration).
-        if abs_steer > 0.85:
-            steer_pen = 0.35
-            if (bend_factor < 0.35) and (not turning_into_bend) and abs_he < 0.22:
-                steer_pen = 0.20
-            if non_hairpin and (not turning_into_bend) and abs_he < 0.20:
-                steer_pen = 0.18
-            desired_speed *= (1.0 - steer_pen * t_steer)
-            if desired_speed < float(self.min_speed):
-                desired_speed = float(self.min_speed)
-
-        # Exit recovery: once we are unwinding out of a bend, ramp target speed up
-        # to start throttle application earlier and avoid sudden snap-to-full-throttle.
-        # Conditions are deliberately relaxed so recovery begins gradually rather than
-        # all at once when a tight threshold is crossed.
-        exit_recover = (
-            (not turning_into_bend)
-            and non_hairpin
-            and (abs_he < 0.35)       # was 0.18 — activate well before fully straight
-            and (bend_factor < 0.65)  # was 0.48
-            and (abs_steer < 0.98)    # was 0.90 — steering still winding down is fine
-            and (abs_off < 0.85 * corridor)  # was 0.75
-        )
-        if exit_recover:
-            straight_t = 1.0 - (abs_he / 0.35)   # was /0.18
-            if straight_t < 0.0:
-                straight_t = 0.0
-            elif straight_t > 1.0:
-                straight_t = 1.0
-            unwind_t = 1.0 - (bend_factor / 0.65)  # was /0.48
-            if unwind_t < 0.0:
-                unwind_t = 0.0
-            elif unwind_t > 1.0:
-                unwind_t = 1.0
-            exit_t = 0.65 * straight_t + 0.35 * unwind_t
-            min_exit_speed = float(self.max_speed) * (0.52 + 0.20 * exit_t)  # gentler ramp
-            if desired_speed < min_exit_speed:
-                desired_speed = min_exit_speed
-
-        # Rate-limit desired_speed increases to prevent sudden snap-to-throttle on
-        # corner exit.  Decreases are unrestricted so braking remains responsive.
-        if self._prev_desired_speed is not None:
-            max_ds_rise = 0.6  # m/s per timestep ≈ 6 m/s²
-            if desired_speed > self._prev_desired_speed + max_ds_rise:
-                desired_speed = self._prev_desired_speed + max_ds_rise
-        self._prev_desired_speed = desired_speed
-
-        throttle = (desired_speed - float(speed)) / (self.max_speed if self.max_speed > 1.0 else 1.0)
-
-        if throttle < 0.0:
-            v_now = float(speed)
-            v_norm = v_now / (self.max_speed if self.max_speed > 1.0 else 1.0)
-            if v_norm < 0.0:
-                v_norm = 0.0
-            elif v_norm > 1.0:
-                v_norm = 1.0
-            bend_brake = float(bend_factor) ** 1.35
-            brake_scale = 1.0 + 0.70 * bend_brake * v_norm
-            if non_hairpin and (not turning_into_bend):
-                brake_scale *= 0.88
-            throttle *= brake_scale
-
-            # Prevent "exit braking": don't amplify braking just because steering is
-            # still unwinding after the apex.
-            if abs_steer > 0.85 and turning_into_bend:
-                throttle *= (1.0 + 1.25 * t_steer)
-
-            # On corner exit, strongly damp residual braking so throttle resumes earlier.
-            if exit_recover:
-                throttle *= 0.50
-                if throttle < -0.22:
-                    throttle = -0.22
-        if throttle < -1.0:
-            throttle = -1.0
-        elif throttle > 1.0:
-            throttle = 1.0
+            throttle = err / self.brake_excess_full
+        throttle = min(max(throttle, -1.0), 1.0)
 
         return {'steering': float(steering), 'throttle': float(throttle)}

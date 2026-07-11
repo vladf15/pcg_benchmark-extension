@@ -97,38 +97,44 @@ def _score_to_color(score: float) -> tuple[int, int, int]:
     t = max(0.0, min(1.0, float(score)))
     return (int(34 + t * 221), int(139 + t * 1), int(34 - t * 34))
 
-def _extract_cell_polygons(problem) -> dict[int, np.ndarray]:
-    """Return {cell_index: ordered vertex positions} for selectable Voronoi cells (boundary cells excluded)."""
-    vertices      = problem._voronoi_vertices
-    edges         = problem._voronoi_all_edges
-    pairs         = problem._voronoi_all_pairs
-    num_cells     = problem._num_cells
-    boundary_skip = getattr(problem, "_ineligible_cells", None) \
-                    or getattr(problem, "_boundary_cells", set()) or set()
-    polygons      = {}
+def _extract_cell_polygons(problem) -> tuple[dict[int, np.ndarray], set[int]]:
+    """Return ({cell_index: ordered vertex positions} for every traceable cell,
+    set of ineligible cell indices).
+
+    All cells are traced, including ineligible border cells, so the score
+    heatmap covers the whole diagram.  Border cells have an open edge chain
+    (their region is clipped at the map edge); the chain is walked from one
+    endpoint to the other and implicitly closed with a straight segment."""
+    vertices   = problem._voronoi_vertices
+    edges      = problem._voronoi_all_edges
+    pairs      = problem._voronoi_all_pairs
+    num_cells  = problem._num_cells
+    ineligible = set(getattr(problem, "_ineligible_cells", None) or set())
+    polygons   = {}
     for cell_idx in range(num_cells):
-        if cell_idx in boundary_skip:
-            continue
         mask       = (pairs[:, 0] == cell_idx) | (pairs[:, 1] == cell_idx)
         cell_edges = edges[mask]
-        if len(cell_edges) < 3:
+        if len(cell_edges) < 2:
             continue
         adj = {}
         for a, b in cell_edges:
             adj.setdefault(int(a), []).append(int(b))
             adj.setdefault(int(b), []).append(int(a))
-        start = int(cell_edges[0, 0])
+        # Closed polygons have degree 2 everywhere; clipped border cells have
+        # two degree-1 endpoints. Start at an endpoint when one exists so the
+        # walk covers the full chain instead of bouncing mid-chain.
+        endpoints = [v for v, nbrs in adj.items() if len(nbrs) == 1]
+        start = endpoints[0] if endpoints else int(cell_edges[0, 0])
         prev, curr, poly = None, start, []
         for _ in range(len(adj) + 2):
             poly.append(curr)
-            nbrs = adj[curr]
-            nxt  = nbrs[0] if prev is None or nbrs[0] != prev else (nbrs[1] if len(nbrs) > 1 else nbrs[0])
-            if nxt == start:
+            nxt = next((n for n in adj[curr] if n != prev), None)
+            if nxt is None or nxt == start:
                 break
             prev, curr = curr, nxt
         if len(poly) >= 3:
             polygons[cell_idx] = vertices[np.array(poly)]
-    return polygons
+    return polygons, ineligible
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +177,10 @@ class RaceViewer:
                 except Exception:
                     pass
 
-    def build_track_surface(self, curve_points, track_width, closed_loop=True,
+    def build_track_surface(self, curve_points, track_width,
                             voronoi_edges=None, voronoi_vertices=None,
-                            cell_polygons=None, cell_scores=None):
+                            cell_polygons=None, cell_scores=None,
+                            ineligible_cells=None):
         """Draw the static track geometry onto a cached Surface."""
         scale         = self._scale
         curve_px      = np.asarray(curve_points, dtype=float) * scale
@@ -181,20 +188,28 @@ class RaceViewer:
         surface       = pygame.Surface((self._img_w, self._img_h))
         surface.fill((34, 139, 34))
         if cell_polygons is not None and cell_scores is not None:
+            ineligible = ineligible_cells or set()
             score_font = pygame.font.Font(None, max(14, int(scale * 5)))
             for cell_idx, poly_verts in cell_polygons.items():
                 if cell_idx >= len(cell_scores):
                     continue
                 score   = float(cell_scores[cell_idx])
                 color   = _score_to_color(score)
+                blocked = cell_idx in ineligible
+                if blocked:
+                    # Ineligible (out-of-bounds) cells: scored but never
+                    # selectable, shown dimmed toward gray.
+                    color = tuple(int(0.35 * c + 0.65 * g) for c, g in zip(color, (95, 95, 95)))
                 poly_px = [(int(round(x * scale)), int(round(y * scale))) for x, y in poly_verts]
                 if len(poly_px) >= 3:
                     pygame.draw.polygon(surface, color, poly_px)
+                    if blocked:
+                        pygame.draw.polygon(surface, (50, 50, 50), poly_px, 2)
                     cx    = int(round(poly_verts[:, 0].mean() * scale))
                     cy    = int(round(poly_verts[:, 1].mean() * scale))
-                    label = score_font.render(f"{score:.2f}", True, (0, 0, 0))
+                    label = score_font.render(f"{score:.2f}", True, (0, 0, 0) if not blocked else (210, 210, 210))
                     surface.blit(label, (cx - label.get_width() // 2, cy - label.get_height() // 2))
-        left_edge, right_edge = self._compute_track_edges(curve_px, half_width_px, closed_loop)
+        left_edge, right_edge = self._compute_track_edges(curve_px, half_width_px)
         if len(left_edge)  > 1: pygame.draw.lines(surface, (10, 10, 10), False, left_edge,  4)
         if len(right_edge) > 1: pygame.draw.lines(surface, (10, 10, 10), False, right_edge, 4)
         for j in range(len(left_edge) - 1):
@@ -363,16 +378,16 @@ class RaceViewer:
         self._screen.blit(hud, (6, 6))
 
     @staticmethod
-    def _compute_track_edges(curve_px, half_width_px, closed_loop):
+    def _compute_track_edges(curve_px, half_width_px):
         left_edge, right_edge = [], []
         n = len(curve_px)
         if n < 2:
             return left_edge, right_edge
-        has_dup = closed_loop and n >= 3 and np.allclose(curve_px[0], curve_px[-1], atol=1e-9)
+        has_dup = n >= 3 and np.allclose(curve_px[0], curve_px[-1], atol=1e-9)
         base    = curve_px[:-1] if has_dup else curve_px
         m       = len(base)
         for j in range(m):
-            if closed_loop and m >= 3:
+            if m >= 3:
                 dp = base[j] - base[(j-1) % m]
                 dn = base[(j+1) % m] - base[j]
             else:
@@ -434,7 +449,7 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
     problem = build_problem(problem_type, num_cells=num_cells)
     if is_voronoi:
         problem._build_cell_graph()
-    cell_polygons    = _extract_cell_polygons(problem) if is_voronoi else None
+    cell_polygons, ineligible_cells = _extract_cell_polygons(problem) if is_voronoi else (None, set())
     show_structure   = config.get("show_structure", False)
     current_content  = None
 
@@ -475,17 +490,17 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
                 scores = np.asarray(raw, dtype=float)
         viewer.build_track_surface(
             problem._curve_points, problem._track_width,
-            closed_loop=problem._closed_loop,
             voronoi_edges=getattr(problem, "_voronoi_all_edges", None) if is_voronoi else None,
             voronoi_vertices=getattr(problem, "_voronoi_vertices", None) if is_voronoi else None,
             cell_polygons=cell_polygons if show_structure else None,
             cell_scores=scores,
+            ineligible_cells=ineligible_cells,
         )
 
     def make_agent():
-        ag = SteeringAgent(problem._curve_points, track_width=problem._track_width,
-                           enable_wander=problem._enable_wander)
-        ag.reset(); return ag
+        ag = SteeringAgent(problem._curve_points, track_width=problem._track_width)
+        ag.reset()
+        return ag
 
     def switch_to(new_iter, new_chrom=0):
         nonlocal iter_index, chrom_index, agent, state, prev_angle, step, step_accumulator

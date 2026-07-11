@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zlib
 import numpy as np
 from pcg_benchmark.probs.racing.problem import RacingProblem
 from pcg_benchmark.spaces import ArraySpace, IntegerSpace, DictionarySpace
@@ -79,31 +80,24 @@ class RacingTileProblem(RacingProblem):
         # genome bytes → (types, rotations, wave_array)
         # wave_array is a (GRID_H, GRID_W) int array of WFC tile indices;
         # stored for localised repair (Bailly & Levieux 2022).
+        # _decode_cache_keys holds the same genomes as arrays (in insertion
+        # order) so the nearest-genome scan is one vectorized comparison
+        # instead of a Python loop over the whole cache.
         self._decode_cache: dict = {}
+        self._decode_cache_keys: list = []
 
-        # Tile tracks live on a fixed grid, so the generic length/spacing
-        # targets must be expressed in cell units: waypoints are tile-edge
-        # midpoints spaced ~1 cell apart, and a good loop uses 24-60 tiles.
-        # Grid construction guarantees the track never overlaps itself (each
-        # cell holds its own disjoint road piece), so the area-overlap check
-        # is disabled — it only fires on artifacts of the corner-cutting
-        # waypoint polyline.
+        # Tile tracks live on a fixed grid, so the generic length targets must
+        # be expressed in cell units: waypoints are tile-edge midpoints spaced
+        # ~1 cell apart, and a good loop uses 24-60 tiles.  Grid construction
+        # guarantees the track never overlaps itself (each cell holds its own
+        # disjoint road piece), so the area-overlap check is disabled — it
+        # only fires on artifacts of the corner-cutting waypoint polyline.
         cell = float(self._width) / GRID_W
         self._QUALITY_PARAMS = {
             **self._QUALITY_PARAMS,
             "min_length":   24.0 * cell,
             "max_length":   60.0 * cell,
-            "seg_min_pref":  0.4 * cell,
-            "seg_max_pref":  3.0 * cell,
             "geom_area_check": False,
-            # Tile corners spread 90° over ~10 dense-curve samples → max avg ≈ 9°/sample.
-            # Recalibrate curvature targets to this scale so the scores are meaningful.
-            "min_curvature_deg":    1.0,
-            "ideal_curvature_deg":  5.0,
-            "ideal_variety_deg":    3.0,
-            # Simulation bonus only unlocks once the track has a real straight section.
-            # WFC alone doesn't reliably produce long runs of consecutive straight tiles.
-            "sim_gate_min_straight": 0.5,
         }
 
     # ── WFC tile index constants (used internally) ────────────────────
@@ -127,12 +121,16 @@ class RacingTileProblem(RacingProblem):
             opp = _OPPOSITE[d]
             compat[d] = []
             for t1, r1 in cls._WFC_TILES:
+                # Tile B may sit in direction d of tile A only when their
+                # touching edges agree: both open (road continues) or both
+                # closed (grass meets grass).
                 a_open = d in _OPEN_EDGES[(t1, r1)]
-                allowed = frozenset(
-                    j for j, (t2, r2) in enumerate(cls._WFC_TILES)
-                    if (opp in _OPEN_EDGES[(t2, r2)]) == a_open
-                )
-                compat[d].append(allowed)
+                allowed = set()
+                for j, (t2, r2) in enumerate(cls._WFC_TILES):
+                    b_open = opp in _OPEN_EDGES[(t2, r2)]
+                    if b_open == a_open:
+                        allowed.add(j)
+                compat[d].append(frozenset(allowed))
         cls._WFC_COMPAT = compat
         return compat
 
@@ -158,14 +156,12 @@ class RacingTileProblem(RacingProblem):
 
     # ── Single-loop enforcement ────────────────────────────────────────
 
-    def _keep_largest_component(self, types, rotations):
-        """Keep only road tiles forming the largest single closed loop.
+    def _build_neighbor_graph(self, types, rotations):
+        """Map each road cell (r, c) to its mutually-connected neighbours.
 
-        Uses mutual-edge connectivity (tile A's open edge must match tile B's
-        opposite edge) rather than simple grid adjacency.  This way two loops
-        that merely touch in the grid are treated as separate candidates and
-        only the biggest one survives."""
-        # Build mutual-match neighbour graph (same logic as _extract_loop)
+        Two tiles are neighbours only when tile A has an open edge toward B
+        *and* B has an open edge back toward A — simple grid adjacency is not
+        enough.  Used by loop extraction, component filtering, and rendering."""
         neighbors: dict = {}
         for r in range(GRID_H):
             for c in range(GRID_W):
@@ -180,8 +176,11 @@ class RacingTileProblem(RacingProblem):
                         if _OPPOSITE[d] in _OPEN_EDGES[(int(types[nr, nc]), int(rotations[nr, nc]))]:
                             nbrs.append((nr, nc))
                 neighbors[(r, c)] = nbrs
+        return neighbors
 
-        # Find connected components via mutual connectivity
+    @staticmethod
+    def _connected_components(neighbors):
+        """Group the cells of a neighbour graph into connected components."""
         visited, components = set(), []
         for seed in neighbors:
             if seed in visited:
@@ -197,10 +196,42 @@ class RacingTileProblem(RacingProblem):
                     if nb not in visited:
                         stack.append(nb)
             components.append(comp)
+        return components
+
+    def _edge_midpoints(self, cells):
+        """Convert an ordered list of grid cells to pixel waypoints.
+
+        One point per cell: the midpoint of the edge shared with the next
+        cell — the exact spot where the road crosses between the two tiles."""
+        n = len(cells)
+        points = []
+        for i, (r, c) in enumerate(cells):
+            nr, nc = cells[(i + 1) % n]
+            px = (c + nc + 1) * self._width  / (2 * GRID_W)
+            py = (r + nr + 1) * self._height / (2 * GRID_H)
+            points.append((px, py))
+        return points
+
+    def _keep_largest_component(self, types, rotations):
+        """Keep only road tiles forming the largest single closed loop.
+
+        Uses mutual-edge connectivity (tile A's open edge must match tile B's
+        opposite edge) rather than simple grid adjacency.  This way two loops
+        that merely touch in the grid are treated as separate candidates and
+        only the biggest one survives."""
+        neighbors = self._build_neighbor_graph(types, rotations)
+        components = self._connected_components(neighbors)
 
         # A closed loop ⟺ every cell in the component has degree exactly 2
-        loops = [comp for comp in components
-                 if all(len(neighbors.get(cell, [])) == 2 for cell in comp)]
+        loops = []
+        for comp in components:
+            is_loop = True
+            for cell in comp:
+                if len(neighbors.get(cell, [])) != 2:
+                    is_loop = False
+                    break
+            if is_loop:
+                loops.append(comp)
 
         if not loops:
             return types, rotations  # No valid loop; _extract_loop will reject
@@ -240,7 +271,8 @@ class RacingTileProblem(RacingProblem):
                 break
             r, c = candidates[int(rng.integers(len(candidates)))]
             possible = list(wave[r][c])
-            w = self._WFC_WEIGHTS[possible]; w = w / w.sum()
+            w = self._WFC_WEIGHTS[possible]
+            w = w / w.sum()  # normalize to probabilities
             chosen = possible[int(rng.choice(len(possible), p=w))]
             wave[r][c] = {chosen}
             if not self._wfc_propagate(wave, [(r, c)], compat):
@@ -300,16 +332,19 @@ class RacingTileProblem(RacingProblem):
         old_p2d = old_prefs.reshape(GRID_H, GRID_W)
 
         # Reconstruct set-based wave from collapsed tile indices; borders stay {0}.
-        wave = [[{int(old_wave[r, c])} for c in range(GRID_W)]
-                for r in range(GRID_H)]
+        wave = []
+        for r in range(GRID_H):
+            row = []
+            for c in range(GRID_W):
+                row.append({int(old_wave[r, c])})
+            wave.append(row)
 
         # Interior cells whose genome preference changed → need re-collapsing.
-        diff_cells = [
-            (r, c)
-            for r in range(1, GRID_H - 1)
-            for c in range(1, GRID_W - 1)
-            if int(new_p2d[r, c]) != int(old_p2d[r, c])
-        ]
+        diff_cells = []
+        for r in range(1, GRID_H - 1):
+            for c in range(1, GRID_W - 1):
+                if int(new_p2d[r, c]) != int(old_p2d[r, c]):
+                    diff_cells.append((r, c))
 
         if not diff_cells:
             # Nothing changed — reconstruct directly without any WFC work.
@@ -341,7 +376,7 @@ class RacingTileProblem(RacingProblem):
             pref = int(new_p2d[r, c])
             if pref == 0 or pref not in wave[r][c] or len(wave[r][c]) == 1:
                 continue
-            snapshot = [[set(cell) for cell in row] for row in wave]
+            snapshot = self._copy_wave(wave)
             wave[r][c] = {pref}
             if not self._wfc_propagate(wave, [(r, c)], compat):
                 wave = snapshot  # Preference contradicts context — skip it
@@ -350,9 +385,10 @@ class RacingTileProblem(RacingProblem):
         # _run_wfc skips cells already collapsed (len == 1), so only the
         # repaired region gets new random choices.
         base_repair = wave  # keep base so we can retry with different seeds
+        genome_seed = zlib.crc32(np.ascontiguousarray(new_prefs).tobytes())
         for attempt in range(20):
-            wave_copy = [[set(cell) for cell in row] for row in base_repair]
-            result = self._run_wfc(wave_copy, np.random.default_rng(attempt * 7_919), compat)
+            wave_copy = self._copy_wave(base_repair)
+            result = self._run_wfc(wave_copy, np.random.default_rng((genome_seed + attempt * 7_919) % (2**32)), compat)
             if result is None:
                 continue
             types, rotations = self._keep_largest_component(*result)
@@ -361,6 +397,20 @@ class RacingTileProblem(RacingProblem):
                 return types, rotations, new_wave
 
         return None  # All repair attempts failed → caller uses full WFC
+
+    @staticmethod
+    def _copy_wave(wave):
+        """Deep-copy a wave: a new grid where every possibility set is a copy,
+        so changes to the copy never leak back into the original."""
+        copied = []
+        for row in wave:
+            copied.append([set(cell) for cell in row])
+        return copied
+
+    def _decode_cache_store(self, prefs_arr, types, rotations, wave):
+        """Insert a decoded genome into the cache (dict + key array list)."""
+        self._decode_cache[prefs_arr.tobytes()] = (types, rotations, wave)
+        self._decode_cache_keys.append(prefs_arr.copy())
 
     def _decode_genome(self, tile_prefs):
         """Decode a partial-map genome to (types, rotations) via Genetic-WFC.
@@ -386,31 +436,37 @@ class RacingTileProblem(RacingProblem):
 
         # ── Localised repair (Bailly & Levieux 2022) ──────────────────────
         # Before doing a full WFC pass, check whether any cached genome is
-        # "close enough" to this one (≤ 50 cells differ — typical after
-        # contentSwap mutation at rate 0.15 on 144 cells gives ~22 changes).
-        # If so, re-collapse only the changed cells and their propagation
-        # neighbourhood rather than starting from an empty wave.
+        # "close enough" to this one.  The threshold must stay at mutation
+        # scale (contentSwap at rate 0.05 on 144 cells changes ~7): two
+        # *unrelated* sparse random genomes already differ in only ~40 cells,
+        # so a generous threshold makes every fresh genome "repair" from the
+        # first decoded track and inherit it almost verbatim, collapsing the
+        # whole population onto one phenotype.  Only mutation-sized diffs get
+        # the localised treatment; anything larger does a full WFC pass.
         if self._decode_cache:
-            best_diff, best_old_prefs, best_old_wave = len(tile_prefs) + 1, None, None
-            for ckey, entry in self._decode_cache.items():
-                old_arr = np.frombuffer(ckey, dtype=tile_prefs.dtype)
-                diff    = int(np.count_nonzero(tile_prefs != old_arr))
-                if diff < best_diff:
-                    best_diff      = diff
-                    best_old_prefs = old_arr
-                    best_old_wave  = entry[2]
-            if best_diff <= 50:
+            # Compare this genome against every cached genome at once:
+            # np.stack piles the cached genomes into a matrix (one per row),
+            # != marks each differing cell, count_nonzero counts them per row.
+            diffs = np.count_nonzero(np.stack(self._decode_cache_keys) != tile_prefs, axis=1)
+            j = int(np.argmin(diffs))
+            if int(diffs[j]) <= 15:
+                best_old_prefs = self._decode_cache_keys[j]
+                best_old_wave  = self._decode_cache[best_old_prefs.tobytes()][2]
                 repaired = self._localised_repair(tile_prefs, best_old_prefs, best_old_wave)
                 if repaired is not None:
                     types, rotations, new_wave = repaired
-                    self._decode_cache[key] = (types, rotations, new_wave)
+                    self._decode_cache_store(tile_prefs, types, rotations, new_wave)
                     return types, rotations
 
         # ── Full WFC from scratch ──────────────────────────────────────────
         # Build the stamped wave once — stamping is deterministic, only the
         # WFC fill afterwards varies between attempts.
-        base_wave = [[set(range(n_tiles)) for _ in range(GRID_W)]
-                     for _ in range(GRID_H)]
+        base_wave = []
+        for r in range(GRID_H):
+            row = []
+            for c in range(GRID_W):
+                row.append(set(range(n_tiles)))
+            base_wave.append(row)
         border = []
         for r in range(GRID_H):
             for c in range(GRID_W):
@@ -429,7 +485,7 @@ class RacingTileProblem(RacingProblem):
                 if len(base_wave[r][c]) == 1:
                     stamped += 1  # already forced to the requested tile
                     continue
-                snapshot = [[set(cell) for cell in row] for row in base_wave]
+                snapshot = self._copy_wave(base_wave)
                 base_wave[r][c] = {pref}
                 if self._wfc_propagate(base_wave, [(r, c)], compat):
                     stamped += 1
@@ -445,9 +501,13 @@ class RacingTileProblem(RacingProblem):
                 base_wave[sr][sc] = {straight_h}
                 self._wfc_propagate(base_wave, [(sr, sc)], compat)
 
+        # Seed the fill from the genome so different genomes explore different
+        # layouts (a fixed seed sequence makes weakly-stamped genomes collapse
+        # to near-identical tracks), while staying deterministic per genome.
+        genome_seed = zlib.crc32(key)
         for attempt in range(100):
-            rng  = np.random.default_rng(attempt * 1_000_003)
-            wave = [[set(cell) for cell in row] for row in base_wave]
+            rng  = np.random.default_rng((genome_seed + attempt * 1_000_003) % (2**32))
+            wave = self._copy_wave(base_wave)
 
             result = self._run_wfc(wave, rng, compat)
             if result is None:
@@ -456,7 +516,7 @@ class RacingTileProblem(RacingProblem):
             types, rotations = self._keep_largest_component(*result)
             if self._extract_loop(types, rotations) is not None:
                 new_wave = self._types_to_wave(types, rotations)
-                self._decode_cache[key] = (types, rotations, new_wave)
+                self._decode_cache_store(tile_prefs, types, rotations, new_wave)
                 return types, rotations
 
         # Total failure — deterministic rectangle as last resort
@@ -465,7 +525,7 @@ class RacingTileProblem(RacingProblem):
         t   = np.asarray(fb["types"],     dtype=int)
         r_  = np.asarray(fb["rotations"], dtype=int)
         w   = self._types_to_wave(t, r_)
-        self._decode_cache[key] = (t, r_, w)
+        self._decode_cache_store(tile_prefs, t, r_, w)
         return t, r_
 
     def init_content(self, rng=None):
@@ -491,11 +551,16 @@ class RacingTileProblem(RacingProblem):
         c0 = int(rng.integers(1, GRID_W - min_dim - 1))
         r1 = int(rng.integers(r0 + min_dim, min(r0 + min_dim + 5, GRID_H - 1) + 1))
         c1 = int(rng.integers(c0 + min_dim, min(c0 + min_dim + 5, GRID_W - 1) + 1))
+        # Walk the rectangle clockwise: top edge, right edge, bottom, left.
         loop = []
-        for c in range(c0, c1):     loop.append((r0, c))
-        for r in range(r0, r1):     loop.append((r,  c1))
-        for c in range(c1, c0, -1): loop.append((r1, c))
-        for r in range(r1, r0, -1): loop.append((r,  c0))
+        for c in range(c0, c1):
+            loop.append((r0, c))
+        for r in range(r0, r1):
+            loop.append((r, c1))
+        for c in range(c1, c0, -1):
+            loop.append((r1, c))
+        for r in range(r1, r0, -1):
+            loop.append((r, c0))
 
         types     = np.zeros((GRID_H, GRID_W), dtype=int)
         rotations = np.zeros((GRID_H, GRID_W), dtype=int)
@@ -503,11 +568,19 @@ class RacingTileProblem(RacingProblem):
         for i, (r, c) in enumerate(loop):
             pr, pc = loop[(i - 1) % n]
             nr, nc = loop[(i + 1) % n]
-            from_dir = next(d for d, (dr, dc) in _DIR_DELTA.items() if r + dr == pr and c + dc == pc)
-            to_dir   = next(d for d, (dr, dc) in _DIR_DELTA.items() if r + dr == nr and c + dc == nc)
+            from_dir = self._direction_toward(r, c, pr, pc)
+            to_dir   = self._direction_toward(r, c, nr, nc)
             t, rot = _EDGES_TO_TILE.get(frozenset({from_dir, to_dir}), (GRASS, 0))
             types[r, c], rotations[r, c] = t, rot
         return {"types": types, "rotations": rotations}
+
+    @staticmethod
+    def _direction_toward(r, c, target_r, target_c):
+        """Return the compass direction that steps from (r, c) to the target cell."""
+        for d, (dr, dc) in _DIR_DELTA.items():
+            if r + dr == target_r and c + dc == target_c:
+                return d
+        return None
 
     # ── Decoding: tile grid -> track waypoints ────────────────────────
 
@@ -516,33 +589,27 @@ class RacingTileProblem(RacingProblem):
         Traverse mutually-connected road tiles to find a closed loop.
         Returns ordered list of (r, c) or None if no valid cycle exists.
         """
-        neighbors = {}
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                edges = _OPEN_EDGES[(int(types[r, c]), int(rotations[r, c]))]
-                if not edges:
-                    continue
-                nbrs = []
-                for d in edges:
-                    dr, dc = _DIR_DELTA[d]
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W:
-                        if _OPPOSITE[d] in _OPEN_EDGES[(int(types[nr, nc]), int(rotations[nr, nc]))]:
-                            nbrs.append((nr, nc))
-                neighbors[(r, c)] = nbrs
+        neighbors = self._build_neighbor_graph(types, rotations)
 
         # A simple cycle requires every node to have degree exactly 2
-        cycle_cells = {cell for cell, nbrs in neighbors.items() if len(nbrs) == 2}
+        cycle_cells = set()
+        for cell, nbrs in neighbors.items():
+            if len(nbrs) == 2:
+                cycle_cells.add(cell)
         if not cycle_cells:
             return None
 
+        # Walk the loop: from each cell, continue to the neighbour we did not
+        # just come from.  (next(iter(...)) takes an arbitrary element from
+        # the set; sets cannot be indexed.)
         start = next(iter(cycle_cells))
         loop, prev, cur = [start], None, start
         while True:
-            nxt = next(
-                (nb for nb in neighbors.get(cur, []) if nb != prev and nb in cycle_cells),
-                None,
-            )
+            nxt = None
+            for nb in neighbors.get(cur, []):
+                if nb != prev and nb in cycle_cells:
+                    nxt = nb
+                    break
             if nxt is None or nxt == start:
                 break
             loop.append(nxt)
@@ -553,74 +620,41 @@ class RacingTileProblem(RacingProblem):
         return loop
 
     def _grid_to_track_points(self, types, rotations):
-        """Convert tile grid to ordered pixel waypoints.
-        One point per tile: the midpoint of the shared edge with the next tile.
-        This gives the exact crossing points where the path transitions between tiles."""
+        """Convert tile grid to ordered pixel waypoints (edge midpoints)."""
         loop = self._extract_loop(types, rotations)
         if loop is None:
             return None
-        n = len(loop)
-        points = []
-        for i, (r, c) in enumerate(loop):
-            nr, nc = loop[(i + 1) % n]
-            px = (c + nc + 1) * self._width  / (2 * GRID_W)
-            py = (r + nr + 1) * self._height / (2 * GRID_H)
-            points.append((px, py))
-        return points
-
+        return self._edge_midpoints(loop)
 
     def _best_effort_path(self, types, rotations):
         """For rendering: find the largest connected chain of road tiles even if
         it is not a closed loop. Returns ordered pixel waypoints or None."""
-        # Build mutual-match neighbor graph (same as _extract_loop)
-        neighbors = {}
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                edges = _OPEN_EDGES[(int(types[r, c]), int(rotations[r, c]))]
-                if not edges:
-                    continue
-                nbrs = []
-                for d in edges:
-                    dr, dc = _DIR_DELTA[d]
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < GRID_H and 0 <= nc < GRID_W:
-                        if _OPPOSITE[d] in _OPEN_EDGES[(int(types[nr, nc]), int(rotations[nr, nc]))]:
-                            nbrs.append((nr, nc))
-                if nbrs:
-                    neighbors[(r, c)] = nbrs
+        neighbors = self._build_neighbor_graph(types, rotations)
+        components = self._connected_components(neighbors)
 
-        if not neighbors:
-            return None
-
-        # Find the largest connected component via DFS
-        visited, best = set(), []
-        for seed in neighbors:
-            if seed in visited:
-                continue
-            comp, stack = [], [seed]
-            while stack:
-                node = stack.pop()
-                if node in visited:
-                    continue
-                visited.add(node)
-                comp.append(node)
-                for nb in neighbors.get(node, []):
-                    if nb not in visited:
-                        stack.append(nb)
-            if len(comp) > len(best):
-                best = comp
-
+        if components:
+            best = max(components, key=len)
+        else:
+            best = []
         if len(best) < 2:
             return None
 
         # Traverse in order: start from an endpoint (degree 1) if one exists
         best_set = set(best)
-        endpoints = [c for c in best if len([nb for nb in neighbors.get(c, []) if nb in best_set]) == 1]
-        start = endpoints[0] if endpoints else best[0]
+        start = best[0]
+        for cell in best:
+            in_chain = [nb for nb in neighbors.get(cell, []) if nb in best_set]
+            if len(in_chain) == 1:
+                start = cell
+                break
 
         path, prev, cur = [start], None, start
         while True:
-            nxt = next((nb for nb in neighbors.get(cur, []) if nb != prev and nb in best_set), None)
+            nxt = None
+            for nb in neighbors.get(cur, []):
+                if nb != prev and nb in best_set:
+                    nxt = nb
+                    break
             if nxt is None or nxt == path[0]:
                 break
             path.append(nxt)
@@ -629,15 +663,7 @@ class RacingTileProblem(RacingProblem):
         if len(path) < 2:
             return None
 
-        # Convert to pixel edge-midpoints
-        n = len(path)
-        points = []
-        for i, (r, c) in enumerate(path):
-            nr, nc = path[(i + 1) % n]
-            px = (c + nc + 1) * self._width  / (2 * GRID_W)
-            py = (r + nr + 1) * self._height / (2 * GRID_H)
-            points.append((px, py))
-        return points
+        return self._edge_midpoints(path)
 
     # ── Content extraction bridge ─────────────────────────────────────
     # Overriding this makes all parent methods (simulate, render, etc.)
@@ -650,9 +676,12 @@ class RacingTileProblem(RacingProblem):
     def _extract_content(self, content):
         if isinstance(content, dict) and "tile_prefs" in content:
             types, rotations = self._genome_to_tiles(content)
-            pts = self._grid_to_track_points(types, rotations) \
-               or self._best_effort_path(types, rotations)
-            return np.array(pts) if pts is not None else np.array(self._default_track_points)
+            pts = self._grid_to_track_points(types, rotations)
+            if pts is None:
+                pts = self._best_effort_path(types, rotations)
+            if pts is None:
+                pts = self._default_track_points
+            return np.array(pts)
         return super()._extract_content(content)
 
     # ── Problem interface ─────────────────────────────────────────────
@@ -687,12 +716,12 @@ class RacingTileProblem(RacingProblem):
         return super().render(content, **kwargs)
 
     def _render_track_bg(self, img_w, img_h, left_edge_f, right_edge_f, scaled_curve,
-                         grass_color, edge_color, road_color, centerline_color):
+                         grass_color, edge_color, road_color, centerline_color, scale=1.0):
         content = getattr(self, '_tile_render_content', None)
         if content is None:
             return super()._render_track_bg(img_w, img_h, left_edge_f, right_edge_f,
                                              scaled_curve, grass_color, edge_color,
-                                             road_color, centerline_color)
+                                             road_color, centerline_color, scale=scale)
         types, rotations = self._genome_to_tiles(content)
         return self._make_tile_bg(img_w, img_h, types, rotations)
 

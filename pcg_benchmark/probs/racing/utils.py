@@ -1,46 +1,57 @@
+﻿"""Geometry helpers shared by all racing problems.
+
+Three groups of functions:
+- Spline interpolation (`interpolate_curves`): turn sparse control points
+  into the dense closed Kochanek-Bartels curve that simulation, scoring,
+  and rendering all run on.
+- Self-intersection counting (`count_self_intersections`,
+  `count_track_area_intersections`): the geometry soundness checks behind
+  quality()'s geom_score.  Both use a uniform grid to prune segment pairs,
+  so they stay near-linear in the number of segments.
+- `lowest_turn_seam_index`: picks the smoothest vertex of a closed loop so
+  the start/finish seam never sits in the middle of a corner.
+"""
 import functools
 from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
 
-@functools.lru_cache(maxsize=128)
-def interpolate_curves_cached(points_tuple, samples_per_segment=20):
-    points = np.array(points_tuple)
-    n = len(points)
-    if n < 2:
-        return points
-    points = np.vstack([points[0], points, points[-1]])
-    dim = points.shape[1]
-    total_segments = n - 1
-    total_points = total_segments * samples_per_segment + 1
-    curve_points = np.empty((total_points, dim), dtype=points.dtype)
-    idx = 0
-    t_vals = np.linspace(0, 1, samples_per_segment, endpoint=False)
-    t2 = t_vals ** 2
-    t3 = t2 * t_vals
-    h1 = 2 * t3 - 3 * t2 + 1
-    h2 = -2 * t3 + 3 * t2
-    h3 = t3 - 2 * t2 + t_vals
-    h4 = t3 - t2
-    for i in range(1, n):
-        p0, p1, p2, p3 = points[i-1], points[i], points[i+1], points[i+2]
-        # The benchmark uses neutral spline parameters, which reduces to
-        # Catmull-Rom-style tangents:
-        #   m1 = 0.5 * (p2 - p0)
-        #   m2 = 0.5 * (p3 - p1)
-        m1 = 0.5 * (p2 - p0)
-        m2 = 0.5 * (p3 - p1)
-        pts = (
-            h1[:, None] * p1 +
-            h2[:, None] * p2 +
-            h3[:, None] * m1 +
-            h4[:, None] * m2
-        )
-        curve_points[idx:idx+samples_per_segment] = pts
-        idx += samples_per_segment
-    curve_points[-1] = points[-1]
-    return curve_points
+def _points_as_tuples(points):
+    """Convert an (N, 2) array to a tuple of (x, y) tuples.
+
+    functools.lru_cache needs hashable arguments; arrays are not hashable,
+    nested tuples are."""
+    rows = []
+    for p in np.asarray(points):
+        rows.append(tuple(p))
+    return tuple(rows)
+
+
+def lowest_turn_seam_index(points) -> int:
+    """Index of the vertex with the smallest local turn angle.
+
+    Used to place the seam of a closed loop at its smoothest spot, so the
+    start/end joint does not sit in the middle of a corner.
+    """
+    pts = np.asarray(points, dtype=float)
+    n = len(pts)
+    best_i = 0
+    best_ang = float('inf')
+    for i in range(n):
+        v1 = pts[i] - pts[(i - 1) % n]
+        v2 = pts[(i + 1) % n] - pts[i]
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-6 or n2 < 1e-6:
+            continue
+        d = float(np.dot(v1, v2) / (n1 * n2))
+        d = max(-1.0, min(1.0, d))
+        ang = float(np.arccos(d))
+        if ang < best_ang:
+            best_ang = ang
+            best_i = i
+    return best_i
 
 
 @functools.lru_cache(maxsize=128)
@@ -62,25 +73,23 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
     curve_points = np.empty((total_points, dim), dtype=points.dtype)
 
     idx = 0
+    # Cubic Hermite basis functions, evaluated once for every sample position
+    # t in [0, 1).  Reshaped to columns so that (basis column) * (point row)
+    # gives one curve sample per row.
     t_vals = np.linspace(0, 1, samples_per_segment, endpoint=False)
     t2 = t_vals ** 2
     t3 = t2 * t_vals
-    h1 = 2 * t3 - 3 * t2 + 1
-    h2 = -2 * t3 + 3 * t2
-    h3 = t3 - 2 * t2 + t_vals
-    h4 = t3 - t2
+    h1 = (2 * t3 - 3 * t2 + 1).reshape(-1, 1)
+    h2 = (-2 * t3 + 3 * t2).reshape(-1, 1)
+    h3 = (t3 - 2 * t2 + t_vals).reshape(-1, 1)
+    h4 = (t3 - t2).reshape(-1, 1)
 
     for i in range(1, n + 1):
         p0, p1, p2, p3 = pad[i - 1], pad[i], pad[i + 1], pad[i + 2]
         # Neutral spline parameters (Catmull-Rom-style tangents).
         m1 = 0.5 * (p2 - p0)
         m2 = 0.5 * (p3 - p1)
-        pts = (
-            h1[:, None] * p1 +
-            h2[:, None] * p2 +
-            h3[:, None] * m1 +
-            h4[:, None] * m2
-        )
+        pts = h1 * p1 + h2 * p2 + h3 * m1 + h4 * m2
         curve_points[idx:idx + samples_per_segment] = pts
         idx += samples_per_segment
 
@@ -88,26 +97,8 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
 
     # Place the seam at a low-curvature location to avoid a visible kink.
     poly = curve_points[:-1]
-    m = len(poly)
-    if m >= 4:
-        best_i = 0
-        best_ang = float('inf')
-        for i in range(m):
-            p_prev = poly[(i - 1) % m]
-            p = poly[i]
-            p_next = poly[(i + 1) % m]
-            v1 = p - p_prev
-            v2 = p_next - p
-            n1 = float(np.linalg.norm(v1))
-            n2 = float(np.linalg.norm(v2))
-            if n1 < 1e-6 or n2 < 1e-6:
-                continue
-            d = float(np.dot(v1, v2) / (n1 * n2))
-            d = -1.0 if d < -1.0 else (1.0 if d > 1.0 else d)
-            ang = float(np.arccos(d))
-            if ang < best_ang:
-                best_ang = ang
-                best_i = i
+    if len(poly) >= 4:
+        best_i = lowest_turn_seam_index(poly)
         if best_i != 0:
             poly = np.vstack([poly[best_i:], poly[:best_i]])
             curve_points[:-1] = poly
@@ -116,161 +107,32 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
     return curve_points
 
 
-def interpolate_curves(points, samples_per_segment=20, *, closed: bool = False):
-    """Interpolate control points into a Kochanek-Bartels spline polyline."""
+def interpolate_curves(points, samples_per_segment=20):
+    """Interpolate control points into a Kochanek-Bartels spline polyline.
+
+    Racing tracks are closed circuits, so the spline is always periodic."""
     pts = np.asarray(points)
-    if closed and len(pts) >= 3:
+    if len(pts) >= 3:
         # If the loop is already explicitly closed (last==first), drop the
         # duplicate control point for interpolation and re-close at the end.
         if np.allclose(pts[0], pts[-1], atol=1e-9, rtol=0.0):
             pts = pts[:-1]
 
-    points_tuple = tuple(map(tuple, np.asarray(pts)))
-    if closed:
-        return interpolate_curves_closed_cached(points_tuple, samples_per_segment)
-    return interpolate_curves_cached(points_tuple, samples_per_segment)
+    return interpolate_curves_closed_cached(_points_as_tuples(pts), samples_per_segment)
 
 
 @functools.lru_cache(maxsize=128)
-def count_self_intersections_cached(points_tuple, closed: bool):
+def count_self_intersections_cached(points_tuple):
     points = np.array(points_tuple)
-    return _count_self_intersections_grid(points, closed=bool(closed))
+    return _count_self_intersections_grid(points)
 
 
-def count_self_intersections(points, *, closed: bool = False):
-    points_tuple = tuple(map(tuple, np.asarray(points)))
-    return count_self_intersections_cached(points_tuple, bool(closed))
+def count_self_intersections(points):
+    points_tuple = _points_as_tuples(points)
+    return count_self_intersections_cached(points_tuple)
 
 
-def _segment_to_segment_distance_sq(p1, p2, p3, p4) -> float:
-    """Return squared minimum distance between 2D segments p1-p2 and p3-p4."""
-
-    def point_to_segment_distance_sq(p, a, b) -> float:
-        abx = float(b[0] - a[0])
-        aby = float(b[1] - a[1])
-        apx = float(p[0] - a[0])
-        apy = float(p[1] - a[1])
-        ab2 = abx * abx + aby * aby
-        if ab2 < 1e-18:
-            return apx * apx + apy * apy
-        t = (apx * abx + apy * aby) / ab2
-        if t < 0.0:
-            t = 0.0
-        elif t > 1.0:
-            t = 1.0
-        cx = float(a[0]) + t * abx
-        cy = float(a[1]) + t * aby
-        dx = float(p[0]) - cx
-        dy = float(p[1]) - cy
-        return dx * dx + dy * dy
-
-    d1 = point_to_segment_distance_sq(p1, p3, p4)
-    d2 = point_to_segment_distance_sq(p2, p3, p4)
-    d3 = point_to_segment_distance_sq(p3, p1, p2)
-    d4 = point_to_segment_distance_sq(p4, p1, p2)
-    return min(d1, d2, d3, d4)
-
-
-@functools.lru_cache(maxsize=128)
-def count_track_width_overlaps_cached(points_tuple, track_width: float, min_arclen_gap: float):
-    pts = np.asarray(points_tuple, dtype=float)
-    return _count_track_width_overlaps_grid(pts, float(track_width), float(min_arclen_gap))
-
-
-def count_track_width_overlaps(points, track_width: float, min_arclen_gap: float | None = None) -> int:
-    """Count self-overlaps of the *track area* implied by a centerline + width.
-
-    Even if the centerline polyline does not intersect, the track with width can
-    overlap when two far-apart parts of the centerline come within < track_width.
-
-    Args:
-        points: (N,2) polyline points (typically interpolated curve_points)
-        track_width: full width of the road
-        min_arclen_gap: ignore segment pairs that are too close along the path
-            (prevents false positives from local neighbors in a densely-sampled polyline).
-
-    Returns:
-        Number of overlapping non-local segment pairs.
-    """
-    pts = np.asarray(points, dtype=float)
-    if min_arclen_gap is None:
-        # Ignore local neighbors along the path (dense sampling would otherwise trip this).
-        min_arclen_gap = max(float(track_width) * 2.0, 1.0)
-    points_tuple = tuple(map(tuple, pts))
-    return int(count_track_width_overlaps_cached(points_tuple, float(track_width), float(min_arclen_gap)))
-
-
-def _count_segment_vs_polyline(
-    seg_a: np.ndarray,
-    seg_b: np.ndarray,
-    poly_points: np.ndarray,
-    *,
-    eps: float,
-    skip_first_segment: bool = False,
-    skip_last_segment: bool = False,
-) -> int:
-    poly_points = np.asarray(poly_points, dtype=float)
-    if len(poly_points) < 2:
-        return 0
-
-    start = poly_points[:-1]
-    end = poly_points[1:]
-    count = 0
-    for i in range(len(start)):
-        if skip_first_segment and i == 0:
-            continue
-        if skip_last_segment and i == (len(start) - 1):
-            continue
-        if _segments_intersect_inclusive(seg_a, seg_b, start[i], end[i], eps=eps):
-            count += 1
-    return count
-
-
-def _count_track_endcap_intersections(left_edge: np.ndarray, right_edge: np.ndarray) -> int:
-    """Count intersections caused by the *end caps* of the rendered road polygon.
-
-    The renderer fills a polygon formed by `left_edge + right_edge[::-1]`.
-    This implicitly adds two cap segments:
-    - end cap: left_edge[-1] -> right_edge[-1]
-    - start cap: right_edge[0] -> left_edge[0]
-
-    Intersections involving these cap segments were previously not checked,
-    which can lead to visible self-intersections and sharp artifacts.
-    """
-    left_edge = np.asarray(left_edge, dtype=float)
-    right_edge = np.asarray(right_edge, dtype=float)
-    if len(left_edge) < 2 or len(right_edge) < 2:
-        return 0
-
-    lens = []
-    for edge in (left_edge, right_edge):
-        seg_len = np.linalg.norm(edge[1:] - edge[:-1], axis=1)
-        seg_len = seg_len[seg_len > 1e-12]
-        if seg_len.size:
-            lens.append(float(np.median(seg_len)))
-    base = float(np.median(lens)) if lens else 1.0
-    eps = max(1e-9, base * 1e-6)
-
-    cap_end_a = left_edge[-1]
-    cap_end_b = right_edge[-1]
-    cap_start_a = right_edge[0]
-    cap_start_b = left_edge[0]
-
-    count = 0
-
-    # Skip adjacent boundary segments (shared endpoints).
-    count += _count_segment_vs_polyline(cap_end_a, cap_end_b, left_edge, eps=eps, skip_last_segment=True)
-    count += _count_segment_vs_polyline(cap_end_a, cap_end_b, right_edge, eps=eps, skip_last_segment=True)
-    count += _count_segment_vs_polyline(cap_start_a, cap_start_b, left_edge, eps=eps, skip_first_segment=True)
-    count += _count_segment_vs_polyline(cap_start_a, cap_start_b, right_edge, eps=eps, skip_first_segment=True)
-
-    if _segments_intersect_inclusive(cap_start_a, cap_start_b, cap_end_a, cap_end_b, eps=eps):
-        count += 1
-
-    return int(count)
-
-
-def _compute_offset_edges(points: np.ndarray, track_width: float, *, closed: bool = False):
+def _compute_offset_edges(points: np.ndarray, track_width: float):
     """Compute left/right offset polylines like the renderer does.
 
     This approximates the track polygon used for rendering and is a good proxy
@@ -285,7 +147,7 @@ def _compute_offset_edges(points: np.ndarray, track_width: float, *, closed: boo
     # then re-close. This avoids degenerate direction vectors at the seam.
     has_dup_close = False
     base = curve
-    if closed and n >= 3 and np.allclose(curve[0], curve[-1], atol=1e-9, rtol=0.0):
+    if n >= 3 and np.allclose(curve[0], curve[-1], atol=1e-9, rtol=0.0):
         has_dup_close = True
         base = curve[:-1]
 
@@ -298,12 +160,13 @@ def _compute_offset_edges(points: np.ndarray, track_width: float, *, closed: boo
     right_edge = np.zeros((m, 2), dtype=float)
 
     for j in range(m):
-        if closed and m >= 3:
+        if m >= 3:
             prev_i = (j - 1) % m
             next_i = (j + 1) % m
             dir_prev = base[j] - base[prev_i]
             dir_next = base[next_i] - base[j]
         else:
+            # Degenerate two-point "track": treat it as a straight segment.
             if j == 0:
                 dir_prev = base[1] - base[0]
             else:
@@ -335,7 +198,6 @@ def _count_polyline_crossings_grid(
     b_points: np.ndarray,
     *,
     min_index_gap: int = 0,
-    closed: bool = False,
 ) -> int:
     """Count segment intersections between two open polylines.
 
@@ -409,7 +271,9 @@ def _count_polyline_crossings_grid(
                 for i in a_idxs:
                     if min_index_gap > 0:
                         d = abs(int(i) - int(j))
-                        if closed and ma == mb:
+                        if ma == mb:
+                            # Same parameterization on a loop: measure the
+                            # index gap around the seam as well.
                             d = min(d, ma - d)
                         if d <= int(min_index_gap):
                             continue
@@ -429,7 +293,6 @@ def count_track_area_intersections(
     track_width: float,
     *,
     min_cross_index_gap: int = 2,
-    closed: bool = False,
 ) -> int:
     """Count intersections in the rendered track area (accounts for width).
 
@@ -438,11 +301,11 @@ def count_track_area_intersections(
     - right edge self-intersections
     - left/right edge crossovers
     """
-    left_edge, right_edge = _compute_offset_edges(points, track_width=float(track_width), closed=bool(closed))
-    left_self = count_self_intersections(left_edge, closed=bool(closed))
+    left_edge, right_edge = _compute_offset_edges(points, track_width=float(track_width))
+    left_self = count_self_intersections(left_edge)
     if left_self > 0:
         return int(left_self)
-    right_self = count_self_intersections(right_edge, closed=bool(closed))
+    right_self = count_self_intersections(right_edge)
     if right_self > 0:
         return int(right_self)
     # When comparing left vs right boundaries, we only care about crossings
@@ -451,18 +314,8 @@ def count_track_area_intersections(
         left_edge,
         right_edge,
         min_index_gap=int(min_cross_index_gap),
-        closed=bool(closed),
     )
-    if cross > 0:
-        return int(cross)
-
-    if closed:
-        # Closed loops have no start/end caps.
-        return 0
-
-    # Also validate the implicit start/end caps of the rendered polygon.
-    cap_inters = _count_track_endcap_intersections(left_edge, right_edge)
-    return int(cap_inters)
+    return int(cross)
 
 
 def _segments_intersect_inclusive(a1, a2, b1, b2, eps: float = 1e-9) -> bool:
@@ -506,7 +359,7 @@ def _segments_intersect_inclusive(a1, a2, b1, b2, eps: float = 1e-9) -> bool:
     return False
 
 
-def _count_self_intersections_grid(points: np.ndarray, *, closed: bool = False) -> int:
+def _count_self_intersections_grid(points: np.ndarray) -> int:
     """Count self-intersections using a grid to prune segment pairs."""
 
     points = np.asarray(points)
@@ -559,7 +412,7 @@ def _count_self_intersections_grid(points: np.ndarray, *, closed: bool = False) 
                 j = segs_sorted[b_idx]
                 if j - i <= 1:
                     continue
-                if closed and i == 0 and j == (m - 1):
+                if i == 0 and j == (m - 1):
                     # First and last segments share the loop seam endpoint.
                     continue
                 candidate_pairs.add((i, j))
@@ -575,100 +428,6 @@ def _count_self_intersections_grid(points: np.ndarray, *, closed: bool = False) 
         # eps is scaled to the cell size used by the grid to remain robust.
         eps_i = max(1e-9, cell_size * 1e-6)
         if _segments_intersect_inclusive(seg_start[i], seg_end[i], seg_start[j], seg_end[j], eps=eps_i):
-            count += 1
-
-    return count
-
-
-def _count_track_width_overlaps_grid(points: np.ndarray, track_width: float, min_arclen_gap: float) -> int:
-    """Count non-local segment pairs whose distance is <= track_width.
-
-    This approximates overlap of a constant-width track as the union of capsules
-    around the centerline segments. Two capsules overlap when the centerlines are
-    within track_width.
-    """
-    points = np.asarray(points, dtype=float)
-    n = len(points)
-    if n < 4:
-        return 0
-
-    seg_start = points[:-1]
-    seg_end = points[1:]
-    m = n - 1
-
-    seg_vec = seg_end - seg_start
-    seg_len = np.linalg.norm(seg_vec, axis=1)
-    # Skip a *number of segments* proportional to sampling resolution.
-
-    # Expanded bounding boxes (by radius=track_width/2) for grid pruning.
-    radius = 0.5 * float(track_width)
-    seg_min = np.minimum(seg_start, seg_end) - radius
-    seg_max = np.maximum(seg_start, seg_end) + radius
-
-    nonzero = seg_len > 1e-12
-    if np.any(nonzero):
-        seg_len_nz = seg_len[nonzero]
-        median_seg_len = float(np.median(seg_len_nz))
-        # Use a lower percentile as reference so the local skip remains
-        # conservative even if some segments are much shorter than typical.
-        seg_len_ref = float(np.percentile(seg_len_nz, 25))
-        cell_size = max(1e-6, max(median_seg_len * 2.0, float(track_width)))
-    else:
-        seg_len_ref = 1.0
-        median_seg_len = 1.0
-        cell_size = max(1.0, float(track_width))
-
-    local_index_gap = int(np.ceil(float(min_arclen_gap) / max(1e-12, seg_len_ref)))
-    local_index_gap = max(local_index_gap, 2)
-
-    origin = np.min(points, axis=0)
-    eps = max(1e-12, cell_size * 1e-9)
-
-    gx0 = np.floor((seg_min[:, 0] - origin[0] - eps) / cell_size).astype(np.int64)
-    gx1 = np.floor((seg_max[:, 0] - origin[0] + eps) / cell_size).astype(np.int64)
-    gy0 = np.floor((seg_min[:, 1] - origin[1] - eps) / cell_size).astype(np.int64)
-    gy1 = np.floor((seg_max[:, 1] - origin[1] + eps) / cell_size).astype(np.int64)
-
-    cell_to_segments: Dict[Tuple[int, int], List[int]] = {}
-    for i in range(m):
-        for gx in range(int(gx0[i]), int(gx1[i]) + 1):
-            for gy in range(int(gy0[i]), int(gy1[i]) + 1):
-                key = (gx, gy)
-                if key in cell_to_segments:
-                    cell_to_segments[key].append(i)
-                else:
-                    cell_to_segments[key] = [i]
-
-    candidate_pairs: Set[Tuple[int, int]] = set()
-    for segs in cell_to_segments.values():
-        if len(segs) < 2:
-            continue
-        segs_sorted = sorted(segs)
-        for a_idx in range(len(segs_sorted) - 1):
-            i = segs_sorted[a_idx]
-            for b_idx in range(a_idx + 1, len(segs_sorted)):
-                j = segs_sorted[b_idx]
-                if j - i <= 1:
-                    continue
-                candidate_pairs.add((i, j))
-
-    thresh2 = float(track_width) * float(track_width)
-    count = 0
-    for i, j in candidate_pairs:
-        # Ignore local neighbors along the path (dense sampling would otherwise trip this).
-        # This is expressed in *index space* so it scales naturally with the
-        # sampling resolution.
-        if (j - i) <= local_index_gap:
-            continue
-
-        # Early bbox rejection (expanded bboxes already include radius, but keep fast checks).
-        if seg_max[i, 0] < seg_min[j, 0] or seg_max[j, 0] < seg_min[i, 0]:
-            continue
-        if seg_max[i, 1] < seg_min[j, 1] or seg_max[j, 1] < seg_min[i, 1]:
-            continue
-
-        d2 = _segment_to_segment_distance_sq(seg_start[i], seg_end[i], seg_start[j], seg_end[j])
-        if d2 <= thresh2:
             count += 1
 
     return count
