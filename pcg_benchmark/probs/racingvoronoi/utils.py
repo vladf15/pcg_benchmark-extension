@@ -228,46 +228,68 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
     return best_cycle
 
 
-def smooth_corners(points: np.ndarray, max_radius: float = 20.0, passes: int = 2) -> np.ndarray:
-    """Angle-adaptive corner cutting with a flat world-unit cap, repeated `passes` times.
+def merge_short_edges(points: np.ndarray, min_edge: float) -> np.ndarray:
+    """Merge polygon vertices connected by edges shorter than min_edge.
 
-    cut = min(angle_factor * edge_length, max_radius, 0.45 * edge_length)
-    angle_factor in [0, 0.45]: 0 for straight-through, 0.45 for full hairpin.
+    Repeatedly replaces the endpoints of the shortest such edge with their
+    midpoint, so clusters of near-coincident Voronoi vertices collapse into a
+    single corner instead of producing several sub-track-width kinks.
     """
-    pts = np.asarray(points, dtype=float)
-    for _ in range(passes):
+    pts = list(np.asarray(points, dtype=float))
+    while len(pts) > 3:
         n = len(pts)
-        if n < 3:
-            return pts
+        dists = [float(np.linalg.norm(pts[(i + 1) % n] - pts[i])) for i in range(n)]
+        shortest = int(np.argmin(dists))
+        if dists[shortest] >= min_edge:
+            break
+        mid = 0.5 * (pts[shortest] + pts[(shortest + 1) % n])
+        drop = (shortest + 1) % n
+        pts = [mid if k == shortest else pts[k] for k in range(n) if k != drop]
+    return np.asarray(pts, dtype=float)
 
-        new_pts: list[np.ndarray] = []
-        for i in range(n):
-            prev = pts[(i - 1) % n]
-            curr = pts[i]
-            nxt  = pts[(i + 1) % n]
 
-            v_in,  v_out  = curr - prev, nxt - curr
-            len_in, len_out = float(np.linalg.norm(v_in)), float(np.linalg.norm(v_out))
-            if len_in < 1e-9 or len_out < 1e-9:
-                new_pts.append(curr)
-                continue
+def fillet_corners(points: np.ndarray, max_radius: float, sample_step: float) -> np.ndarray:
+    """Replace each polygon corner with a circular arc tangent to both edges.
 
-            cos_a        = float(np.clip(np.dot(v_in / len_in, v_out / len_out), -1.0, 1.0))
-            angle_factor = 0.45 * float(np.arccos(cos_a)) / np.pi
-
-            if angle_factor < 1e-4:
-                new_pts.append(curr)
-                continue
-
-            cut_in  = min(angle_factor * len_in,  max_radius, len_in  * 0.45)
-            cut_out = min(angle_factor * len_out, max_radius, len_out * 0.45)
-
-            new_pts.append(curr - (v_in  / len_in)  * cut_in)
-            new_pts.append(curr + (v_out / len_out) * cut_out)
-
-        pts = np.array(new_pts, dtype=float)
-
-    return pts
+    The radius adapts so the arc never eats past the midpoint of either
+    adjacent edge (two arcs share each edge), capped at max_radius.  Arcs are
+    sampled about sample_step apart, which keeps their curvature contiguous:
+    downstream corner counting sees one corner per arc no matter how large
+    the radius is, unlike corner cutting whose straight chords reset it.
+    """
+    poly = np.asarray(points, dtype=float)
+    n = len(poly)
+    if n < 3:
+        return poly
+    out: list[np.ndarray] = []
+    for i in range(n):
+        prev, curr, nxt = poly[(i - 1) % n], poly[i], poly[(i + 1) % n]
+        v_in, v_out = curr - prev, nxt - curr
+        l_in, l_out = float(np.linalg.norm(v_in)), float(np.linalg.norm(v_out))
+        if l_in < 1e-9 or l_out < 1e-9:
+            out.append(curr)
+            continue
+        u_in, u_out = v_in / l_in, v_out / l_out
+        cos_t = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
+        turn = float(np.arccos(cos_t))
+        if turn < np.deg2rad(2.0):
+            out.append(curr)
+            continue
+        half_tan = np.tan(turn / 2.0)
+        tangent_allow = 0.5 * min(l_in, l_out)
+        radius = min(float(max_radius), tangent_allow / max(half_tan, 1e-9))
+        tangent_len = radius * half_tan
+        arc_start = curr - u_in * tangent_len
+        sign = 1.0 if (u_in[0] * u_out[1] - u_in[1] * u_out[0]) > 0 else -1.0
+        normal_in = np.array([-u_in[1], u_in[0]]) * sign
+        center = arc_start + normal_in * radius
+        a0 = float(np.arctan2(arc_start[1] - center[1], arc_start[0] - center[0]))
+        sweep = sign * turn
+        n_samples = max(2, int(np.ceil(abs(sweep) * radius / max(float(sample_step), 1e-9))) + 1)
+        for k in range(n_samples + 1):
+            a = a0 + sweep * (k / n_samples)
+            out.append(center + radius * np.array([np.cos(a), np.sin(a)]))
+    return np.asarray(out, dtype=float)
 
 
 def remove_spike_vertices(polygon_points: np.ndarray, threshold_deg: float = 168.0) -> np.ndarray:

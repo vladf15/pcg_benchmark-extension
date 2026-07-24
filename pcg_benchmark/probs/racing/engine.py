@@ -108,11 +108,20 @@ class CarPhysicsEngine:
         self.throttle_slew_rate = 6.0
 
         self.tire_mu = 1.3                  # track-day tires, ~1.3 g
-        # 0: the tires' slip angles already damp yaw naturally, giving a
-        # realistic ~15-20% yaw overshoot on a step-steer.  Any exponential
-        # yaw damping on top starves steady-state cornering (holding a
-        # corner then needs a constant surplus yaw moment).
-        self.yaw_damping = 0.0
+        # Yaw damping resists the rate at which the car rotates.  It is the
+        # stabilizer that stops the car spinning out when it accelerates in a
+        # corner (power oversteer): with it at 0 the yaw rate runs away to a
+        # spin (measured ~280 deg/s on tight tile corners), since the clamped
+        # rear slip angle cannot generate enough restoring moment on its own.
+        # Value chosen by sweeping against the real lap-finish test on the best
+        # track of every representation: 0.6 tames the spin (peak yaw ~55 deg/s
+        # instead of ~280) while every representation still completes its lap at
+        # a comparable pace.  Higher values (>=0.9) make the car too sluggish to
+        # finish the tighter grid tracks, so we keep it light: stable but not
+        # inert.  A benchmark wants the car to be a predictable constant across
+        # all track types, so we err toward stable/forgiving without breaking
+        # drivability.
+        self.yaw_damping = 0.6
 
         self.max_slip_angle = np.deg2rad(10.0)
         self.max_slip_ratio = 1.0
@@ -277,8 +286,16 @@ class CarPhysicsEngine:
         elif Fx0_total < -self.max_brake_force:
             Fx0_total = -self.max_brake_force
 
-        Fx0_f = Fx0_total * (self.load_front / self.normal_load)
-        Fx0_r = Fx0_total * (self.load_rear / self.normal_load)
+        # Rear-engine 911 is rear-wheel drive: ALL drive force goes through the
+        # rear axle (so the rear grip limit, with lateral priority below, is
+        # what governs whether the car can accelerate).  Braking is split by
+        # load across both axles as normal.
+        if Fx0_total >= 0.0:
+            Fx0_r = Fx0_total
+            Fx0_f = 0.0
+        else:
+            Fx0_f = Fx0_total * (self.load_front / self.normal_load)
+            Fx0_r = Fx0_total * (self.load_rear / self.normal_load)
 
         muFzf = self.max_tire_force_front
         muFzr = self.max_tire_force_rear
@@ -287,6 +304,7 @@ class CarPhysicsEngine:
         Fy_r = Fy0_r
 
         # Friction-circle clamp for combined longitudinal and lateral tire force.
+        # Front axle: proportional clamp (both components scaled together).
         if muFzf > 1e-6:
             mag2 = Fx0_f * Fx0_f + Fy_f * Fy_f
             lim2 = muFzf * muFzf
@@ -294,13 +312,30 @@ class CarPhysicsEngine:
                 s = muFzf / math.sqrt(mag2)
                 Fx0_f *= s
                 Fy_f *= s
+        # Rear axle (driven): LATERAL-GRIP PRIORITY under power.  The rear
+        # cornering force is kept, and drive force is limited to the grip that
+        # REMAINS after cornering (Fx_avail = sqrt(muFz^2 - Fy^2)).  So when the
+        # rear tyre is near its cornering limit the car is mostly unable to
+        # accelerate - throttle cannot steal lateral grip and spin the rear
+        # (power-on oversteer).  This is the behaviour of traction control / a
+        # driver who does not apply more power than the rear can take.  Braking
+        # (and coasting) keep the proportional clamp so trail-braking still
+        # trades grip normally.
         if muFzr > 1e-6:
-            mag2 = Fx0_r * Fx0_r + Fy_r * Fy_r
-            lim2 = muFzr * muFzr
-            if mag2 > lim2:
-                s = muFzr / math.sqrt(mag2)
-                Fx0_r *= s
-                Fy_r *= s
+            if Fx0_r > 0.0:
+                fy_used = min(abs(Fy_r), muFzr)
+                if abs(Fy_r) > muFzr:
+                    Fy_r = math.copysign(muFzr, Fy_r)
+                fx_avail = math.sqrt(muFzr * muFzr - fy_used * fy_used)
+                if Fx0_r > fx_avail:
+                    Fx0_r = fx_avail
+            else:
+                mag2 = Fx0_r * Fx0_r + Fy_r * Fy_r
+                lim2 = muFzr * muFzr
+                if mag2 > lim2:
+                    s = muFzr / math.sqrt(mag2)
+                    Fx0_r *= s
+                    Fy_r *= s
 
         # Rotate front-axle tire forces from wheel frame into body frame.
         c = math.cos(delta)

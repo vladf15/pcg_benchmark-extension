@@ -7,8 +7,12 @@ from pcg_benchmark.spaces import ArraySpace, IntegerSpace, DictionarySpace
 from PIL import Image, ImageDraw
 
 
-GRID_H = 12
-GRID_W = 12
+# 11x11 grid (2026-07-24): gives ~15 turns on random content, matching the
+# ~15-turn average of famous European circuits and the other representations
+# (was 12x12 ~ 18 turns).  Corner radius grows slightly to ~34 m, still a
+# realistic slow-corner size.
+GRID_H = 11
+GRID_W = 11
 
 GRASS    = 0
 STRAIGHT = 1
@@ -72,6 +76,10 @@ class _TileGridSpace(DictionarySpace):
 
 class RacingTileProblem(RacingProblem):
 
+    # Decoded points already trace a valid loop in order; the base class's
+    # 2-opt untangle must not reorder them (it would break the loop).
+    _untangle_control_points = False
+
     def __init__(self, **kwargs):
         kwargs.setdefault('num_points', 15)
         kwargs.setdefault('max_steps', 2000)
@@ -85,6 +93,9 @@ class RacingTileProblem(RacingProblem):
         # instead of a Python loop over the whole cache.
         self._decode_cache: dict = {}
         self._decode_cache_keys: list = []
+        # Bound chosen well above one GA population (default 100) so every
+        # mutation-sized neighbour of the current generation stays cached.
+        self._DECODE_CACHE_MAX = int(kwargs.get("decode_cache_max", 512))
 
         # Tile tracks live on a fixed grid, so the generic length targets must
         # be expressed in cell units: waypoints are tile-edge midpoints spaced
@@ -98,6 +109,10 @@ class RacingTileProblem(RacingProblem):
             "min_length":   24.0 * cell,
             "max_length":   60.0 * cell,
             "geom_area_check": False,
+            # start_straight is NOT overridden: the shared 50 m target (base
+            # class) applies to every representation (2026-07-22 user rule).
+            # Tile straights are cell-quantized (>= 62.5 m for a single cell),
+            # so tile passes the 50 m target easily.
         }
 
     # ── WFC tile index constants (used internally) ────────────────────
@@ -408,9 +423,20 @@ class RacingTileProblem(RacingProblem):
         return copied
 
     def _decode_cache_store(self, prefs_arr, types, rotations, wave):
-        """Insert a decoded genome into the cache (dict + key array list)."""
-        self._decode_cache[prefs_arr.tobytes()] = (types, rotations, wave)
-        self._decode_cache_keys.append(prefs_arr.copy())
+        """Insert a decoded genome into the cache (dict + key array list).
+
+        The cache is bounded (oldest genome evicted first): it exists for
+        localised repair of mutation-sized neighbours, which are always
+        recent, and the nearest-genome scan in _decode_genome is linear in
+        the cache size, so an unbounded cache would make every decode of a
+        long run slower and heavier than the last."""
+        key = prefs_arr.tobytes()
+        if key not in self._decode_cache:
+            self._decode_cache_keys.append(prefs_arr.copy())
+            while len(self._decode_cache_keys) > self._DECODE_CACHE_MAX:
+                oldest = self._decode_cache_keys.pop(0)
+                self._decode_cache.pop(oldest.tobytes(), None)
+        self._decode_cache[key] = (types, rotations, wave)
 
     def _decode_genome(self, tile_prefs):
         """Decode a partial-map genome to (types, rotations) via Genetic-WFC.
@@ -619,12 +645,69 @@ class RacingTileProblem(RacingProblem):
             return None
         return loop
 
+    # How many samples each corner tile's quarter-circle arc contributes to
+    # the track polyline (spacing ~5.5 m at the default cell size, matching
+    # the densification step, so corners translate into the track exactly).
+    _ARC_SAMPLES = 6
+
+    def _corner_arc_center(self, r, c, rotation):
+        """The cell corner both open edges touch: the arc's centre point."""
+        cw = self._width / GRID_W
+        ch = self._height / GRID_H
+        x0, y0 = c * cw, r * ch
+        return {
+            0: (x0 + cw, y0),       # corner NE
+            1: (x0 + cw, y0 + ch),  # corner ES
+            2: (x0,      y0 + ch),  # corner SW
+            3: (x0,      y0),       # corner WN
+        }[int(rotation)]
+
+    def _loop_to_track_points(self, loop, types, rotations):
+        """Convert an ordered cell loop to waypoints that follow the actual
+        tile road geometry.
+
+        Straight tiles contribute their exit-edge midpoint (the road inside
+        them is the exact straight between entry and exit midpoints).
+        Corner tiles contribute _ARC_SAMPLES points along their true
+        quarter-circle centerline (radius = half a cell, centred on the
+        cell corner shared by the two open edges), ending at the exit
+        midpoint.  The polyline therefore IS the drawn road, and the curve
+        step only densifies it instead of fitting a spline (which bowed the
+        straights and wobbled at corners because the edge-midpoint chords
+        alternate 41.7 m / 29.5 m spacing)."""
+        n = len(loop)
+        points = []
+        for i, (r, c) in enumerate(loop):
+            pr, pc = loop[(i - 1) % n]
+            nr, nc = loop[(i + 1) % n]
+            exit_mid = (
+                (c + nc + 1) * self._width / (2 * GRID_W),
+                (r + nr + 1) * self._height / (2 * GRID_H),
+            )
+            if int(types[r, c]) != CORNER:
+                points.append(exit_mid)
+                continue
+
+            entry_mid = (
+                (c + pc + 1) * self._width / (2 * GRID_W),
+                (r + pr + 1) * self._height / (2 * GRID_H),
+            )
+            cx, cy = self._corner_arc_center(r, c, rotations[r, c])
+            radius = 0.5 * self._width / GRID_W
+            a0 = np.arctan2(entry_mid[1] - cy, entry_mid[0] - cx)
+            a1 = np.arctan2(exit_mid[1] - cy, exit_mid[0] - cx)
+            sweep = (a1 - a0 + np.pi) % (2.0 * np.pi) - np.pi  # shortest way
+            for s in range(1, self._ARC_SAMPLES + 1):
+                a = a0 + sweep * s / self._ARC_SAMPLES
+                points.append((cx + radius * np.cos(a), cy + radius * np.sin(a)))
+        return points
+
     def _grid_to_track_points(self, types, rotations):
-        """Convert tile grid to ordered pixel waypoints (edge midpoints)."""
+        """Convert tile grid to ordered pixel waypoints along the tile road."""
         loop = self._extract_loop(types, rotations)
         if loop is None:
             return None
-        return self._edge_midpoints(loop)
+        return self._loop_to_track_points(loop, types, rotations)
 
     def _best_effort_path(self, types, rotations):
         """For rendering: find the largest connected chain of road tiles even if
@@ -684,6 +767,38 @@ class RacingTileProblem(RacingProblem):
             return np.array(pts)
         return super()._extract_content(content)
 
+    def _make_curve(self, track_points):
+        """Tile waypoints already trace the exact road (straights + sampled
+        arcs), so like voronoi the curve step only densifies with straight
+        segments; a spline through them would re-introduce wobble."""
+        return self._densify_polyline(
+            track_points,
+            max_step=float(self._track_width) * 0.35,
+        )
+
+    def _count_loop_turns(self, loop, types):
+        """Number of turns as a designer would count them: consecutive
+        corner tiles turning the same way form ONE turn (three same-way
+        corner tiles are one 270 degree loop-back, a left-right chicane is
+        two turns).  The dense arc-sampled polyline makes the base class's
+        per-vertex angle count meaningless for tile (every sample turns
+        only ~15 degrees), so controlability uses this count instead."""
+        turns = 0
+        prev_sign = 0
+        n = len(loop)
+        for i, (r, c) in enumerate(loop):
+            if int(types[r, c]) != CORNER:
+                prev_sign = 0
+                continue
+            pr, pc = loop[(i - 1) % n]
+            nr, nc = loop[(i + 1) % n]
+            cross = (r - pr) * (nc - c) - (c - pc) * (nr - r)
+            sign = 1 if cross > 0 else (-1 if cross < 0 else 0)
+            if sign != 0 and sign != prev_sign:
+                turns += 1
+            prev_sign = sign
+        return turns
+
     # ── Problem interface ─────────────────────────────────────────────
 
     def info(self, content, trajectory=None, use_cache=True):
@@ -700,11 +815,15 @@ class RacingTileProblem(RacingProblem):
                 'curve_points': np.zeros((0, 2)),
             }
 
-        return super().info(
+        result = super().info(
             {"track_points": np.array(track_pts)},
             trajectory=trajectory,
             use_cache=use_cache,
         )
+        loop = self._extract_loop(types, rotations)
+        if loop is not None:
+            result['num_turns'] = self._count_loop_turns(loop, types)
+        return result
 
     # ── Tile rendering ────────────────────────────────────────────────
 

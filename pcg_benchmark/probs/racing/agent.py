@@ -43,13 +43,25 @@ class SteeringAgent:
         self.accel_max     = 4.0    # acceleration out of corners
         self.min_speed     = 4.0    # never plan slower than this
 
-        # Steering law.
+        # Steering law.  Lookahead is left at the tuned agile values: the
+        # engine's yaw damping now handles stability, so the agent does not need
+        # a long (sluggish) lookahead that would run the tighter grid tracks
+        # wide.  Short lookahead + engine damping keeps corners crisp AND stable.
         self.lookahead_base = 8.0    # metres at standstill
         self.lookahead_gain = 0.35   # extra metres per m/s of speed
         self.lookahead_max  = 30.0
         self.stanley_k      = 0.35   # cross-track gain (trim only; the
         self.stanley_v0     = 1.5    # lookahead aim does the main work)
         self.nominal_max_steer_rad = math.radians(28.0)
+        # Damp the steering by the car's own rotation rate: when the car is
+        # already turning toward the aim point, ease off a little so it stops on
+        # the line rather than swinging past it.  Kept light (the engine yaw
+        # damping does the heavy lifting) so it smooths the residual settle
+        # wiggle without slowing corner entry.
+        self.yaw_damp_gain = 0.03    # seconds; steering reduced per rad/s of yaw
+        # Below this heading error (radians) on a near-centered car, hold
+        # straight instead of chasing tiny errors (deadzone stops twitching).
+        self.steer_deadzone_rad = math.radians(0.6)
 
         # Slow down when the car drifts outside the usable corridor
         # (half width minus a margin).
@@ -69,6 +81,8 @@ class SteeringAgent:
         self.max_index_advance = 12
 
         self.current_idx = 0
+        self._prev_angle = None      # for yaw-rate estimate in act()
+        self._dt = 0.1               # engine time step; steering damping only
         self.curve_points = curve_points  # setter precomputes everything
 
     # ── Path geometry and speed profile (once per track) ─────────────────
@@ -166,6 +180,8 @@ class SteeringAgent:
         """Reset agent to start of path."""
         self.current_idx = 0
         self.last_lookahead_point = None
+        self._prev_angle = None      # for yaw-rate estimate in act()
+        self._dt = 0.1               # engine time step; steering damping only
 
     # ── Path queries ──────────────────────────────────────────────────────
 
@@ -292,7 +308,23 @@ class SteeringAgent:
         lat_off = self._signed_lateral_offset(pos, self.current_idx)
         stanley = math.atan2(self.stanley_k * (-lat_off), spd + self.stanley_v0)
 
-        steering = (heading_err + stanley) / self.nominal_max_steer_rad
+        # Estimate the car's turn rate from the heading change since last call,
+        # then subtract it: if the car is already rotating toward the aim, we
+        # need less steering.  This damping is what stops the recovery wiggle.
+        yaw_rate_est = 0.0
+        if self._prev_angle is not None:
+            d = (float(angle) - self._prev_angle + math.pi) % (2.0 * math.pi) - math.pi
+            yaw_rate_est = d / self._dt
+        self._prev_angle = float(angle)
+
+        steer_rad = heading_err + stanley - self.yaw_damp_gain * yaw_rate_est
+
+        # Deadzone: on a near-straight aim, hold the wheel still rather than
+        # chasing sub-degree errors (removes idle twitching).
+        if abs(heading_err) < self.steer_deadzone_rad and abs(lat_off) < 0.5:
+            steer_rad = 0.0
+
+        steering = steer_rad / self.nominal_max_steer_rad
         steering = min(max(steering, -1.0), 1.0)
 
         # ── Throttle: track the speed profile over a short horizon ──

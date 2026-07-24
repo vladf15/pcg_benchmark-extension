@@ -3,9 +3,10 @@ from __future__ import annotations
 from pcg_benchmark.probs.racing.problem import RacingProblem
 from pcg_benchmark.probs.racingvoronoi.utils import (
     build_voronoi_cell_graph,
+    fillet_corners,
     find_boundary_cycle,
+    merge_short_edges,
     remove_spike_vertices,
-    smooth_corners,
 )
 from pcg_benchmark.spaces import ArraySpace, FloatSpace, IntegerSpace, DictionarySpace
 from pcg_benchmark.probs.utils import get_range_reward
@@ -16,16 +17,26 @@ class RacingVoronoiProblem(RacingProblem):
 
     _render_desc = 'Rendering voronoi frames'
 
+    # Decoded points already trace a valid loop in order; the base class's
+    # 2-opt untangle must not reorder them (it would break the loop).
+    _untangle_control_points = False
+
     def __init__(self, **kwargs):
         kwargs.setdefault('num_points', 15)
         kwargs.setdefault('max_steps', 2000)
 
-        # 100 cells leaves ~38 eligible interior cells after boundary/one-ring/
-        # out-of-bounds-vertex exclusion.  With 60 cells only ~17 remained, so a
-        # 15-cell connected cluster had almost no degrees of freedom and the
-        # whole phenotype space was exhausted by a random initial population.
-        num_cells = int(kwargs.pop('num_cells', 100))
-        num_selected = int(kwargs.pop('num_selected_cells', 15))
+        # Corner count is set by the number of USED cells, not by shrinking the
+        # diagram (2026-07-24): 100/15 gave ~37 turns (roughly double a famous
+        # European circuit's ~15) because voronoi corners are pinned to the
+        # cell-edge scale.  Keeping 50 total cells (small enough that the cells
+        # are not oversized, ~26 eligible -> lots of search freedom) and using
+        # only 6 of them gives ~19 turns.  The trade-off is that a 6-cell loop
+        # is shorter (~1600 m, length_score ~0.71) since fewer/smaller cells
+        # cannot both be few AND span a long lap - voronoi stays the most
+        # corner-dense representation (19 vs ~16), an inherent property of the
+        # tessellation.
+        num_cells = int(kwargs.pop('num_cells', 50))
+        num_selected = int(kwargs.pop('num_selected_cells', 6))
         voronoi_seed = int(kwargs.pop('voronoi_seed', 0))
 
         super().__init__(**kwargs)
@@ -51,32 +62,7 @@ class RacingVoronoiProblem(RacingProblem):
         self._cell_adjacency = None
         self._last_selected_cells = None
 
-    # ------------------------------------------------------------------
-    # Static helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _densify_polyline(points: np.ndarray, *, max_step: float) -> np.ndarray:
-        """Subdivide a closed polygon's edges so no segment exceeds max_step."""
-        points = np.asarray(points, dtype=float).reshape(-1, 2)
-        if len(points) < 2:
-            return points
-        out = [points[0]]
-        n = len(points)
-        for i in range(n):
-            a = points[i]
-            b = points[(i + 1) % n]
-            d = float(np.linalg.norm(b - a))
-            if d <= 1e-12:
-                continue
-            steps = max(1, int(np.ceil(d / max(float(max_step), 1e-9))))
-            for s in range(1, steps + 1):
-                t = s / steps
-                out.append(a * (1.0 - t) + b * t)
-        out_np = np.asarray(out, dtype=float)
-        if len(out_np) >= 2 and not np.allclose(out_np[0], out_np[-1], atol=1e-9):
-            out_np = np.vstack([out_np, out_np[0]])
-        return out_np
+    # _densify_polyline is inherited from RacingProblem (shared with tile).
 
     # ------------------------------------------------------------------
     # Fixed Voronoi grid
@@ -200,7 +186,10 @@ class RacingVoronoiProblem(RacingProblem):
 
             pts = self._voronoi_vertices[np.array(cycle, dtype=int)]
             pts = remove_spike_vertices(pts)
-            pts = smooth_corners(pts)
+            # Collapse vertex clusters tighter than 1.5 track widths: they are
+            # artifacts of the cell tessellation, not corners a track designer
+            # would build.  The rounding itself happens in _make_curve.
+            pts = merge_short_edges(pts, min_edge=float(self._track_width) * 1.5)
             if len(pts) < 3:
                 return super()._extract_content(None)
             return np.asarray(pts, dtype=float)
@@ -212,14 +201,17 @@ class RacingVoronoiProblem(RacingProblem):
     # Simulation interface
     # ------------------------------------------------------------------
 
+    # Corner rounding: every polygon corner becomes a circular arc tangent to
+    # both edges, mirroring how the tile representation drives quarter arcs.
+    _FILLET_MAX_RADIUS = 40.0
+
     def _make_curve(self, track_points):
-        """Voronoi tracks are already polygons: densify their edges with
-        straight segments instead of fitting a spline (a spline would bow
-        the straights and round every corner twice)."""
-        return self._densify_polyline(
-            track_points,
-            max_step=float(self._track_width) * 0.35,
-        )
+        """Voronoi tracks are polygons: round each corner with a tangent arc,
+        then densify the remaining straights (a spline would bow the straights
+        and round every corner twice)."""
+        step = float(self._track_width) * 0.35
+        rounded = fillet_corners(track_points, max_radius=self._FILLET_MAX_RADIUS, sample_step=step)
+        return self._densify_polyline(rounded, max_step=step)
 
     # ------------------------------------------------------------------
     # Info
@@ -259,6 +251,13 @@ class RacingVoronoiProblem(RacingProblem):
         **RacingProblem._QUALITY_PARAMS,
         "angles_on_curve":    False,
         "geom_area_check":    False,
+        # start_straight is NOT overridden: the shared 50 m target (base class)
+        # applies to every representation (2026-07-22 user rule).  Voronoi is the
+        # tightest case (straights pinned to the diagram edge scale); measured on
+        # the 750 m map, 29% of random genomes already reach 50 m and the GA can
+        # push toward the ~99 m diagram-best chain, so 50 m is a real, reachable
+        # discriminator (it is the one thing random voronoi content genuinely
+        # fails often) without locking the representation out.
     }
 
     # ------------------------------------------------------------------

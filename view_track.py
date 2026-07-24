@@ -53,11 +53,18 @@ def sort_chromosomes(chromosomes: list[dict], sort_by: str) -> list[dict]:
         return sorted(chromosomes, key=lambda c:  (c.get("quality") or 0.0))
     return list(chromosomes)
 
-def infer_problem_type(chromosomes: list[dict]) -> str:
+def infer_problem_type(chromosomes: list[dict], results_folder: str | Path = "") -> str:
     content = chromosomes[0].get("content") or {} if chromosomes else {}
     if "cell_scores" in content:
         return "RacingVoronoi"
     if "tile_prefs" in content:
+        # Square and hex tile genomes share the same schema (tile_prefs, 144
+        # cells), so the env name in the results path is the discriminator;
+        # gene range as fallback (square prefs are 0-6, hex go up to 15).
+        if "tilehex" in str(results_folder).lower():
+            return "RacingTileHex"
+        if int(np.max(np.asarray(content["tile_prefs"]))) > 6:
+            return "RacingTileHex"
         return "RacingTile"
     return "Racing"
 
@@ -77,15 +84,21 @@ def resolve_all_iterations(config: dict) -> tuple[list[Path], str, int]:
     seed_chroms = load_chromosomes(iters[start_idx])
     if not seed_chroms:
         raise FileNotFoundError(f"No chromosome files found in {iters[start_idx]}")
-    return iters, infer_problem_type(seed_chroms), start_idx
+    return iters, infer_problem_type(seed_chroms, folder), start_idx
 
 def build_problem(problem_type: str, num_cells: int = 50):
     if problem_type == "RacingVoronoi":
         from pcg_benchmark.probs.racingvoronoi.problem import RacingVoronoiProblem
-        return RacingVoronoiProblem(num_cells=num_cells, num_selected_cells=15)
+        # num_selected_cells must match the problem default (6) so the viewer
+        # decodes the same track the GA scored; num_cells comes from the saved
+        # genome's cell_scores length.
+        return RacingVoronoiProblem(num_cells=num_cells, num_selected_cells=6)
     if problem_type == "RacingTile":
         from pcg_benchmark.probs.racingtile.problem import RacingTileProblem
         return RacingTileProblem()
+    if problem_type == "RacingTileHex":
+        from pcg_benchmark.probs.racingtilehex.problem import RacingTileHexProblem
+        return RacingTileHexProblem()
     from pcg_benchmark.probs.racing.problem import RacingProblem
     return RacingProblem()
 
@@ -292,6 +305,38 @@ class RaceViewer:
 
         self._track_surface = surface
 
+    def build_hextile_surface(self, problem, tiles=None):
+        """Draw the RacingTileHex structure view: the normal track ribbon with
+        the hex cell grid drawn on top.
+
+        `tiles` is accepted for call-site compatibility but no longer used: the
+        road comes from the ribbon, not from the per-tile arc polylines.
+
+        Earlier this redrew the road itself from per-tile arc polylines, which
+        came out as a lumpy string of beads instead of smooth turns.  Instead
+        we build the same filled road ribbon the plain track view uses (so the
+        road looks identical to every other representation) and then overlay the
+        hex cell outlines, so the structure is shown ON the track rather than
+        substituted for it.  Pixel coordinates are in problem space
+        (0.._width / 0.._height); scale maps them to the viewer surface."""
+        from pcg_benchmark.probs.racingtilehex.problem import GRID_H, GRID_W
+
+        # 1. The nice road ribbon, exactly as the plain track view draws it.
+        self.build_track_surface(problem._curve_points, problem._track_width)
+        surface = self._track_surface
+
+        # 2. Hex cell outlines on top, so the grid is visible over the track.
+        sx = self._img_w / float(problem._width)
+        sy = self._img_h / float(problem._height)
+        OUTLINE = (20, 100, 20)
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                corners = [(int(p[0] * sx), int(p[1] * sy))
+                           for p in problem._hex_corners(r, c)]
+                pygame.draw.polygon(surface, OUTLINE, corners, 1)
+
+        self._track_surface = surface
+
     def draw_frame(self, state, action=None, lookahead=None, yaw_rate=0.0, mass=1350.0):
         """Blit the cached track, draw the car and HUD."""
         if self._track_surface is None:
@@ -438,6 +483,7 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
 
     is_voronoi = problem_type == "RacingVoronoi"
     is_tile    = problem_type == "RacingTile"
+    is_hextile = problem_type == "RacingTileHex"
     num_cells  = 50
     if is_voronoi:
         seed = get_iter_chroms(start_iter)
@@ -482,6 +528,13 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
                     np.asarray(current_content["tile_prefs"], dtype=int),
                 )
                 viewer.build_tile_surface(types, rotations)
+            return
+        if is_hextile and show_structure and current_content is not None:
+            if hasattr(problem, "_decode_genome") and "tile_prefs" in current_content:
+                tiles = problem._decode_genome(
+                    np.asarray(current_content["tile_prefs"], dtype=int),
+                )
+                viewer.build_hextile_surface(problem, tiles)
             return
         scores = None
         if show_structure and cell_polygons is not None:

@@ -236,6 +236,12 @@ def _count_polyline_crossings_grid(
         cell_size = max(1e-6, base * 2.0)
     else:
         cell_size = 1.0
+    # Same degenerate-curve guard as _count_self_intersections_grid: never
+    # let one segment span more than ~256 cells of the overall extent.
+    hi = np.maximum(np.max(a_points, axis=0), np.max(b_points, axis=0))
+    lo = np.minimum(np.min(a_points, axis=0), np.min(b_points, axis=0))
+    span = float(np.max(hi - lo))
+    cell_size = max(cell_size, span / 256.0, 1e-6)
 
     origin = np.minimum(np.min(a_points, axis=0), np.min(b_points, axis=0))
     eps = max(1e-12, cell_size * 1e-9)
@@ -382,6 +388,12 @@ def _count_self_intersections_grid(points: np.ndarray) -> int:
         cell_size = max(1e-9, base * 2.0)
     else:
         cell_size = 1.0
+    # Floor the cell size against the overall extent: on degenerate curves
+    # (nearly identical points) the median segment length approaches zero
+    # and a single normal-length segment would otherwise span billions of
+    # grid cells, exhausting memory.
+    span = float(np.max(np.max(points, axis=0) - np.min(points, axis=0)))
+    cell_size = max(cell_size, span / 256.0, 1e-9)
 
     origin = np.min(points, axis=0)
     eps = max(1e-12, cell_size * 1e-9)

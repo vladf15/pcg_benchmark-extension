@@ -34,6 +34,10 @@ class RacingRadialProblem(RacingProblem):
 
     _render_desc = 'Rendering radial frames'
 
+    # Points are decoded in angle order (already non-self-crossing), so the
+    # base class's 2-opt untangle must not reorder them.
+    _untangle_control_points = False
+
     def __init__(self, **kwargs):
         # Same control-point budget and step budget as racing-v0: both
         # genomes are num_points * 2 floats, so search compares like for like.
