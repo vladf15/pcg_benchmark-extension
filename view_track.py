@@ -7,6 +7,13 @@ Keyboard shortcuts inside the pygame window:
   Up / Down      previous / next chromosome within current iteration
   Space          restart current chromosome
   Escape         close the window
+
+Driver: the scripted SteeringAgent by default. Set "RL model" in the
+control panel to a trained policy (model_training/runs/<name>/best/*.zip)
+to watch that instead; the active driver is named in the overlay. An RL
+policy runs on its own engine_v2 physics via rl_agent_adapter, because it
+was trained on that engine and on an 18-float observation rather than the
+benchmark engine's 5-float state.
 """
 from __future__ import annotations
 
@@ -497,6 +504,12 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         problem._build_cell_graph()
     cell_polygons, ineligible_cells = _extract_cell_polygons(problem) if is_voronoi else (None, set())
     show_structure   = config.get("show_structure", False)
+    # Path to a trained SB3 model; empty means use the scripted agent.
+    # Resolved against this file's directory so a relative path works
+    # regardless of where the viewer was launched from.
+    rl_model_path    = (config.get("rl_model", "") or "").strip()
+    if rl_model_path and not Path(rl_model_path).is_absolute():
+        rl_model_path = str((Path(__file__).parent / rl_model_path).resolve())
     current_content  = None
 
     scale   = _TARGET_WINDOW_PX / max(problem._width, problem._height)
@@ -551,6 +564,26 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         )
 
     def make_agent():
+        """Scripted agent by default; a trained RL policy if one is loaded.
+
+        The RL wrapper exposes the same act()/reset() interface but drives
+        its own engine_v2 instance (it was trained on that physics and on
+        an 18-float observation, neither of which the benchmark engine
+        provides). Everything downstream of act() is unchanged.
+        """
+        if rl_model_path:
+            try:
+                from rl_agent_adapter import RLAgent
+                return RLAgent(rl_model_path, problem._curve_points,
+                               problem._track_width,
+                               getattr(problem, "_width", None))
+            except Exception as exc:
+                # Never let a bad model path kill the viewer: say what went
+                # wrong and fall back to the scripted agent, which the
+                # overlay will then name.
+                print(f"[viewer] could not load RL model {rl_model_path!r}: "
+                      f"{type(exc).__name__}: {exc}")
+                print("[viewer] falling back to the scripted agent")
         ag = SteeringAgent(problem._curve_points, track_width=problem._track_width)
         ag.reset()
         return ag
@@ -565,6 +598,8 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         if len(problem._curve_points) >= 2:
             rebuild_surface(); agent = make_agent()
         state = problem._engine.reset()
+        if hasattr(agent, "state"):          # RL agent drives its own engine
+            state = agent.reset()
         dt    = problem._engine.time_step
         prev_angle = None; step = 0; step_accumulator = 0.0
         action = {"steering": 0.0, "throttle": 0.0}; lookahead = None; yaw_rate = 0.0
@@ -585,7 +620,9 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         chroms   = get_iter_chroms(iter_index)
         quality  = chroms[chrom_index].get("quality")
         q_str    = f"  quality: {quality:.3f}" if quality is not None else ""
+        driver   = getattr(agent, "name", None) or "scripted agent"
         text     = (f"iter [{iter_index+1}/{total_iters}]  chrom [{chrom_index+1}/{len(chroms)}]{q_str}"
+                    f"  driver: {driver}"
                     f"   ◄/► iterations   ▲/▼ chromosomes   Space restart")
         surf     = overlay_font.render(text, True, (220, 220, 220))
         screen   = pygame.display.get_surface()
@@ -632,7 +669,11 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
             action    = agent.act(state)
             lookahead = getattr(agent, "last_lookahead_point", None)
             yaw_rate, prev_angle = RaceViewer.compute_yaw_rate(state, prev_angle, dt)
-            state     = problem._engine.step(action)
+            # An RL agent integrates its own physics inside act(), so its
+            # pose comes from the agent; the scripted agent is driven by
+            # the benchmark engine as before.
+            state     = (agent.state() if hasattr(agent, "state")
+                         else problem._engine.step(action))
             step     += 1; step_accumulator -= 1.0
 
         viewer.draw_frame(state, action=action, lookahead=lookahead, yaw_rate=yaw_rate)
@@ -757,8 +798,27 @@ class ConfigWindow:
         self._show_structure_var = tk.BooleanVar(value=d.get("show_structure", False))
         self._show_structure_var.trace_add("write", lambda *_: self._on_show_structure_changed())
         self._field(parent, "Show structure", ttk.Checkbutton(parent, variable=self._show_structure_var))
+        # Driver: scripted agent, or a trained RL model (.zip from
+        # model_training/runs/<name>/best/). Applied on the next start.
+        self._rl_var = tk.StringVar(value=d.get("rl_model", ""))
+        self._field(parent, "RL model",
+                    ttk.Entry(parent, textvariable=self._rl_var, width=28),
+                    ttk.Button(parent, text="Browse…", command=self._pick_rl_model))
+        ttk.Label(parent, text="Leave empty for the scripted agent",
+                  foreground="gray", font=("", 8)).grid(row=self._row, column=0,
+                                                        columnspan=3, sticky="w")
+        self._row += 1
         self._loop_var = tk.BooleanVar(value=d.get("loop_track", True))
         self._field(parent, "Auto-cycle", ttk.Checkbutton(parent, variable=self._loop_var))
+
+    def _pick_rl_model(self):
+        start = Path(__file__).parent / "model_training" / "runs"
+        path = filedialog.askopenfilename(
+            title="Select a trained model",
+            initialdir=str(start) if start.exists() else str(Path.home()),
+            filetypes=[("Trained model", "*.zip"), ("All files", "*.*")])
+        if path:
+            self._rl_var.set(path)
 
     def _build_controls_section(self, parent):
         self._sep(parent)
@@ -862,6 +922,7 @@ class ConfigWindow:
             "show_hud":        bool(self._hud_var.get()),
             "show_structure":  bool(self._show_structure_var.get()),
             "loop_track":     bool(self._loop_var.get()),
+            "rl_model":       self._rl_var.get().strip(),
         }
 
 
@@ -877,6 +938,7 @@ _DEFAULTS = {
     "speed":          0.5,
     "show_hud":        True,
     "show_structure":  False,
+    "rl_model":        "",
     "loop_track":     True,
 }
 

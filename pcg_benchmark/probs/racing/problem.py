@@ -346,7 +346,7 @@ class RacingProblem(Problem):
         self._width = float(kwargs.get("width", 750.0))
         self._height = float(kwargs.get("height", 750.0))
         self._diversity = float(kwargs.get("diversity", 0.4))
-        self._default_max_steps = kwargs.get("max_steps", 4000)
+        self._default_max_steps = kwargs.get("max_steps", 7000)
         self._skip_render = kwargs.get("skip_render", False)
 
         self._lap_finish_min_steps = int(kwargs.get("lap_finish_min_steps", 60))
