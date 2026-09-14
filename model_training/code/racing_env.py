@@ -40,9 +40,14 @@ Reward per step:
              gradient about corner-entry speed and produced a constant-
              pace policy that never braked for tight corners.
     lap complete:  +20, plus up to +200 for finishing with steps to spare
-    departed the track (beyond 2 half-widths), off the map, or stuck:
+    departed the track (beyond 2 half-widths) or off the map:
            -(20 + 30 * v/vmax) and the episode ends: failing fast is
            much worse than failing slow, which is the point.
+    stuck (no progress for stuck_patience steps):
+           -40 and the episode ends. Larger than the crash penalty because
+           the timeout is short, so without it a stationary car pays less
+           total time cost than a car that drives and crashes, and standing
+           still becomes the cheapest ending available.
 
 This is the shape used by the racing RL literature: dense progress along
 the track plus penalties for leaving it (GT Sophy, Wurman et al. 2022) and
@@ -135,27 +140,41 @@ class EngineBackedPhysics:
         return self._state()
 
 
-class V2Physics(EngineBackedPhysics):
-    """Simcade physics v2 (engine_v2.py): substepped, load transfer, real
-    grip limits, human-limited inputs. Default for the driving model; the
-    benchmark's own engine stays frozen and available as EngineBackedPhysics.
+class LegacyPhysics(EngineBackedPhysics):
+    """Simcade physics (engine_legacy.py): substepped, load transfer, real grip
+    limits, human-limited inputs.
+
+    Kept alongside the benchmark engine because the two differ in how readily
+    the car spins under the near-random actions PPO starts from: measured over
+    200 random-action rollouts, peak yaw rate is 1.80 rad/s here against 4.38
+    for the benchmark engine.  A run that spins on most early episodes never
+    reaches the episode lengths where progress reward outweighs TIME_COST, so
+    which engine trains is a property worth being able to switch.
     """
 
     def __init__(self):
-        from engine_v2 import CarPhysicsEngineV2
-        self._engine = CarPhysicsEngineV2(start_position=(0.0, 0.0))
+        from engine_legacy import CarPhysicsEngineLegacy
+        self._engine = CarPhysicsEngineLegacy(start_position=(0.0, 0.0))
         self.dt = float(self._engine.time_step)
         self.max_speed = float(self._engine.max_speed)
         self.max_steering = float(self._engine.max_steering)
 
 
-def make_physics(name="v2"):
-    """Physics by name: 'v2' (simcade, default) or 'v1' (benchmark engine)."""
-    if name == "v2":
-        return V2Physics()
-    if name == "v1":
+def make_physics(name="benchmark"):
+    """Physics for the training environment, by name.
+
+    'benchmark' is the car the GA quality function scores laps with, so a
+    policy trained on it is measuring the same vehicle the benchmark
+    simulates.  'legacy' is the separate simcade model that run10 was
+    trained on.  Training on 'legacy' and scoring on 'benchmark' means the
+    policy learned physics the benchmark never uses, which is why
+    'benchmark' is the default.
+    """
+    if name == "benchmark":
         return EngineBackedPhysics()
-    raise ValueError(f"unknown physics '{name}' (use 'v1' or 'v2')")
+    if name == "legacy":
+        return LegacyPhysics()
+    raise ValueError("unknown physics '%s' (use 'benchmark' or 'legacy')" % name)
 
 
 class RacingEnv(gym.Env):
@@ -221,8 +240,35 @@ class RacingEnv(gym.Env):
                               # extra pace pressure cannot be paid for by
                               # running wide more often
     OFFROAD_SPEED = 4.0
-    FAIL_PENALTY = 20.0        # also the stuck/off-map penalty (at v ~ 0)
+    FAIL_PENALTY = 20.0        # also the off-map penalty (at v ~ 0)
     FAIL_SPEED_PENALTY = 30.0
+    # Ending an episode by not moving has to cost more than any attempt to
+    # drive, or standing still is a cheap way out of the time cost. Measured
+    # net return over an episode, benchmark car: standing still -25.1,
+    # driving at 10 m/s -21.1, crashing at 30 m/s -25.0. That landscape is
+    # flat, and run11 converged onto it exactly, its evaluation return pinned
+    # at -25.1 (101 steps, the stuck timeout) for all 5M steps. The escape
+    # hatch is the timeout itself: a stationary car ends its episode after
+    # 101 steps having paid 5.1 of time cost, while a car that drives badly
+    # pays the same 20 having at least covered ground.
+    #
+    # 40 restores the slope that trained run10, where the same comparison ran
+    # -43.9 (standing) against -20.8 (driving at 10 m/s), a 23-point gap:
+    # -101*0.05 - 40 = -45.1 against -21.1 is a 24-point gap. Sized to that
+    # measurement, not chosen for roundness. 20 (leaving it equal to
+    # FAIL_PENALTY) is the flat landscape above; 80 was not tried, since a
+    # penalty far above the worst crash would teach the car to drive off the
+    # track deliberately rather than risk stopping.
+    #
+    # Validated by a 5M-step run on the benchmark car (runs/run12_stuckfix,
+    # seed 0, 12 envs, otherwise run11's settings): evaluation return
+    # -45.1 -> 482.6 and 4 of 5 held-out circuits lapped, against run11's
+    # -25.1 frozen for all 5M steps and 0 of 5. From a standing start on Monza
+    # it reaches 24.8 m/s in 40 steps where run11 reaches 3.7. The escape from
+    # the flat region comes later than on the legacy engine, at about 3.7M steps
+    # against run10's 1.7M, so a run shorter than ~4M looks like a failure
+    # while it is still climbing.
+    STUCK_PENALTY = 40.0
     # The edge is 1.0 half-widths (point car); KERB_LIMIT adds a tolerance
     # inside which progress still counts, so clipping an apex kerb is not
     # treated as leaving the track. Beyond OFF_TRACK_LIMIT the car has
@@ -243,7 +289,7 @@ class RacingEnv(gym.Env):
                      reset(options=...) overrides any of those.
         """
         super().__init__()
-        self._physics = physics if physics is not None else V2Physics()
+        self._physics = physics if physics is not None else EngineBackedPhysics()
         self._randomize = randomize
         self._stuck_patience = int(stuck_patience)
         self._rng = np.random.default_rng(seed)
@@ -253,7 +299,8 @@ class RacingEnv(gym.Env):
         for name in names:
             t = track_loader.load_track(name)
             # 1:1 scale (world units = metres); each circuit carries its own
-            # bounding square since real circuits exceed the 750 m benchmark map.
+            # bounding square, since real circuits span 813-2171 m and the
+            # benchmark map is one fixed square for every track.
             base = TrackGeometry(t["points"], t["track_width"], t["map_size"])
             # Precompute the four augmentation variants once.
             self._geoms[name] = {
@@ -428,7 +475,7 @@ class RacingEnv(gym.Env):
             self._progress_marker = (self._steps, self._progress)
         elif not terminated and self._steps - mark_step > self._stuck_patience:
             terminated = True
-            reward -= self.FAIL_PENALTY
+            reward -= self.STUCK_PENALTY
             info["stuck"] = True
 
         if not terminated and self._steps >= self.max_episode_steps:

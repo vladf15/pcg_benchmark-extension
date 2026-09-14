@@ -5,11 +5,8 @@ from pcg_benchmark.probs.racingvoronoi.utils import (
     build_voronoi_cell_graph,
     fillet_corners,
     find_boundary_cycle,
-    merge_short_edges,
-    remove_spike_vertices,
 )
-from pcg_benchmark.spaces import ArraySpace, FloatSpace, IntegerSpace, DictionarySpace
-from pcg_benchmark.probs.utils import get_range_reward
+from pcg_benchmark.spaces import ArraySpace, FloatSpace, DictionarySpace
 import numpy as np
 
 
@@ -23,35 +20,63 @@ class RacingVoronoiProblem(RacingProblem):
 
     def __init__(self, **kwargs):
         kwargs.setdefault('num_points', 15)
-        kwargs.setdefault('max_steps', 2000)
+        # max_steps is NOT overridden: the shared 7000-step budget applies.
+        # Now that every representation generates a lap of the same length, a
+        # per-representation cap would score the budget rather than the track.
+        # A 4400 m lap at the ~16 m/s the agent averages needs ~2750 steps, so
+        # 7000 leaves headroom for a slow lap without truncating a good one.
 
-        # Corner count is set by the number of USED cells, not by shrinking the
-        # diagram (2026-07-24): 100/15 gave ~37 turns (roughly double a famous
-        # European circuit's ~15) because voronoi corners are pinned to the
-        # cell-edge scale.  Keeping 50 total cells (small enough that the cells
-        # are not oversized, ~26 eligible -> lots of search freedom) and using
-        # only 6 of them gives ~19 turns.  The trade-off is that a 6-cell loop
-        # is shorter (~1600 m, length_score ~0.71) since fewer/smaller cells
-        # cannot both be few AND span a long lap - voronoi stays the most
-        # corner-dense representation (19 vs ~16), an inherent property of the
-        # tessellation.
-        num_cells = int(kwargs.pop('num_cells', 50))
-        num_selected = int(kwargs.pop('num_selected_cells', 6))
+        # The two counts trade lap length against how many distinct tracks the
+        # representation can express, and the binding constraint is the number
+        # of ELIGIBLE cells, not num_cells: a cell whose polygon leaves the
+        # build box cannot be selected, and the diagram always loses its outer
+        # ring to unbounded regions.
+        #
+        # Swept over num_cells 36/49/64 x lloyd 0/2/4 x selection 10/14/18,
+        # 8 genomes each, measuring the eligible pool, the spread of
+        # nearest-neighbour site spacing (std over mean), median lap length and
+        # how many of the 8 genomes chose a distinct cluster:
+        #
+        #   cells  lloyd  k   pool  spread  medlen  distinct
+        #      36      0  10    16    0.57    3278       8/8
+        #      36      4  10    15    0.18    3839       8/8
+        #      49      0  14    25    0.49    3941       8/8
+        #      49      4  14    26    0.18    4494       8/8
+        #      64      4  18    35    0.20    4653       8/8
+        #
+        # 49 cells with 14 selected is the setting taken.  36 cells leave only
+        # 16 eligible, so most of the genome is inert, and the laps they
+        # produce sit below the shared 3900-5900 m band whatever the relaxation.
+        # 64 cells raise the pool further but cut cell size enough that the
+        # selected rim gains corners and its tightest one tightens toward
+        # undrivable.  Every setting keeps full cluster variety, so that is not
+        # what decides it.
+        num_cells = int(kwargs.pop('num_cells', 49))
+        num_selected = int(kwargs.pop('num_selected_cells', 14))
         voronoi_seed = int(kwargs.pop('voronoi_seed', 0))
+        # Lloyd relaxation: repeatedly move each site to the centre of its own
+        # cell, which evens the cells out.  0 disables it and uses the raw
+        # random scatter.
+        #
+        # 4 iterations, from the same sweep.  Raw scatter clumps: the spread of
+        # nearest-neighbour spacing is 0.57 of its mean at 0 iterations, 0.32
+        # at 2 and 0.18 at 4, past which it stops improving.  Rounder cells
+        # also give the selected cluster a longer rim, which is what carries
+        # the lap from 3941 m to 4494 m and into the shared length band.
+        lloyd_iterations = int(kwargs.pop('lloyd_iterations', 4))
 
         super().__init__(**kwargs)
 
         self._num_cells = num_cells
         self._num_selected_cells = num_selected
         self._voronoi_seed = voronoi_seed
+        self._lloyd_iterations = lloyd_iterations
 
         self._content_space = DictionarySpace({
             "cell_scores": ArraySpace((self._num_cells,), FloatSpace(0.0, 1.0)),
         })
-        self._control_space = DictionarySpace({
-            "length":    FloatSpace(500.0, self._width * 16.0),
-            "num_turns": IntegerSpace(1, num_selected * 4),
-        })
+        # Control space is the inherited one: every representation is asked for
+        # the same length band, so controlability compares like with like.
 
         self._cell_sites = None
         self._boundary_cells = None
@@ -62,7 +87,7 @@ class RacingVoronoiProblem(RacingProblem):
         self._cell_adjacency = None
         self._last_selected_cells = None
 
-    # _densify_polyline is inherited from RacingProblem (shared with tile).
+    # _resample_uniform is inherited from RacingProblem (shared with tile).
 
     # ------------------------------------------------------------------
     # Fixed Voronoi grid
@@ -71,30 +96,28 @@ class RacingVoronoiProblem(RacingProblem):
     def _build_cell_graph(self):
         if self._cell_sites is not None:
             return
-        graph = build_voronoi_cell_graph(self._num_cells, self._width, self._height, self._voronoi_seed)
-        self._cell_sites             = graph['cell_sites']
+        graph = build_voronoi_cell_graph(self._num_cells, self._build_box(),
+                                         self._voronoi_seed,
+                                         lloyd_iterations=self._lloyd_iterations)
+        self._cell_sites             = graph['cell_sites']  # also the built flag
         self._voronoi_vertices       = graph['voronoi_vertices']
         self._voronoi_all_edges = graph['all_edges_full']
         self._voronoi_all_pairs = graph['all_edge_pairs_full']
         self._cell_adjacency         = graph['cell_neighbours']
         self._boundary_cells         = graph['boundary_cells']
 
-        # Eligibility rule: a cell may be selected iff its polygon stays fully
-        # inside the safe box (margin inside the map edges).  That is exactly
-        # the out-of-bounds condition quality() enforces on the decoded track,
-        # since the track runs along the selected cells' Voronoi vertices.
-        # Two ways a cell can violate it: its region is semi-infinite (clipped
-        # at the map border), or a finite region owns a vertex outside the
-        # safe box (near-collinear sites push Voronoi vertices arbitrarily far
-        # out).  No other exclusions (in particular no buffer ring around the
-        # border cells), so eligibility is visually consistent: what is fully
-        # in bounds is selectable.
+        # A cell is selectable iff its polygon stays fully inside the shared
+        # build box, since the track runs along the selected cells' Voronoi
+        # vertices.  Two ways to fail: a semi-infinite region clipped at the
+        # border, or a finite region owning a vertex outside the box
+        # (near-collinear sites push Voronoi vertices arbitrarily far out).  No
+        # other exclusions, so what is inside the box is selectable.
         self._ineligible_cells = set(self._boundary_cells)
-        margin = float(self._track_width) * 0.5 + 2.0
+        bx0, by0, bx1, by1 = self._build_box()
         verts = self._voronoi_vertices
         vertex_ok = (
-            (verts[:, 0] >= margin) & (verts[:, 0] <= self._width - margin) &
-            (verts[:, 1] >= margin) & (verts[:, 1] <= self._height - margin)
+            (verts[:, 0] >= bx0) & (verts[:, 0] <= bx1) &
+            (verts[:, 1] >= by0) & (verts[:, 1] <= by1)
         )
         for (va, vb), (p1, p2) in zip(self._voronoi_all_edges, self._voronoi_all_pairs):
             if not (vertex_ok[int(va)] and vertex_ok[int(vb)]):
@@ -107,16 +130,12 @@ class RacingVoronoiProblem(RacingProblem):
 
     @staticmethod
     def _highest_scoring_cell(cells, scores):
-        """Return the cell with the highest score; ties go to the lowest index."""
-        best = None
-        for i in cells:
-            if best is None:
-                best = i
-            elif scores[i] > scores[best]:
-                best = i
-            elif scores[i] == scores[best] and i < best:
-                best = i
-        return best
+        """Return the cell with the highest score; ties go to the lowest index.
+
+        Sorting on (-score, index) puts the best score first and the lowest
+        index first within a tie, so the pick is a pure function of the genome
+        and not of the order the caller happened to build `cells` in."""
+        return min(cells, key=lambda i: (-float(scores[i]), i), default=None)
 
     def _decode_selected_cells(self, cell_scores: np.ndarray) -> list[int]:
         self._build_cell_graph()
@@ -140,13 +159,9 @@ class RacingVoronoiProblem(RacingProblem):
                 # The cluster is walled in; fill the remaining slots with the
                 # best leftover cells by score (connectivity can no longer
                 # be satisfied, so the boundary-cycle step will reject this).
-                leftovers = []
-                for i in selectable:
-                    if i not in selected:
-                        leftovers.append((-float(scores[i]), i))
-                leftovers.sort()
-                for _score, i in leftovers[: k - len(selected)]:
-                    selected.add(i)
+                leftovers = sorted((i for i in selectable if i not in selected),
+                                   key=lambda i: (-float(scores[i]), i))
+                selected.update(leftovers[: k - len(selected)])
                 break
             nxt = self._highest_scoring_cell(candidates, scores)
             selected.add(nxt)
@@ -184,12 +199,11 @@ class RacingVoronoiProblem(RacingProblem):
             if cycle is None:
                 return super()._extract_content(None)
 
+            # The cycle is the track: the rim of the selected cluster, taken
+            # as-is.  Short edges and tight vertex clusters are left alone,
+            # because the corner arcs in _make_curve adapt their radius to the
+            # adjacent edge lengths and absorb them.
             pts = self._voronoi_vertices[np.array(cycle, dtype=int)]
-            pts = remove_spike_vertices(pts)
-            # Collapse vertex clusters tighter than 1.5 track widths: they are
-            # artifacts of the cell tessellation, not corners a track designer
-            # would build.  The rounding itself happens in _make_curve.
-            pts = merge_short_edges(pts, min_edge=float(self._track_width) * 1.5)
             if len(pts) < 3:
                 return super()._extract_content(None)
             return np.asarray(pts, dtype=float)
@@ -203,15 +217,20 @@ class RacingVoronoiProblem(RacingProblem):
 
     # Corner rounding: every polygon corner becomes a circular arc tangent to
     # both edges, mirroring how the tile representation drives quarter arcs.
-    _FILLET_MAX_RADIUS = 40.0
+    # The cap only binds on shallow corners, since the radius is already
+    # limited to half the shorter adjacent edge.  At 110 m it leaves the arcs
+    # as round as the cell geometry allows, which is what keeps the car on the
+    # road: capping at 40 forces tighter arcs than the corner needs, raising
+    # the off-road fraction from 0.112 to 0.166.
+    _FILLET_MAX_RADIUS = 110.0
 
     def _make_curve(self, track_points):
         """Voronoi tracks are polygons: round each corner with a tangent arc,
         then densify the remaining straights (a spline would bow the straights
         and round every corner twice)."""
-        step = float(self._track_width) * 0.35
+        step = self._curve_step()
         rounded = fillet_corners(track_points, max_radius=self._FILLET_MAX_RADIUS, sample_step=step)
-        return self._densify_polyline(rounded, max_step=step)
+        return self._resample_uniform(rounded, step=step)
 
     # ------------------------------------------------------------------
     # Info
@@ -225,7 +244,8 @@ class RacingVoronoiProblem(RacingProblem):
         - the list of selected cells, which diversity() compares."""
         scores_key = None
         if use_cache and trajectory is None and isinstance(content, dict) and 'cell_scores' in content:
-            scores_key = tuple(np.asarray(content['cell_scores'], dtype=float).ravel().tolist())
+            scores_key = (tuple(np.asarray(content['cell_scores'], dtype=float).ravel().tolist()),
+                          self._driver)
             cached = self._info_cache.get(scores_key)
             if cached is not None:
                 return cached
@@ -251,40 +271,17 @@ class RacingVoronoiProblem(RacingProblem):
         **RacingProblem._QUALITY_PARAMS,
         "angles_on_curve":    False,
         "geom_area_check":    False,
-        # start_straight is NOT overridden: the shared 50 m target (base class)
-        # applies to every representation (2026-07-22 user rule).  Voronoi is the
-        # tightest case (straights pinned to the diagram edge scale); measured on
-        # the 750 m map, 29% of random genomes already reach 50 m and the GA can
-        # push toward the ~99 m diagram-best chain, so 50 m is a real, reachable
-        # discriminator (it is the one thing random voronoi content genuinely
-        # fails often) without locking the representation out.
+        # start_straight is deliberately NOT overridden: one quality function
+        # for all.  Voronoi is the tightest case, with straights pinned to the
+        # diagram edge scale, but it still reaches the shared target often
+        # enough to be a real discriminator rather than a lock-out.
     }
 
     # ------------------------------------------------------------------
-    # Controlability
-    # ------------------------------------------------------------------
-    # Diversity is inherited from RacingProblem: it compares the decoded
-    # track shapes (occupancy grid + average turn), which keeps the measure
-    # identical and comparable across all four representations.  A Jaccard
-    # measure on the selected cell sets would be genotype-based and only
-    # meaningful for this representation.
-
-    def controlability(self, info, control):
-        length_err = self._width * 0.6
-        l_score = get_range_reward(
-            info.get('total_length', 0.0), 0,
-            control['length'] - length_err,
-            control['length'] + length_err,
-            self._width * 16.0,
-        )
-        turns_err = 2
-        t_score = get_range_reward(
-            info.get('num_turns', 0), 0,
-            control['num_turns'] - turns_err,
-            control['num_turns'] + turns_err,
-            self._num_selected_cells * 4,
-        )
-        return (l_score + t_score) / 2.0
+    # Controlability and diversity are both inherited from RacingProblem, so
+    # every representation is measured by the same function.  A Jaccard measure
+    # on the selected cell sets would be genotype-based and meaningful only
+    # here, which is exactly what a shared benchmark measure must not be.
 
     # ------------------------------------------------------------------
     # Render

@@ -4,14 +4,14 @@ Reads the raw CSV files (columns: x_m, y_m, w_tr_right_m, w_tr_left_m) and
 converts them to the benchmark's world units.
 
 Scale: the benchmark's simulation world is metric, 1 world unit = 1 metre
-(the engine integrates position with velocity in m/s; the 750x750 map and
+(the engine integrates position with velocity in m/s; the 1500x1500 map and
 the 16 m track width are metres; problem.py's PX_PER_M = 5.0 is only the
 world-to-pixel factor used when rendering images). So the circuits are
 imported at 1:1 — every circuit at the exact same scale, with real corner
 radii and lengths. Each circuit is translated so its bounding box starts at
-the benchmark's edge margin; real circuits span up to ~2.2 km, so each track
-carries its own `map_size` (bounding square + margins) instead of the fixed
-750 m benchmark map.
+the benchmark's edge margin; real circuits span 813-2171 m, so each track
+carries its own `map_size` (bounding square + margins) rather than sharing
+the benchmark's fixed square map.
 
 The returned track dict plugs straight into the benchmark simulation:
 
@@ -30,7 +30,6 @@ import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 TRACKS_DIR = os.path.normpath(os.path.join(_HERE, "..", "racetrack-database-master", "tracks"))
-RACELINES_DIR = os.path.normpath(os.path.join(_HERE, "..", "racetrack-database-master", "racelines"))
 
 # Benchmark dimensions (mirror racing/problem.py: track_width 16 m and the
 # out-of-bounds margin of half a track width plus 2). One world unit is one
@@ -117,24 +116,6 @@ def load_track(name, tracks_dir=TRACKS_DIR, resample_spacing=None):
         "map_size": map_size,
         "length": _polyline_length(pts),
         "real_width_m": float(np.mean(widths)),
-    }
-
-
-def load_raceline(name, tracks_dir=TRACKS_DIR, racelines_dir=RACELINES_DIR):
-    """Load the TUMFTM precomputed raceline for a circuit, transformed with
-    the SAME translation as its track (so both line up)."""
-    track_pts = _read_csv(os.path.join(tracks_dir, name + ".csv"))[:, :2] / METERS_PER_UNIT
-    offset = track_pts.min(axis=0) - PADDING
-    line = _read_csv(os.path.join(racelines_dir, name + ".csv"))[:, :2] / METERS_PER_UNIT
-    return line - offset
-
-
-def load_all(tracks_dir=TRACKS_DIR, resample_spacing=None):
-    """Load every circuit. Returns {name: track dict}."""
-    return {
-        name: load_track(name, tracks_dir=tracks_dir,
-                         resample_spacing=resample_spacing)
-        for name in list_tracks(tracks_dir)
     }
 
 

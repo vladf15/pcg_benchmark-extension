@@ -1,4 +1,4 @@
-﻿"""Geometry helpers shared by all racing problems.
+"""Geometry helpers shared by all racing problems.
 
 Three groups of functions:
 - Spline interpolation (`interpolate_curves`): turn sparse control points
@@ -22,10 +22,7 @@ def _points_as_tuples(points):
 
     functools.lru_cache needs hashable arguments; arrays are not hashable,
     nested tuples are."""
-    rows = []
-    for p in np.asarray(points):
-        rows.append(tuple(p))
-    return tuple(rows)
+    return tuple(tuple(p) for p in np.asarray(points))
 
 
 def lowest_turn_seam_index(points) -> int:
@@ -132,11 +129,14 @@ def count_self_intersections(points):
     return count_self_intersections_cached(points_tuple)
 
 
-def _compute_offset_edges(points: np.ndarray, track_width: float):
-    """Compute left/right offset polylines like the renderer does.
+def compute_offset_edges(points: np.ndarray, track_width: float):
+    """Push a centerline sideways by half the track width, both ways.
 
-    This approximates the track polygon used for rendering and is a good proxy
-    for detecting width-based self-intersections.
+    Each point moves along the perpendicular of the average of its two
+    neighbouring segment directions, so the road keeps a constant width through
+    corners.  count_track_area_intersections runs this in metres to find
+    width-based self-intersections; RacingProblem._track_edges runs it in
+    pixels to draw the road.
     """
     curve = np.asarray(points, dtype=float)
     n = len(curve)
@@ -260,12 +260,9 @@ def _count_polyline_crossings_grid(
     for i in range(ma):
         for gx in range(int(agx0[i]), int(agx1[i]) + 1):
             for gy in range(int(agy0[i]), int(agy1[i]) + 1):
-                key = (gx, gy)
-                if key in cell_to_a:
-                    cell_to_a[key].append(i)
-                else:
-                    cell_to_a[key] = [i]
+                cell_to_a.setdefault((gx, gy), []).append(i)
 
+    eps_i = max(1e-9, cell_size * 1e-6)
     count = 0
     for j in range(mb):
         for gx in range(int(bgx0[j]), int(bgx1[j]) + 1):
@@ -288,7 +285,6 @@ def _count_polyline_crossings_grid(
                         continue
                     if a_max[i, 1] < b_min[j, 1] or b_max[j, 1] < a_min[i, 1]:
                         continue
-                    eps_i = max(1e-9, cell_size * 1e-6)
                     if _segments_intersect_inclusive(a0[i], a1[i], b0[j], b1[j], eps=eps_i):
                         count += 1
     return count
@@ -307,7 +303,7 @@ def count_track_area_intersections(
     - right edge self-intersections
     - left/right edge crossovers
     """
-    left_edge, right_edge = _compute_offset_edges(points, track_width=float(track_width))
+    left_edge, right_edge = compute_offset_edges(points, track_width=float(track_width))
     left_self = count_self_intersections(left_edge)
     if left_self > 0:
         return int(left_self)
@@ -407,11 +403,7 @@ def _count_self_intersections_grid(points: np.ndarray) -> int:
     for i in range(m):
         for gx in range(int(gx0[i]), int(gx1[i]) + 1):
             for gy in range(int(gy0[i]), int(gy1[i]) + 1):
-                key = (gx, gy)
-                if key in cell_to_segments:
-                    cell_to_segments[key].append(i)
-                else:
-                    cell_to_segments[key] = [i]
+                cell_to_segments.setdefault((gx, gy), []).append(i)
 
     candidate_pairs: Set[Tuple[int, int]] = set()
     for segs in cell_to_segments.values():
@@ -429,16 +421,15 @@ def _count_self_intersections_grid(points: np.ndarray) -> int:
                     continue
                 candidate_pairs.add((i, j))
 
+    # Inclusive intersection test, so self-touching is rejected too.  eps is
+    # scaled to the grid's cell size to stay robust across track scales.
+    eps_i = max(1e-9, cell_size * 1e-6)
     count = 0
     for i, j in candidate_pairs:
         if seg_max[i, 0] < seg_min[j, 0] or seg_max[j, 0] < seg_min[i, 0]:
             continue
         if seg_max[i, 1] < seg_min[j, 1] or seg_max[j, 1] < seg_min[i, 1]:
             continue
-
-        # Use an inclusive intersection test so self-touching is rejected too.
-        # eps is scaled to the cell size used by the grid to remain robust.
-        eps_i = max(1e-9, cell_size * 1e-6)
         if _segments_intersect_inclusive(seg_start[i], seg_end[i], seg_start[j], seg_end[j], eps=eps_i):
             count += 1
 

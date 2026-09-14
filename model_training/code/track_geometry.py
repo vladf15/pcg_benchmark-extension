@@ -136,11 +136,6 @@ class TrackGeometry:
         heading_ref = float(np.arctan2(tangent[1], tangent[0]))
         return seg_idx, s, lateral, heading_ref
 
-    def curvature_at_s(self, s):
-        """Curvature at (wrapped) arc position s, nearest-point lookup."""
-        i = int(round((s % self.length) / self.spacing)) % self.n
-        return float(self.curvature[i])
-
     def curvature_ahead(self, s, edges):
         """Worst signed curvature in each arc band ahead of position s.
 

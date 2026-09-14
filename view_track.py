@@ -11,9 +11,9 @@ Keyboard shortcuts inside the pygame window:
 Driver: the scripted SteeringAgent by default. Set "RL model" in the
 control panel to a trained policy (model_training/runs/<name>/best/*.zip)
 to watch that instead; the active driver is named in the overlay. An RL
-policy runs on its own engine_v2 physics via rl_agent_adapter, because it
-was trained on that engine and on an 18-float observation rather than the
-benchmark engine's 5-float state.
+policy runs through rl_agent_adapter, which owns its own engine instance
+because the policy reads an 18-float observation rather than the benchmark
+engine's 5-float state.  Both drivers now use the same physics.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import ctypes
 import json
 import multiprocessing
 import sys
+import time
 from pathlib import Path
 from queue import Empty
 
@@ -31,7 +32,11 @@ from tkinter import filedialog, ttk
 
 
 DEFAULT_RESULTS_DIR = Path(__file__).parent.parent / "benchmark_experiments-extension" / "results"
-_TARGET_WINDOW_PX   = 1000
+
+# Canvas height in pixels.  The process is DPI-aware (see run_simulation), so
+# this is PHYSICAL pixels, not logical ones.  Fixed rather than derived from
+# the screen so the canvas is identical on every machine and for every track.
+_CANVAS_HEIGHT_PX = 1250
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +69,13 @@ def infer_problem_type(chromosomes: list[dict], results_folder: str | Path = "")
     content = chromosomes[0].get("content") or {} if chromosomes else {}
     if "cell_scores" in content:
         return "RacingVoronoi"
+    if "polar_points" in content:
+        return "RacingRadial"
     if "tile_prefs" in content:
-        # Square and hex tile genomes share the same schema (tile_prefs, 144
-        # cells), so the env name in the results path is the discriminator;
-        # gene range as fallback (square prefs are 0-6, hex go up to 15).
+        # Both tile genomes use the same key, so the env name in the results
+        # path is the discriminator.  Two fallbacks: the gene range (square
+        # prefs are 0-6, hex go up to 15) and the length (square 11x11 = 121
+        # cells, hex 13x11 = 143).
         if "tilehex" in str(results_folder).lower():
             return "RacingTileHex"
         if int(np.max(np.asarray(content["tile_prefs"]))) > 6:
@@ -93,13 +101,17 @@ def resolve_all_iterations(config: dict) -> tuple[list[Path], str, int]:
         raise FileNotFoundError(f"No chromosome files found in {iters[start_idx]}")
     return iters, infer_problem_type(seed_chroms, folder), start_idx
 
-def build_problem(problem_type: str, num_cells: int = 50):
+def build_problem(problem_type: str, num_cells: int = 36):
     if problem_type == "RacingVoronoi":
         from pcg_benchmark.probs.racingvoronoi.problem import RacingVoronoiProblem
-        # num_selected_cells must match the problem default (6) so the viewer
-        # decodes the same track the GA scored; num_cells comes from the saved
-        # genome's cell_scores length.
-        return RacingVoronoiProblem(num_cells=num_cells, num_selected_cells=6)
+        # num_cells comes from the saved genome's cell_scores length.  Every
+        # other knob is left at the problem's own default, so the viewer
+        # decodes the same track the GA scored and cannot drift out of step
+        # with it the way a hardcoded copy would.
+        return RacingVoronoiProblem(num_cells=num_cells)
+    if problem_type == "RacingRadial":
+        from pcg_benchmark.probs.racingradial.problem import RacingRadialProblem
+        return RacingRadialProblem()
     if problem_type == "RacingTile":
         from pcg_benchmark.probs.racingtile.problem import RacingTileProblem
         return RacingTileProblem()
@@ -110,6 +122,11 @@ def build_problem(problem_type: str, num_cells: int = 50):
     return RacingProblem()
 
 def parse_speed(speed) -> float:
+    """Playback speed as a REAL-TIME factor (1.0 = real time, 0.25 = quarter).
+
+    Not a steps-per-frame count: the playback loop converts it using the
+    frame rate and the physics timestep.
+    """
     return float(str(speed).strip())
 
 def _score_to_color(score: float) -> tuple[int, int, int]:
@@ -177,14 +194,23 @@ def _rotated_rect_corners(cx, cy, fwd, rgt, hl, hw):
 class RaceViewer:
     """Real-time pygame window for watching a car drive around a racetrack."""
 
-    def __init__(self, width, height, scale=5.0, fps=60, show_hud=True, title="Race Viewer"):
+    def __init__(self, width, height, scale=None, fps=60, show_hud=True, title="Race Viewer"):
         pygame.init()
         pygame.font.init()
+        self._map_w, self._map_h = float(width), float(height)
+        if scale is None:
+            # Fixed canvas height, so every track is drawn at the same scale
+            # and tracks stay directly comparable by eye.
+            scale = _CANVAS_HEIGHT_PX / self._map_h
         self._scale  = float(scale)
         self._fps    = fps
         self._show_hud      = show_hud
         self._img_w         = int(round(width  * self._scale))
         self._img_h         = int(round(height * self._scale))
+        # View origin in pixels, kept at 0 so the view always covers the whole
+        # map.  Every track therefore shares one canvas and one scale.
+        self._ox = 0.0
+        self._oy = 0.0
         self._screen        = pygame.display.set_mode((self._img_w, self._img_h))
         self._clock         = pygame.time.Clock()
         self._track_surface = None
@@ -197,13 +223,34 @@ class RaceViewer:
                 except Exception:
                     pass
 
+    # ── View transform: world metres -> window pixels ────────────────────
+
+    def _px(self, pts):
+        """Map world points (metres) to window pixels: p * scale - origin."""
+        a = np.asarray(pts, dtype=float) * self._scale
+        a[..., 0] -= self._ox
+        a[..., 1] -= self._oy
+        return a
+
+    def _reset_view(self):
+        """Show the whole map at the fixed canvas scale.
+
+        Deliberately NOT a per-track zoom: fitting each track to the window
+        would make a compact tile track and a sprawling spline track look the
+        same size, which hides exactly the difference between representations
+        that the viewer is used to judge.
+        """
+        self._scale = float(min(self._img_w / self._map_w, self._img_h / self._map_h))
+        self._ox = self._oy = 0.0
+
     def build_track_surface(self, curve_points, track_width,
                             voronoi_edges=None, voronoi_vertices=None,
                             cell_polygons=None, cell_scores=None,
                             ineligible_cells=None):
         """Draw the static track geometry onto a cached Surface."""
+        self._reset_view()
         scale         = self._scale
-        curve_px      = np.asarray(curve_points, dtype=float) * scale
+        curve_px      = self._px(curve_points)
         half_width_px = float(track_width) * scale * 0.5
         surface       = pygame.Surface((self._img_w, self._img_h))
         surface.fill((34, 139, 34))
@@ -220,13 +267,15 @@ class RaceViewer:
                     # Ineligible (out-of-bounds) cells: scored but never
                     # selectable, shown dimmed toward gray.
                     color = tuple(int(0.35 * c + 0.65 * g) for c, g in zip(color, (95, 95, 95)))
-                poly_px = [(int(round(x * scale)), int(round(y * scale))) for x, y in poly_verts]
+                poly_px = [(int(round(x)), int(round(y)))
+                           for x, y in self._px(poly_verts)]
                 if len(poly_px) >= 3:
                     pygame.draw.polygon(surface, color, poly_px)
                     if blocked:
                         pygame.draw.polygon(surface, (50, 50, 50), poly_px, 2)
-                    cx    = int(round(poly_verts[:, 0].mean() * scale))
-                    cy    = int(round(poly_verts[:, 1].mean() * scale))
+                    ctr   = self._px(np.asarray(poly_verts, dtype=float).mean(axis=0))
+                    cx    = int(round(ctr[0]))
+                    cy    = int(round(ctr[1]))
                     label = score_font.render(f"{score:.2f}", True, (0, 0, 0) if not blocked else (210, 210, 210))
                     surface.blit(label, (cx - label.get_width() // 2, cy - label.get_height() // 2))
         left_edge, right_edge = self._compute_track_edges(curve_px, half_width_px)
@@ -236,11 +285,23 @@ class RaceViewer:
             pygame.draw.polygon(surface, (215, 215, 215),
                                 [left_edge[j], left_edge[j+1], right_edge[j+1], right_edge[j]])
         if voronoi_edges is not None and voronoi_vertices is not None:
-            sv = np.asarray(voronoi_vertices, dtype=float) * scale
+            sv = self._px(voronoi_vertices)
             for a, b in voronoi_edges:
                 pygame.draw.line(surface, (70, 70, 70),
                                  (int(round(sv[int(a), 0])), int(round(sv[int(a), 1]))),
                                  (int(round(sv[int(b), 0])), int(round(sv[int(b), 1]))), 1)
+        if cell_polygons is not None:
+            # The edge list holds Voronoi ridges only.  A cell on the outside
+            # of the diagram is closed by the map border instead of by a
+            # ridge, so that part of its outline is in no edge, and stroking
+            # the traced polygons is what draws it.  Same gray as the ridges,
+            # so the diagram reads as one thing whether or not the score
+            # heatmap is showing.
+            for poly_verts in cell_polygons.values():
+                poly_px = [(int(round(x)), int(round(y)))
+                           for x, y in self._px(poly_verts)]
+                if len(poly_px) >= 3:
+                    pygame.draw.polygon(surface, (70, 70, 70), poly_px, 1)
         cl = [(int(round(x)), int(round(y))) for x, y in curve_px]
         if len(cl) > 1:
             pygame.draw.lines(surface, (120, 120, 120), False, cl, 2)
@@ -249,6 +310,9 @@ class RaceViewer:
     def build_tile_surface(self, types, rotations):
         """Draw the tile grid as the static track background (for RacingTile problems)."""
         import math as _m
+        # This view draws the grid in cell space across the whole window, so
+        # the car must be placed against the full map, not a zoomed track.
+        self._reset_view()
         grid_h, grid_w = types.shape
         surface = pygame.Surface((self._img_w, self._img_h))
         surface.fill((34, 139, 34))
@@ -257,7 +321,7 @@ class RaceViewer:
         ROAD = (210, 210, 210)
         EDGE = (25,  25,  25)
         GRASS_C = (34, 139, 34)
-        GRASS, STRAIGHT, CORNER = 0, 1, 2
+        GRASS, STRAIGHT = 0, 1
 
         for r in range(grid_h):
             for c in range(grid_w):
@@ -312,20 +376,20 @@ class RaceViewer:
 
         self._track_surface = surface
 
-    def build_hextile_surface(self, problem, tiles=None):
+    def build_hextile_surface(self, problem):
         """Draw the RacingTileHex structure view: the normal track ribbon with
         the hex cell grid drawn on top.
 
-        `tiles` is accepted for call-site compatibility but no longer used: the
-        road comes from the ribbon, not from the per-tile arc polylines.
+        The road comes from the ribbon, not from the per-tile arc polylines.
+        Drawing it per tile produces a lumpy string of beads where the turns
+        should be smooth, because each tile's arc is stroked and capped
+        separately.
 
-        Earlier this redrew the road itself from per-tile arc polylines, which
-        came out as a lumpy string of beads instead of smooth turns.  Instead
-        we build the same filled road ribbon the plain track view uses (so the
-        road looks identical to every other representation) and then overlay the
-        hex cell outlines, so the structure is shown ON the track rather than
-        substituted for it.  Pixel coordinates are in problem space
-        (0.._width / 0.._height); scale maps them to the viewer surface."""
+        Building the same filled ribbon the plain track view uses keeps the
+        road identical to every other representation, and the hex outlines go
+        on top, so the structure is shown ON the track rather than substituted
+        for it.  Pixel coordinates are in problem space (0.._width /
+        0.._height); scale maps them to the viewer surface."""
         from pcg_benchmark.probs.racingtilehex.problem import GRID_H, GRID_W
 
         # 1. The nice road ribbon, exactly as the plain track view draws it.
@@ -333,13 +397,12 @@ class RaceViewer:
         surface = self._track_surface
 
         # 2. Hex cell outlines on top, so the grid is visible over the track.
-        sx = self._img_w / float(problem._width)
-        sy = self._img_h / float(problem._height)
+        # Both go through self._px, so the grid stays registered with the road.
         OUTLINE = (20, 100, 20)
         for r in range(GRID_H):
             for c in range(GRID_W):
-                corners = [(int(p[0] * sx), int(p[1] * sy))
-                           for p in problem._hex_corners(r, c)]
+                corners = [(int(round(p[0])), int(round(p[1])))
+                           for p in self._px(problem._hex_corners(r, c))]
                 pygame.draw.polygon(surface, OUTLINE, corners, 1)
 
         self._track_surface = surface
@@ -356,8 +419,39 @@ class RaceViewer:
             self._draw_hud(state, action, yaw_rate, mass)
         self._clock.tick(self._fps)
 
+    @property
+    def fps(self):
+        """Frame rate cap, used by the playback loop to pace physics steps."""
+        return self._fps
+
     def close(self):
         pygame.quit()
+
+    @staticmethod
+    def interpolate_state(prev_state, state, alpha):
+        """Blend two physics states for drawing, `alpha` in [0, 1].
+
+        Physics runs at 10 Hz but the display refreshes at 60, so most
+        frames fall BETWEEN two simulated states. Drawing the latest state
+        on every frame makes the car sit still for five frames and then
+        jump, which reads as jitter even though the simulation is fine.
+        Interpolating position and heading turns those five frames into
+        real motion. Only x/y/angle are blended: speed and steering angle
+        are HUD readouts, and showing the true last simulated value there
+        is better than a smoothed one.
+        """
+        if prev_state is None or state is None:
+            return state
+        out = np.array(state, dtype=float)
+        a = min(max(float(alpha), 0.0), 1.0)
+        out[0] = prev_state[0] + (state[0] - prev_state[0]) * a
+        out[1] = prev_state[1] + (state[1] - prev_state[1]) * a
+        if len(out) > 2:
+            # Shortest way round the circle, so wrapping from +pi to -pi
+            # does not spin the car backwards for one frame.
+            d = (float(state[2]) - float(prev_state[2]) + np.pi) % (2.0 * np.pi) - np.pi
+            out[2] = float(prev_state[2]) + d * a
+        return out
 
     @staticmethod
     def compute_yaw_rate(state, prev_angle, dt):
@@ -369,8 +463,7 @@ class RaceViewer:
 
     def _draw_car(self, state):
         s  = self._scale
-        cx = float(state[0]) * s
-        cy = float(state[1]) * s
+        cx, cy = self._px((float(state[0]), float(state[1])))
         a  = float(state[2]) if len(state) > 2 else 0.0
         ca, sa   = float(np.cos(a)), float(np.sin(a))
         fwd, rgt = (ca, sa), (-sa, ca)
@@ -398,9 +491,10 @@ class RaceViewer:
                          (int(round(cx + ca*hl)), int(round(cy + sa*hl))), 3)
 
     def _draw_lookahead(self, state, lookahead):
-        s = self._scale
-        car = (int(round(float(state[0])*s)),     int(round(float(state[1])*s)))
-        la  = (int(round(float(lookahead[0])*s)), int(round(float(lookahead[1])*s)))
+        cp  = self._px((float(state[0]), float(state[1])))
+        lp  = self._px((float(lookahead[0]), float(lookahead[1])))
+        car = (int(round(cp[0])), int(round(cp[1])))
+        la  = (int(round(lp[0])), int(round(lp[1])))
         pygame.draw.circle(self._screen, (0, 255, 255), la, 6, 3)
         pygame.draw.line(self._screen, (0, 200, 200), car, la, 2)
 
@@ -491,7 +585,7 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
     is_voronoi = problem_type == "RacingVoronoi"
     is_tile    = problem_type == "RacingTile"
     is_hextile = problem_type == "RacingTileHex"
-    num_cells  = 50
+    num_cells  = 36
     if is_voronoi:
         seed = get_iter_chroms(start_iter)
         if seed:
@@ -511,9 +605,13 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
     if rl_model_path and not Path(rl_model_path).is_absolute():
         rl_model_path = str((Path(__file__).parent / rl_model_path).resolve())
     current_content  = None
+    # False when the loaded chromosome does not fit this problem, so the
+    # structure overlay knows not to decode it a second time.
+    content_fits     = True
 
-    scale   = _TARGET_WINDOW_PX / max(problem._width, problem._height)
-    viewer  = RaceViewer(problem._width, problem._height, scale=scale,
+    # scale=None: the viewer sizes its window to the screen and then fits the
+    # view to each track as it is loaded.
+    viewer  = RaceViewer(problem._width, problem._height, scale=None,
                          fps=config["fps"], show_hud=config["show_hud"],
                          title=f"Track Viewer — {problem_type}")
 
@@ -523,31 +621,46 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
 
     iter_index = chrom_index = step = 0
     step_accumulator = yaw_rate = 0.0
-    prev_angle = state = agent = None
+    prev_angle = state = prev_state = agent = None
+    last_frame_time = time.perf_counter()
     action    = {"steering": 0.0, "throttle": 0.0}
     lookahead = None
     dt        = 0.1
 
     def load_track():
-        nonlocal current_content
+        """Load the selected chromosome, falling back to the default track when
+        the saved genome does not fit this problem.
+
+        A results tree written before a grid size changed holds genomes of the
+        wrong length (an 11x11 tile genome is 121 genes; the 13x11 hex grid
+        wants 143).  Decoding one raises deep inside the representation, and
+        this runs in a worker process, so an unhandled raise takes the viewer
+        down with no window and only a traceback.  Report it and keep going.
+        """
+        nonlocal current_content, content_fits
         current_content = numpy_content(get_iter_chroms(iter_index)[chrom_index]["content"])
-        track_points    = problem._extract_content(current_content)
+        content_fits = True
+        try:
+            track_points = problem._extract_content(current_content)
+        except (ValueError, KeyError, IndexError) as exc:
+            print(f"[viewer] iter {iter_index} chromosome {chrom_index} does not fit "
+                  f"{problem_type}: {type(exc).__name__}: {exc}")
+            print("[viewer] these results were saved for a different grid; "
+                  "showing the default track instead")
+            content_fits = False
+            track_points = problem._extract_content(None)
         problem.reset(track_points)
 
     def rebuild_surface():
-        if is_tile and show_structure and current_content is not None:
+        if is_tile and show_structure and content_fits and current_content is not None:
             if hasattr(problem, "_decode_genome") and "tile_prefs" in current_content:
                 types, rotations = problem._decode_genome(
                     np.asarray(current_content["tile_prefs"], dtype=int),
                 )
                 viewer.build_tile_surface(types, rotations)
             return
-        if is_hextile and show_structure and current_content is not None:
-            if hasattr(problem, "_decode_genome") and "tile_prefs" in current_content:
-                tiles = problem._decode_genome(
-                    np.asarray(current_content["tile_prefs"], dtype=int),
-                )
-                viewer.build_hextile_surface(problem, tiles)
+        if is_hextile and show_structure and content_fits and current_content is not None:
+            viewer.build_hextile_surface(problem)
             return
         scores = None
         if show_structure and cell_polygons is not None:
@@ -558,7 +671,10 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
             problem._curve_points, problem._track_width,
             voronoi_edges=getattr(problem, "_voronoi_all_edges", None) if is_voronoi else None,
             voronoi_vertices=getattr(problem, "_voronoi_vertices", None) if is_voronoi else None,
-            cell_polygons=cell_polygons if show_structure else None,
+            # Passed whether or not structure is showing: the fill below is
+            # gated on cell_scores, which stays None without it, while the
+            # outlines close the border cells in both modes.
+            cell_polygons=cell_polygons,
             cell_scores=scores,
             ineligible_cells=ineligible_cells,
         )
@@ -567,9 +683,9 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         """Scripted agent by default; a trained RL policy if one is loaded.
 
         The RL wrapper exposes the same act()/reset() interface but drives
-        its own engine_v2 instance (it was trained on that physics and on
-        an 18-float observation, neither of which the benchmark engine
-        provides). Everything downstream of act() is unchanged.
+        its own engine instance, because it reads an 18-float observation
+        that the benchmark state does not provide. Everything downstream of
+        act() is unchanged.
         """
         if rl_model_path:
             try:
@@ -584,13 +700,14 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
                 print(f"[viewer] could not load RL model {rl_model_path!r}: "
                       f"{type(exc).__name__}: {exc}")
                 print("[viewer] falling back to the scripted agent")
-        ag = SteeringAgent(problem._curve_points, track_width=problem._track_width)
+        ag = SteeringAgent(problem._curve_points, track_width=problem._track_width,
+                           engine=getattr(problem, "_engine", None))
         ag.reset()
         return ag
 
     def switch_to(new_iter, new_chrom=0):
         nonlocal iter_index, chrom_index, agent, state, prev_angle, step, step_accumulator
-        nonlocal action, lookahead, yaw_rate, dt
+        nonlocal action, lookahead, yaw_rate, dt, prev_state
         iter_index   = new_iter % total_iters
         total_chroms = len(get_iter_chroms(iter_index))
         chrom_index  = new_chrom % total_chroms
@@ -600,8 +717,16 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
         state = problem._engine.reset()
         if hasattr(agent, "state"):          # RL agent drives its own engine
             state = agent.reset()
-        dt    = problem._engine.time_step
-        prev_angle = None; step = 0; step_accumulator = 0.0
+        # Playback pace must come from the engine actually being stepped: an
+        # RL agent integrates its own engine instance, so reading the
+        # benchmark engine's dt would silently mis-time playback if the two
+        # ever stop sharing a control interval.
+        dt    = float(getattr(getattr(agent, "_engine", None), "time_step",
+                              problem._engine.time_step))
+        # prev_state must reset with the episode: interpolating from the
+        # previous track's final pose would fling the car across the map on
+        # the first frame after a switch.
+        prev_angle = None; prev_state = None; step = 0; step_accumulator = 0.0
         action = {"steering": 0.0, "throttle": 0.0}; lookahead = None; yaw_rate = 0.0
         quality = get_iter_chroms(iter_index)[chrom_index].get("quality")
         q_str   = f"  quality={quality:.3f}" if quality is not None else ""
@@ -664,7 +789,15 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
 
         if not running: break
 
-        step_accumulator += speed_multiplier
+        # speed_multiplier is a REAL-TIME factor: 1.0 plays the simulation
+        # back at the speed it would happen at. Advance by MEASURED elapsed
+        # time rather than assuming the frame rate held, so a heavy track
+        # that drops below `fps` plays at the right speed instead of going
+        # into slow motion.
+        now = time.perf_counter()
+        elapsed = min(now - last_frame_time, 0.25)   # cap: don't fast-forward
+        last_frame_time = now                        # after a long stall
+        step_accumulator += speed_multiplier * elapsed / max(dt, 1e-9)
         while step_accumulator >= 1.0:
             action    = agent.act(state)
             lookahead = getattr(agent, "last_lookahead_point", None)
@@ -672,11 +805,20 @@ def run_simulation(config: dict, cmd_queue, status_queue) -> None:
             # An RL agent integrates its own physics inside act(), so its
             # pose comes from the agent; the scripted agent is driven by
             # the benchmark engine as before.
+            # Copy, don't alias: the engine returns one preallocated array and
+            # mutates it in place, so keeping the reference would leave
+            # prev_state and state pointing at the same values and the
+            # interpolation below would have nothing to interpolate between.
+            prev_state = np.array(state, dtype=float) if state is not None else None
             state     = (agent.state() if hasattr(agent, "state")
                          else problem._engine.step(action))
             step     += 1; step_accumulator -= 1.0
 
-        viewer.draw_frame(state, action=action, lookahead=lookahead, yaw_rate=yaw_rate)
+        # Physics is 10 Hz, the display is 60: draw the car partway between
+        # the last two simulated states so the frames in between show motion
+        # instead of the car standing still and then jumping.
+        draw_state = RaceViewer.interpolate_state(prev_state, state, step_accumulator)
+        viewer.draw_frame(draw_state, action=action, lookahead=lookahead, yaw_rate=yaw_rate)
         draw_overlay()
         pygame.display.flip()
 
@@ -783,12 +925,18 @@ class ConfigWindow:
         self._fps_var = tk.IntVar(value=d.get("fps", 60))
         self._field(parent, "FPS",
                     ttk.Spinbox(parent, from_=10, to=120, textvariable=self._fps_var, width=10))
-        self._speed_var   = tk.DoubleVar(value=float(d.get("speed", 0.5)))
-        self._speed_label = ttk.Label(parent, text=f"{float(d.get('speed', 0.5)):.2f}×", width=6)
-        speed_slider      = ttk.Scale(parent, from_=0.25, to=2.0, orient="horizontal",
+        # Real-time factor: 1.0 = the speed the simulation would actually
+        # happen at. Range reaches 0.1 for slow-motion inspection of slides
+        # and corner entries, which is what watching the driver is for.
+        self._speed_var   = tk.DoubleVar(value=float(d.get("speed", 1.0)))
+        self._speed_label = ttk.Label(parent, text=f"{float(d.get('speed', 1.0)):.2f}×", width=6)
+        speed_slider      = ttk.Scale(parent, from_=0.1, to=4.0, orient="horizontal",
                                       variable=self._speed_var,
                                       command=lambda _: self._on_speed_changed())
         self._field(parent, "Speed", speed_slider, self._speed_label)
+        ttk.Label(parent, text="Speed is a real-time factor: 1.00× is real time, 0.25× is quarter speed",
+                  foreground="gray", font=("", 8)).grid(row=self._row, column=0, columnspan=3, sticky="w")
+        self._row += 1
         ttk.Label(parent, text="Speed, HUD and structure toggle update live without restarting",
                   foreground="gray", font=("", 8)).grid(row=self._row, column=0, columnspan=3, sticky="w")
         self._row += 1
@@ -935,7 +1083,7 @@ _DEFAULTS = {
     "iteration":      "latest",
     "sort_by":        "Quality (best first)",
     "fps":            60,
-    "speed":          0.5,
+    "speed":          1.0,          # real-time factor (1.0 = real time)
     "show_hud":        True,
     "show_structure":  False,
     "rl_model":        "",

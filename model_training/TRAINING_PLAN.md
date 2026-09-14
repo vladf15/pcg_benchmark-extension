@@ -7,9 +7,9 @@ finished experiment outputs, never inside the GA fitness.
 
 ## Physics v2 (2026-07-27)
 
-`code/engine_v2.py` replaces the benchmark engine for the driving model
+`code/engine_legacy.py` replaces the benchmark engine for the driving model
 (the benchmark's own engine is untouched and still reachable via
-`make_physics("v1")`). Simcade feel: substepped integration, real load
+`make_physics("legacy")`). Simcade feel: substepped integration, real load
 transfer, genuine grip limits with power-on oversteer, human-limited inputs
 (33 deg lock at 70 deg/s, 1.0 s lock-to-lock), and none of v1's hidden
 driver aids. Acceptance suite `code/physics_tests.py` passes 7/7. Full

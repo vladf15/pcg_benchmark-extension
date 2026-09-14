@@ -1,9 +1,9 @@
 # Plan: TORCS-like physics upgrade without the overhead
 
-> **STATUS 2026-07-27: BUILT, then aligned to TORCS.** `code/engine_v2.py`
+> **STATUS 2026-07-27: BUILT, then aligned to TORCS.** `code/engine_legacy.py`
 > implements the simcade car, `code/physics_tests.py` is the acceptance
 > suite (9/9 passing), and `RacingEnv` uses v2 by default
-> (`make_physics("v1")` restores the old engine). Measured cost: env.step
+> Measured cost: env.step
 > 57 us (v1) -> 124 us (v2 with combined slip), so 2M training steps is
 > 4.1 minutes of environment time. The benchmark engine is untouched, so
 > every GA result stays valid. Read "TORCS comparison and second pass"
@@ -51,7 +51,7 @@ captures every handling phenomenon that shows up in top-down driving.
 
 The GA quality function simulates with the current engine; changing it
 invalidates the regression reference and every experiment run so far. The
-upgrade therefore goes into a NEW class (`engine_v2.py`), used by
+upgrade therefore goes into a NEW class (`engine_legacy.py`), used by
 model_training through the existing `EngineBackedPhysics` adapter slot.
 Whether the benchmark itself ever adopts v2 is a separate decision for Rafa.
 The judge being trained on better physics than the GA fitness used is fine:
@@ -267,7 +267,7 @@ preserved:
 - an unused `yaw_rate` unpack left over from the reverted damping
   experiment removed from the heuristic
 
-engine_v2.py 448 -> 344 lines, sanity_check.py 163 -> 114, all 9 physics
+engine_legacy.py 448 -> 344 lines, sanity_check.py 163 -> 114, all 9 physics
 tests and the 25-circuit baseline unchanged.
 
 **Handling balance check.** Steady-state cornering at 25 m/s, comparing

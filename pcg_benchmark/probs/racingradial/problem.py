@@ -39,24 +39,25 @@ class RacingRadialProblem(RacingProblem):
     _untangle_control_points = False
 
     def __init__(self, **kwargs):
-        # Same control-point budget and step budget as racing-v0: both
-        # genomes are num_points * 2 floats, so search compares like for like.
         radius_min = kwargs.pop('radius_min', None)
         radius_max = kwargs.pop('radius_max', None)
+        # A star of radii needs more spokes than a free tour of points needs
+        # corners to fill the same box: at 14 points this representation makes
+        # a 3220 m lap against the spline's 4870, below the shared band.
+        kwargs.setdefault('num_points', 20)
 
         super().__init__(**kwargs)
 
-        # The out-of-bounds margin is track_width * 0.5 + 2 on each side, so
-        # the largest legal radius on a 500x500 map is 240.  radius_max keeps
-        # 20 extra as slack for the spline bowing outward between control
-        # points; radius_min keeps points off the exact centre (coincident
-        # points would produce zero-length segments).
+        # Radii are measured from the map centre, so the largest one that keeps
+        # every control point inside the shared build box is half the box.
+        # radius_min keeps points off the exact centre, where coincident points
+        # would produce zero-length segments.
+        x0, _y0, x1, _y1 = self._build_box()
         half_map = 0.5 * float(min(self._width, self._height))
-        margin = float(self._track_width) * 0.5 + 2.0
         if radius_min is None:
-            radius_min = 0.16 * half_map                  # 40 on a 500 map
+            radius_min = 0.16 * half_map                  # 120 on the 1500 map
         if radius_max is None:
-            radius_max = half_map - margin - 0.08 * half_map  # 220 on a 500 map
+            radius_max = 0.5 * (x1 - x0)                  # 545 on the 1500 map
         self._radius_min = float(radius_min)
         self._radius_max = float(radius_max)
         self._center = np.array([self._width / 2.0, self._height / 2.0])

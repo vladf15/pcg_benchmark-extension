@@ -8,6 +8,9 @@ def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int,
                      bounds: tuple[float, float, float, float] | None = None) -> np.ndarray:
     """Run Lloyd's Voronoi relaxation. Cells with infinite regions are left in place.
 
+    `num_iterations` of 0 returns the sites untouched, which is the raw
+    Voronoi diagram with no relaxation applied.
+
     Boundary-adjacent cells can have finite regions whose centroid lies far
     outside the map (their Voronoi vertices are unbounded in practice), which
     would drag sites — and with them the whole diagram — off the canvas.
@@ -69,8 +72,14 @@ def _ray_bbox_intersect(
     return np.array([x0 + t * dx, y0 + t * dy], dtype=float)
 
 
-def build_voronoi_cell_graph(num_cells: int, width: float, height: float, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
-    """Generate a Voronoi grid without guard/boundary points.
+def build_voronoi_cell_graph(num_cells: int, box, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
+    """Generate a Voronoi grid covering `box`, without guard/boundary points.
+
+    `box` is (x0, y0, x1, y1), the region the track may occupy.  Scattering the
+    sites over exactly that region rather than over the whole map is what keeps
+    the cells large: a cell is only selectable if its polygon stays inside the
+    box, so sites spread wider would push most of the diagram out of reach and
+    force a much finer, more corner-dense grid to compensate.
 
     Cells with semi-infinite edges are added to boundary_cells (ineligible for selection).
     Each semi-infinite edge is clipped to the bounding box and appended to the vertex/edge
@@ -84,17 +93,13 @@ def build_voronoi_cell_graph(num_cells: int, width: float, height: float, vorono
         cell_neighbours     list[list[int]]
         boundary_cells      set[int]
     """
-    W, H = float(width), float(height)
+    x0, y0, x1, y1 = (float(v) for v in box)
 
-    margin = float(min(W, H)) * 0.02
     cell_sites = np.random.default_rng(voronoi_seed).uniform(
-        low=[margin, margin],
-        high=[W - margin, H - margin],
-        size=(num_cells, 2),
+        low=[x0, y0], high=[x1, y1], size=(num_cells, 2),
     ).astype(float)
 
-    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations,
-                                  bounds=(margin, margin, W - margin, H - margin))
+    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations, bounds=(x0, y0, x1, y1))
 
     try:
         voronoi = scipy.spatial.Voronoi(cell_sites) 
@@ -129,7 +134,12 @@ def build_voronoi_cell_graph(num_cells: int, width: float, height: float, vorono
             normal /= nlen
             if np.dot(normal, (cell_sites[p1] + cell_sites[p2]) * 0.5 - center) < 0:
                 normal = -normal
-            clipped = _ray_bbox_intersect(voronoi.vertices[finite_v], normal, 0.0, W, 0.0, H)
+            # Clipped against the build box, the same rectangle the caller
+            # tests cells against.  Clipping from 0 instead put the low ends
+            # one border width outside it while the high ends landed on it, so
+            # the diagram overhung on two sides and not the other two.
+            clipped = _ray_bbox_intersect(
+                voronoi.vertices[finite_v], normal, x0, x1, y0, y1)
             if clipped is not None:
                 new_idx = len(vertices)
                 vertices.append(clipped)
@@ -228,26 +238,6 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
     return best_cycle
 
 
-def merge_short_edges(points: np.ndarray, min_edge: float) -> np.ndarray:
-    """Merge polygon vertices connected by edges shorter than min_edge.
-
-    Repeatedly replaces the endpoints of the shortest such edge with their
-    midpoint, so clusters of near-coincident Voronoi vertices collapse into a
-    single corner instead of producing several sub-track-width kinks.
-    """
-    pts = list(np.asarray(points, dtype=float))
-    while len(pts) > 3:
-        n = len(pts)
-        dists = [float(np.linalg.norm(pts[(i + 1) % n] - pts[i])) for i in range(n)]
-        shortest = int(np.argmin(dists))
-        if dists[shortest] >= min_edge:
-            break
-        mid = 0.5 * (pts[shortest] + pts[(shortest + 1) % n])
-        drop = (shortest + 1) % n
-        pts = [mid if k == shortest else pts[k] for k in range(n) if k != drop]
-    return np.asarray(pts, dtype=float)
-
-
 def fillet_corners(points: np.ndarray, max_radius: float, sample_step: float) -> np.ndarray:
     """Replace each polygon corner with a circular arc tangent to both edges.
 
@@ -290,30 +280,3 @@ def fillet_corners(points: np.ndarray, max_radius: float, sample_step: float) ->
             a = a0 + sweep * (k / n_samples)
             out.append(center + radius * np.array([np.cos(a), np.sin(a)]))
     return np.asarray(out, dtype=float)
-
-
-def remove_spike_vertices(polygon_points: np.ndarray, threshold_deg: float = 168.0) -> np.ndarray:
-    """Remove vertices forming near-180° hairpin turns from a closed polygon."""
-    points = list(np.asarray(polygon_points, dtype=float))
-    spike_cos_threshold = np.cos(np.deg2rad(threshold_deg))
-
-    changed = True
-    while changed and len(points) >= 4:
-        changed = False
-        spike_indices = []
-        n = len(points)
-        for i in range(n):
-            incoming = np.array(points[i],            dtype=float) - np.array(points[(i - 1) % n], dtype=float)
-            outgoing = np.array(points[(i + 1) % n], dtype=float) - np.array(points[i],            dtype=float)
-            in_len, out_len = np.linalg.norm(incoming), np.linalg.norm(outgoing)
-            if in_len < 1e-9 or out_len < 1e-9:
-                spike_indices.append(i)
-                continue
-            if float(np.dot(incoming / in_len, outgoing / out_len)) < spike_cos_threshold:
-                spike_indices.append(i)
-        if spike_indices:
-            for idx in reversed(spike_indices):
-                points.pop(idx)
-            changed = True
-
-    return np.array(points, dtype=float)

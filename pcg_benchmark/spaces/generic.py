@@ -86,10 +86,27 @@ def _recursiveIsSampled(input, value):
             else:
                 return input == value
         if isinstance(input, dict):
+            # The key sets have to match, not just cover the space's own keys.
+            # A dict carrying every content key plus extras is not a sample
+            # from this space, and accepting it makes info dicts
+            # indistinguishable from content: PCGEnv.quality, diversity and
+            # controlability all decide which of the two they were handed by
+            # calling isSampled on it, and each one that guesses "content"
+            # recomputes info() for the whole population.  racing-v0 is the
+            # one problem of the 50 registered where this fires, because its
+            # content space key is track_points and its info dict reports a
+            # track_points entry as well; measured at population 12 it ran
+            # info() 48 times against the 12 every other problem runs.
+            if not isinstance(value, dict) or len(value) != len(input):
+                return False
             for v in input:
                 if not _recursiveIsSampled(input[v], value[v]):
                     return False
             return True
+        # Same argument for sequences: _recursiveSample builds a fixed shape,
+        # so a longer value is a different structure rather than a sample.
+        if not hasattr(value, "__len__") or len(value) != len(input):
+            return False
         for i in range(len(input)):
             if not _recursiveIsSampled(input[i], value[i]):
                 return False

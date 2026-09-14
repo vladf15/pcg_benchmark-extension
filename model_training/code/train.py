@@ -1,8 +1,7 @@
 """Train a PPO driver on the rescaled real circuits.
 
-This is the training harness; the physics is still the current benchmark
-engine (via EngineBackedPhysics). Once the TORCS-style physics decision is
-settled, swap the physics adapter and rerun. Nothing else here changes.
+The car is selected with --physics: 'benchmark' (the engine the GA quality
+function scores laps with) or 'legacy' (the separate simcade model).
 
 Requires stable-baselines3 + torch (not installed yet):
     pip install stable-baselines3 torch tensorboard
@@ -26,7 +25,7 @@ import time
 
 import numpy as np
 
-from racing_env import RacingEnv
+from racing_env import RacingEnv, make_physics
 import track_loader
 
 # Held-out circuits: varied and well known, used only for evaluation.
@@ -40,14 +39,17 @@ def train_track_names():
     return [n for n in track_loader.list_tracks() if n not in EVAL_TRACKS]
 
 
-def make_env(track_names, randomize, seed):
+def make_env(track_names, randomize, seed, physics="benchmark"):
     def _thunk():
         # Monitor records episode return and length. Without it SB3 logs no
         # ep_rew_mean/ep_len_mean during training and EvalCallback reports
         # inaccurate episode rewards, so the run gives no feedback at all.
         from stable_baselines3.common.monitor import Monitor
+        # One physics instance per env: each holds its own car state, so a
+        # shared one would have twelve parallel envs stepping the same car.
         return Monitor(RacingEnv(track_names=track_names,
-                                 randomize=randomize, seed=seed))
+                                 randomize=randomize, seed=seed,
+                                 physics=make_physics(physics)))
     return _thunk
 
 
@@ -92,6 +94,10 @@ def main():
     parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--name", type=str, default="ppo_driver")
+    parser.add_argument("--physics", type=str, default="benchmark",
+                        choices=["benchmark", "legacy"],
+                        help="car to train on; 'benchmark' is the one the GA "
+                             "quality function scores laps with")
     args = parser.parse_args()
 
     # Imported here so the env/plan work without the RL stack installed.
@@ -106,9 +112,10 @@ def main():
 
     train_names = train_track_names()
     train_vec = SubprocVecEnv(
-        [make_env(train_names, True, args.seed + i) for i in range(args.n_envs)])
+        [make_env(train_names, True, args.seed + i, args.physics)
+         for i in range(args.n_envs)])
     eval_vec = SubprocVecEnv(
-        [make_env(EVAL_TRACKS, False, args.seed + 1000)])
+        [make_env(EVAL_TRACKS, False, args.seed + 1000, args.physics)])
 
     model = PPO(
         "MlpPolicy", train_vec,

@@ -5,12 +5,12 @@ view_track's loop is `action = agent.act(state)` then
 engine's 5-float [x, y, angle, speed, steering]. A trained policy cannot be
 dropped in directly, because it was trained in model_training/ against:
 
-  - engine_v2 (simcade physics), not the benchmark engine, and
+  - an 18-float observation, not the benchmark's 5-float state, and
   - a 21-float observation built from track geometry (lateral offset,
     heading error, thirteen speed-scaled curvature bands ahead), not the
     5-float state.
 
-`RLAgent` bridges both. It owns its own engine_v2 instance and its own
+`RLAgent` bridges both. It owns its own engine instance and its own
 TrackGeometry for the current track, drives that engine from the policy,
 and reports the resulting pose back in the benchmark's 5-float format so
 the viewer can draw it unchanged. The benchmark engine is left untouched:
@@ -43,7 +43,7 @@ class RLAgent:
 
     def __init__(self, model_path, curve_points, track_width, map_size=None):
         from stable_baselines3 import PPO
-        from engine_v2 import CarPhysicsEngineV2
+        from pcg_benchmark.probs.racing.engine import CarPhysicsEngine
         from track_geometry import TrackGeometry
         from racing_env import RacingEnv
 
@@ -53,7 +53,7 @@ class RLAgent:
         if map_size is None:
             map_size = float(np.max(pts) + 50.0)
         self._geom = TrackGeometry(pts, float(track_width), map_size)
-        self._engine = CarPhysicsEngineV2(start_position=(0.0, 0.0))
+        self._engine = CarPhysicsEngine(start_position=(0.0, 0.0))
         self._max_speed = self._engine.max_speed
         self._max_steer = self._engine.max_steering
         self.name = os.path.basename(str(model_path))
@@ -65,7 +65,7 @@ class RLAgent:
     def reset(self):
         """Place the car at the start of the centerline, facing along it."""
         pos, heading = self._geom.pose_at_s(0.0)
-        car = self._engine.reset()
+        self._engine.reset()
         self._engine.position = np.array(pos, dtype=float)
         self._engine.angle = float(heading)
         self._engine.start_position = np.array(pos, dtype=float)
@@ -89,7 +89,7 @@ class RLAgent:
 
         `car_state` is ignored: the benchmark engine's state describes a
         different car driven by a different physics model. This agent
-        integrates its own engine_v2 instance instead, so the two never
+        integrates its own engine instance instead, so the two never
         interfere. The viewer reads the resulting pose from `state()`.
         """
         obs = self._observe()

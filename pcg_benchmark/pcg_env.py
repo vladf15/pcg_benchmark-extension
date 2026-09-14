@@ -1,4 +1,115 @@
+import hashlib
+import os
+import pickle
+
 import numpy as np
+
+# Worker pool for the population evaluation loop in PCGEnv.info.
+#
+# On by default at 8 processes, capped by the core count.  Set
+# PCG_BENCHMARK_WORKERS to override, and to 1 or 0 to force the serial path.
+# 8 is where the speedup flattens: measured on 100 genomes of racing-v0 on 24
+# logical cores, serial 63.7 s, then 21.1 / 16.0 / 15.5 / 17.4 s at 4 / 8 / 16
+# / 24 workers, so 16 buys 3% over 8 and 24 is slower than both.
+#
+# Why here and not in the search code: generators/ is held identical to
+# upstream, and it already hands the whole population to env.evaluate, so the
+# only serial loop worth splitting is the one below.
+#
+# Why processes and not threads: the racing simulation is interpreted Python
+# stepping one car at a time, so it holds the GIL throughout.
+#
+# Results are byte for byte the serial ones, because evaluation is a pure
+# function of the content: Problem.info consumes no randomness (the problems'
+# _random is used by their content spaces, which stay in the parent), and
+# executor.map returns results in input order.  Verified two ways: identical
+# SHA-256 of every info dict across all five racing representations, and a
+# 3-generation GA at population 100 whose saved output diffs clean against the
+# serial run.
+_DEFAULT_WORKERS = min(8, os.cpu_count() or 1)
+
+_POOL = None
+_POOL_KEY = None
+_POOL_FAILED = False
+_WORKER_PROBLEM = None
+
+
+def _worker_init(problem_bytes):
+    global _WORKER_PROBLEM
+    _WORKER_PROBLEM = pickle.loads(problem_bytes)
+
+
+def _worker_info(content):
+    return _WORKER_PROBLEM.info(content)
+
+
+def _drop_pool():
+    """Stop using workers for the rest of the run."""
+    global _POOL, _POOL_KEY, _POOL_FAILED
+    if _POOL is not None:
+        _POOL.shutdown(wait=False)
+    _POOL, _POOL_KEY, _POOL_FAILED = None, None, True
+
+
+def _worker_count():
+    try:
+        return int(os.environ.get("PCG_BENCHMARK_WORKERS", str(_DEFAULT_WORKERS)))
+    except ValueError:
+        return _DEFAULT_WORKERS
+
+
+def _problem_payload(problem):
+    """The problem as bytes for the workers, or False if it cannot be sent.
+
+    Taken on the first info() call: after the caller has seeded and configured
+    the problem, but before anything has evaluated.  That timing is the whole
+    point.  The racing problems build their driver lazily and a loaded policy
+    does not pickle, so a problem that has already scored something cannot be
+    sent, and capturing it here means a single-content call earlier in a
+    session does not quietly cost the rest of the run its workers.
+    """
+    if _worker_count() <= 1:
+        return False
+    try:
+        payload = pickle.dumps(problem)
+        # Round-trip, do not just serialise.  Some problems bind a function
+        # onto a space as an instance attribute (arcaderules and building do
+        # this to their control space), which pickles by reference and then
+        # fails to resolve on the far side.  Catching that here turns a dead
+        # worker into a clean serial fallback.
+        pickle.loads(payload)
+        return payload
+    except Exception as e:
+        print("pcg_benchmark: cannot parallelise this problem (%s: %s); "
+              "evaluating serially" % (type(e).__name__, e))
+        return False
+
+
+def _get_pool(payload):
+    """The shared executor for this problem, or None to evaluate serially.
+
+    Workers receive the pickled problem rather than rebuilding it from its
+    name, so they carry the exact instance the caller configured.
+    """
+    global _POOL, _POOL_KEY
+    if _POOL_FAILED or not payload or _worker_count() <= 1:
+        return None
+    # The workers hold one problem, fixed when the pool starts.  A second
+    # problem in the same process (comparing representations, say) must not be
+    # scored by workers still holding the first, so the pool is keyed on the
+    # problem it was built from and replaced when that changes.
+    key = hashlib.sha256(payload).hexdigest()
+    if _POOL is not None and key == _POOL_KEY:
+        return _POOL
+    if _POOL is not None:
+        _POOL.shutdown(wait=True)
+    from concurrent.futures import ProcessPoolExecutor
+    _POOL = ProcessPoolExecutor(max_workers=_worker_count(),
+                                initializer=_worker_init,
+                                initargs=(payload,))
+    _POOL_KEY = key
+    return _POOL
+
 
 """
 An internal recurrsive function to calculate the number of unique content and the minimum 
@@ -53,6 +164,7 @@ class PCGEnv:
     def __init__(self, name, problem):
         self._name = name
         self._problem = problem
+        self._worker_payload = None
 
     """
     Content space property to check range or sample
@@ -113,11 +225,30 @@ class PCGEnv:
                 is_content = self.content_space.isSampled(contents[0])
             
         if not is_content:
-            raise ValueError(f"wrong input for the function, the contents are not sampled from the content space.")
+            raise ValueError("wrong input for the function, the contents are not sampled from the content space.")
 
-        info = []
-        for c in contents:
-            info.append(self._problem.info(c))
+        if self._worker_payload is None:
+            self._worker_payload = _problem_payload(self._problem)
+        # One content cannot be split, and starting 8 processes to score it
+        # would cost more than the evaluation.
+        pool = _get_pool(self._worker_payload) if len(contents) > 1 else None
+        if pool is None:
+            info = [self._problem.info(c) for c in contents]
+        else:
+            # chunksize 1 because evaluation cost varies by an order of
+            # magnitude between genomes (an undrivable track runs to the step
+            # cap), so fixed chunks leave workers idle at the end of a
+            # generation.  Ordered map, so info[i] belongs to contents[i].
+            try:
+                info = list(pool.map(_worker_info, contents, chunksize=1))
+            except Exception as e:
+                # A dead worker must not end an overnight search.  The serial
+                # path gives the same values, so the run continues correctly,
+                # just slower.
+                _drop_pool()
+                print("pcg_benchmark: worker pool failed (%s: %s); "
+                      "evaluating serially from here" % (type(e).__name__, e))
+                info = [self._problem.info(c) for c in contents]
         if not is_array:
             return info[0]
         return info

@@ -9,7 +9,6 @@ question is laptime on circuits the agent never trained on.
 """
 
 import argparse
-import os
 
 import numpy as np
 

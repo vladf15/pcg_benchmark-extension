@@ -116,7 +116,7 @@ def _draw_frame(geom, left, right, state, trail, size_px, view_m, follow,
 
     # HUD: speed, pedal, steering, elapsed time, and body slip angle (the
     # number that says whether the car is sliding, which is the thing the
-    # v2 physics made possible and the agent has to manage).
+    # physics made possible and the agent has to manage).
     bar = 90
     d.text((8, 6), f"{speed * 3.6:5.0f} km/h", fill=C_TEXT)
     d.text((8, 20), f"t {step * 0.1:6.1f} s", fill=C_TEXT)

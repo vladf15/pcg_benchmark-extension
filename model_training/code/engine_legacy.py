@@ -1,4 +1,4 @@
-"""Simcade car physics v2 ("2D Forza" feel) for the driving model.
+"""Simcade car physics ("2D Forza" feel) for the driving model.
 
 Standalone upgrade of the benchmark's CarPhysicsEngine (which stays frozen,
 since the GA quality function depends on it). Same external interface:
@@ -65,7 +65,7 @@ _PEAK_SLIP = math.radians(10.0)      # slip at which the tire curve peaks
 
 
 
-class CarPhysicsEngineV2:
+class CarPhysicsEngineLegacy:
 
     def __init__(self, start_position, start_angle=0.0, time_step=0.1,
                  substeps=5):

@@ -60,9 +60,9 @@ def geometry_from_content(problem, content, map_size=None):
 def centerline_escapes_map(geometry, margin=None):
     """True if the centerline itself leaves the drivable area.
 
-    Generated centerlines are not clamped to the map: sampled racing-v0
-    tracks reach x = 768 and y = -16 on a 750 m map. Such a track cannot be
-    lapped whatever its shape, so the driveability report must call it out
+    Generated centerlines are not clamped to the map, so a sampled track can
+    place points past the edge or at negative coordinates. Such a track cannot
+    be lapped whatever its shape, so the driveability report must call it out
     as out of bounds rather than blame the driver for an off_map failure.
     """
     if margin is None:
@@ -81,8 +81,6 @@ class _PresetTrackEnv(RacingEnv):
     """
 
     def __init__(self, geometry, name="generated", **kwargs):
-        self._preset = geometry
-        self._preset_name = name
         super().__init__(track_names=[], **kwargs)
         self._geoms = {name: {(False, False): geometry,
                               (True, False): geometry.reversed(),
