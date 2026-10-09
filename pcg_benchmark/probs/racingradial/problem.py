@@ -43,7 +43,8 @@ class RacingRadialProblem(RacingProblem):
         radius_max = kwargs.pop('radius_max', None)
         # A star of radii needs more spokes than a free tour of points needs
         # corners to fill the same box: at 14 points this representation makes
-        # a 3220 m lap against the spline's 4870, below the shared band.
+        # a 3220 m lap, below the shared band, where the free spline made
+        # 4870 m.
         kwargs.setdefault('num_points', 20)
 
         super().__init__(**kwargs)
@@ -57,7 +58,7 @@ class RacingRadialProblem(RacingProblem):
         if radius_min is None:
             radius_min = 0.16 * half_map                  # 120 on the 1500 map
         if radius_max is None:
-            radius_max = 0.5 * (x1 - x0)                  # 545 on the 1500 map
+            radius_max = 0.5 * (x1 - x0)                  # 650 on the 1500 map
         self._radius_min = float(radius_min)
         self._radius_max = float(radius_max)
         self._center = np.array([self._width / 2.0, self._height / 2.0])
@@ -65,7 +66,7 @@ class RacingRadialProblem(RacingProblem):
         self._content_space = DictionarySpace({
             "polar_points": ArraySpace((self.num_points, 2), FloatSpace(0.0, 1.0)),
         })
-        # Control space is inherited from RacingProblem (length + num_turns).
+        # Control space is inherited from RacingProblem (_CONTROL_TARGETS).
 
     # ------------------------------------------------------------------
     # Decoding

@@ -1,7 +1,15 @@
 
 The MIT License (MIT)
 
-Copyright (c) 2025 Vlad
+Copyright (c) Ahmed Khalifa and contributors: the PCG Benchmark this
+repository forks (https://github.com/amidos2006/pcg_benchmark), declared MIT
+in its setup.py.
+Copyright (c) 2025 Vlad: the racing problems (pcg_benchmark/probs/racing*),
+model_training/ and tests/.
+
+The circuit centre lines in model_training/racetrack-database-master are the
+TUMFTM racetrack database (Heilmeier et al.), distributed under the GNU LGPL
+v3 in that folder's LICENSE.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

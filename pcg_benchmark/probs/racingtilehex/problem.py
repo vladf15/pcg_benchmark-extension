@@ -7,50 +7,33 @@ after evaluation.  Deviations 1-10 listed there apply here unchanged.
 
 TWO FURTHER DEVIATIONS, specific to the hex lattice:
 
-11. Six neighbours instead of four.  The paper takes "into account four
-    neighbors: left, right, top and bottom" with four 90-degree rotations
-    (Sec. III-B).  WFC itself does not require a square lattice, and the paper
-    notes the neighbour count may vary (Sec. II-A, citing [12]); this variant
-    exists to test whether the lattice, rather than the algorithm, is what
-    limits the shapes a constructive representation can reach.
-
-12. The module set is enumerated rather than rotated.  On a square grid a
-    module plus four rotations covers the vocabulary; on a hex grid a road
-    piece joins any two of six faces, so all C(6,2) = 15 pairs are generated
-    directly and rotation is implicit in which pair a module names.  This
-    yields 16 modules against the paper's 7, which costs WFC time (their
-    Table I) but is what gives 60 and 120 degree corners instead of only 90.
+11. Six neighbours, not the paper's four (Sec. III-B); WFC does not need a
+    square lattice (Sec. II-A).  This variant tests whether the lattice, not
+    the algorithm, limits the shapes a constructive representation reaches.
+12. Modules are enumerated, not rotated: a road joins any two of six faces,
+    so all C(6,2) = 15 pairs are generated, each with variants from
+    racingtile's shapes (_VARIANTS), 106 modules against the paper's 7 (more
+    WFC time, their Table I); the plain pairs give 60 and 120 degree corners.
 """
 from __future__ import annotations
 
 import numpy as np
-from pcg_benchmark.probs.racing.problem import RacingProblem
-from pcg_benchmark.spaces import ArraySpace, IntegerSpace, DictionarySpace
+from pcg_benchmark.probs.racingtile.problem import (
+    STRAIGHT, CORNER, SHARP, HAIRPIN, KINK, S_CHICANE, ESS, SWEEP, _GeneticWFCProblem,
+    _exit_port, _largest_loop, _rectangle_loop, _tile_points)
 from PIL import Image, ImageDraw
 
 
 # ── Hex grid (pointy-top, odd-r offset storage) ───────────────────────────
-# Stored as a (GRID_H, GRID_W) array exactly like the square tile problem, so
-# border forcing, genome shape and the render loop carry over unchanged.  Only
-# the neighbour graph differs: six faces instead of four, so the turn menu
-# becomes {0, 60, 120} degrees with no 90-degree corners at all.
-# 6-way connectivity is inherently corner-dense: a road tile joins any two of
-# six faces, and only 3 of the 15 pairs are opposite faces, so 80% of the road
-# vocabulary is a corner.
-#
-# 11x11 matches racingtile's grid exactly, so both representations hand the
-# search the same 121-gene genome and the lattice is the only difference
-# between them.  That is what makes the pair a controlled experiment rather
-# than two separate representations that also happen to differ in search-space
-# size.
-#
-# The cost, stated plainly: pointy-top hexes pack tighter vertically than
-# horizontally (rows sit 1.5 * size apart against sqrt(3) * size for columns),
-# so a square hex grid cannot fill a square map.  With equal rows and columns
-# the WIDTH binds, the hexes grow to fill it, and the grid leaves an untiled
-# band along the bottom of the build box.  A 13x11 grid fills the box in both
-# axes to within 2% but costs the genome-length match; this is the other side
-# of that trade.
+# Stored as a (GRID_H, GRID_W) array like the square problem, so border,
+# genome and render loop carry over; six faces make the turn menu {0, 60,
+# 120} degrees.  Only 3 of 15 plain pairs are opposite faces, so 80% are
+# corners (with the variants, 27 of 105 road tiles join opposite faces, 24 of
+# them curved).  11x11 as racingtile, so both hand the search the same
+# 121-gene genome and the lattice is the only difference.  The cost: rows sit
+# 1.5 size apart against sqrt(3) size for columns, so the width binds and an
+# untiled band stays along the bottom of the box (13x11 fills it to 2% but
+# breaks the genome match).
 GRID_H = 11
 GRID_W = 11
 
@@ -83,12 +66,11 @@ def _neighbor(r, c, d):
     return r + dr, c + dc
 
 
-# ── Tile vocabulary: every unordered pair of faces is one road tile ───────
-# C(6, 2) = 15 face-pairs + grass = 16 tiles.  A tile's "open edges" are simply
-# its two connected faces (or the empty set for grass).  Binary sockets: a face
-# is open or closed, and two neighbouring cells are compatible when the shared
-# face agrees (both open or both closed) — identical rule to the square tiles,
-# just over six directions.
+# ── Tile vocabulary ───────────────────────────────────────────────────────
+# Ids 1-15: one plain road tile per face pair; binary sockets as on squares
+# (neighbours agree on the shared face).  Ids 16-105: variants per pair
+# (_VARIANTS) with the same faces, differing only inside the cell.
+# racingtile's three-arc CHICANE is not used on hexes (user decision).
 _FACE_PAIRS = [
     frozenset({a, b})
     for i, a in enumerate(_DIRS)
@@ -96,130 +78,152 @@ _FACE_PAIRS = [
 ]
 assert len(_FACE_PAIRS) == 15
 
-# WFC tile index -> frozenset of open faces.  0 = grass.
+
+def _separation(pair):
+    """Faces between the two open faces the short way round: 3 is opposite
+    (straight), 2 a 60 degree turn, 1 a 120 degree turn."""
+    a, b = sorted(pair)
+    return min(b - a, 6 - (b - a))
+
+
+# Variants per face separation, (racingtile kind, mirror, value): SHARP's
+# tangent length, KINK's strong radius, or the ESS / SWEEP swing; None for
+# the defaults.  Each sits in one census class (_weights), measured alone
+# between straights as (turn, mean radius):
+#   opposite  S_CHICANE: 42 degrees at 34 m and 86 at 30 m (slow), twice
+#             each.  ESS at 20 and 16 degrees: 37 degrees at 108 m and 30 at
+#             134 m (fast).  SWEEP at 13: 24 degrees at 165 m (sweeper).
+#   60        SHARP at 0.25, 0.40, 0.60: 60 degrees at 38 m (slow), 53 m and
+#             73 m (medium).  The plain corner: 58 degrees at 119 m (fast).
+#             KINK at the default 0.4: 78 degrees at 29-40 m (slow); at 0.7:
+#             78 degrees at 52 m (medium).  0.8 leaves a negative straight.
+#             HAIRPIN: 180 degrees at 30 m, with 60 degree swings either side.
+#   120       the plain corner: 117 degrees at 44 m, on the slow/medium edge.
+#             KINK: 140 degrees at 22-25 m (slow).  HAIRPIN: 180 degrees at
+#             22 m, with 30 degree swings either side.
+# No 120 degree tile is wider than the plain corner, the largest that fits.
+# calibration/proto_hx.py.
+_VARIANTS = {
+    3: [(S_CHICANE, False, None), (S_CHICANE, True, None),
+        (ESS, False, 20.0), (ESS, True, 20.0), (ESS, False, 16.0), (ESS, True, 16.0),
+        (SWEEP, False, 13.0), (SWEEP, True, 13.0)],
+    2: [(SHARP, False, 0.25), (SHARP, False, 0.40), (SHARP, False, 0.60),
+        (KINK, False, None), (KINK, True, None), (KINK, False, 0.7), (KINK, True, 0.7),
+        (HAIRPIN, False, None)],
+    1: [(KINK, False, None), (KINK, True, None), (HAIRPIN, False, None)],
+}
+
+# WFC tile index -> frozenset of open faces, and -> (tile kind, mirror,
+# value) with the kinds of racingtile.  0 = grass.
 _OPEN_EDGES = {0: frozenset()}
+_TILE_KIND = {0: None}
 for _i, _pair in enumerate(_FACE_PAIRS, start=1):
     _OPEN_EDGES[_i] = _pair
+    _TILE_KIND[_i] = (STRAIGHT if _separation(_pair) == 3 else CORNER, False, None)
+for _pair in _FACE_PAIRS:
+    for _kind in _VARIANTS[_separation(_pair)]:
+        _TILE_KIND[len(_OPEN_EDGES)] = _kind
+        _OPEN_EDGES[len(_OPEN_EDGES)] = _pair
 
-# frozenset of two open faces -> WFC tile index (inverse map, for fallback).
+# frozenset of two open faces -> plain WFC tile index (inverse map, for fallback).
 _EDGES_TO_TILE = {pair: i for i, pair in enumerate(_FACE_PAIRS, start=1)}
 
-_N_WFC_TILES    = len(_OPEN_EDGES)  # 16: 0 = grass, 1-15 = road pairs
+_N_WFC_TILES    = len(_OPEN_EDGES)  # 106: 0 = grass, 1-15 plain pairs, 16-105 variants
+
+# WFC weights of grass, the plain straight and every curve tile (see
+# RacingTileHexProblem._weights).
+_GRASS_WEIGHT = 4.0
+_STRAIGHT_WEIGHT = 20.0
+_CURVE_WEIGHT = 0.1
+
+# Hairpin leg and kink strong radius per turn angle (apothems, 68.4 m), the
+# two lengths a hex cell does not fit at the square values.  Swept in 0.05
+# steps on the 16 m road (8 m half width), at the 64.2 m apothem of the
+# 1091 m box:
+#   hairpin leg: the longest leg that keeps the road edge at least 5.7 m inside
+#     the cell, the square hairpin's clearance.  120 degrees: 0.95 (6.3 m;
+#     1.00 leaves 3.5 m).  60 degrees: 0.40 (5.7 m; 0.45 leaves 2.5 m).  The
+#     centre line scales with the apothem, the edge a half width off it, so
+#     at the 68.4 m apothem and the 12 m road the clearances only grow.
+#   kink: at the square's strong radius 0.4 the straight between the two
+#     turns solves to -0.13 at 120 degrees, 0.35 leaves 0.003 and 0.30 leaves
+#     0.14.  60 degrees keeps 0.4 (straight 0.26).  Both are in apothems, so
+#     they hold at any cell size.
+# Radii at the 68.4 m apothem: plain 39.5 m (120 degrees) and 118.5 m (60),
+# hairpin 20.5 m, kink 20.5 m for 140 degrees and 27.4 m for 80, S chicane
+# 27.4 m (_S_CHICANE_HEX); the census class of each tile is in _VARIANTS.
+_HAIRPIN_LEG = {120.0: 0.95, 60.0: 0.40}
+_KINK_STRONG = {120.0: 0.30, 60.0: 0.40}
+# The hex S chicane: 45 degree swings (90 degree reversals) at 0.4 apothems,
+# 27.4 m.  Target: the circuits' tight chicanes (opposite corner pairs under
+# 50 m apart, both radii under 45 m; 12 pairs), median 92 degrees at 30 m,
+# tightest 19 m (calibration/chicane_census.py).  racingtile's S (70 degree
+# swings at 17.1 m) is tighter than every one.  Why not 30 m: it needs 2.13
+# apothems along the cell, which has 2.
+_S_CHICANE_HEX = (45.0, 0.4)
 
 
-class _HexGridSpace(DictionarySpace):
-    """Genome = one boost zone per cell (Genetic-WFC, Bailly and Levieux 2023).
-
-    Following Sec. III-E of the paper, each gene holds the tile whose selection
-    probability is boosted when WFC collapses that cell, so the genome steers
-    generation without ever overriding it: a tile that constraint propagation
-    has already eliminated has probability zero, and boosting zero leaves it
-    zero.  Generation therefore cannot produce an adjacency violation, and no
-    request ever has to be detected and undone.
-
-    Every cell carries a boost ("one boost zone per grid cell"): gene 0 boosts
-    grass, values 1-15 boost that face-pair road tile at cell (r,c).  Each gene
-    maps to one cell of the layout, so crossover and mutation via contentSwap
-    make small, local changes to the track.
-
-    Re-encoding (Sec. III-E(b)) is implemented in _reencode, called from
-    info(): after evaluation the genome is rewritten to the raw WFC output, so
-    crossover recombines layouts that were actually built.  Decoding is a pure
-    function of the genome, since every individual gets its own full WFC pass
-    from the same seed, so the same genome yields the same track in any
-    instance and in any order."""
-
-    def __init__(self, problem_ref):
-        super().__init__({
-            "tile_prefs": ArraySpace(
-                (GRID_H * GRID_W,),
-                # IntegerSpace max is exclusive (isSampled uses value < max, and
-                # sample() draws integers(min, max)), so 0.._N_WFC_TILES-1 are
-                # the valid tile indices: 0 = grass, 1..15 = the face-pair roads.
-                IntegerSpace(0, _N_WFC_TILES),
-            ),
-        })
-        self._prob = problem_ref
-
-    def seed(self, seed):
-        """Seed the genome draw, not just the nested spaces.
-
-        GenericSpace.seed only reaches the nested ArraySpace, and sample()
-        below never consults it: the genome comes from init_content, which
-        without an explicit generator builds a fresh unseeded one on every
-        call.  So seeding this space used to have no effect at all and two
-        identical runs drew different populations.
-        """
-        super().seed(seed)
-        self._random = np.random.default_rng(seed)
-
-    def sample(self):
-        return self._prob.init_content(self._random)
-
-
-class RacingTileHexProblem(RacingProblem):
+class RacingTileHexProblem(_GeneticWFCProblem):
     """Racetrack generation on a hexagonal WFC grid.
 
-    Identical in spirit to racingtile-v0 (Genetic-WFC over a fixed lattice),
-    but the lattice is hexagonal: each cell has six faces, a road tile may
-    connect ANY face to ANY other face, and corners are 60 or 120 degrees
-    instead of a fixed 90.  This removes the boxy right-angle look of the
-    square tiles while keeping the same constructive drivability guarantee
-    (each cell holds its own disjoint road piece, so tracks never self-overlap).
+    Identical in spirit to racingtile-v0 (Genetic-WFC over a fixed lattice,
+    the pipeline in racingtile's _GeneticWFCProblem), but the lattice is
+    hexagonal: each cell has six faces, a road tile may connect ANY face to
+    ANY other face, and corners are 60 or 120 degrees instead of a fixed 90.
+    This removes the boxy right-angle look of the square tiles while keeping
+    the same constructive drivability guarantee (each cell holds its own
+    disjoint road piece, so tracks never self-overlap).
     """
 
-    # Decoded points already trace a valid loop in order; the base class's
-    # 2-opt untangle must not reorder them (it would break the loop).
-    _untangle_control_points = False
+    _SEED_TILE = _EDGES_TO_TILE[frozenset({E, W})]   # a straight
 
     def __init__(self, **kwargs):
-        kwargs.setdefault('num_points', 15)
-        # max_steps is NOT overridden: the shared 7000-step budget applies.
-        # Now that every representation generates a lap of the same length, a
-        # per-representation cap would score the budget rather than the track.
         super().__init__(**kwargs)
         self._hex_geom = None
-        self._content_space = _HexGridSpace(self)
-        # genome bytes -> (tiles, wave_array), where wave_array is a
-        # (GRID_H, GRID_W) int array of WFC tile indices.  _decode_cache_keys
-        # holds the same genomes in insertion order, giving the eviction policy
-        # something to pop from.
-        self._decode_cache: dict = {}
-        self._decode_cache_keys: list = []
-        self._DECODE_CACHE_MAX = int(kwargs.get("decode_cache_max", 512))
-        # genome bytes -> raw WFC output before loop pruning, used by _reencode.
-        self._raw_wfc: dict = {}
 
-        # Grid construction guarantees the track never overlaps itself, so the
-        # area-overlap check is disabled.  This is the ONLY quality parameter
-        # hex overrides; the length band is the shared one, since lap length is
-        # tuned in the generator (see _weights) rather than by moving the
-        # target.
-        self._QUALITY_PARAMS = {
-            **self._QUALITY_PARAMS,
-            "geom_area_check": False,
-        }
+        # No quality parameter is overridden.  40 random genomes (seed 7): no
+        # crossing, no fold (no tile radius under 20 m), closest separated
+        # approach 32.4 m.  The check costs 10.3 ms per track.
 
     # ── Hex pixel geometry ────────────────────────────────────────────
-    # A pointy-top hex of "size" (centre-to-vertex), sized and positioned so
-    # the INTERIOR cells fill the shared build box.  Interior is what matters:
-    # the outer ring is forced to grass, so rows 1..GRID_H-2 and columns
-    # 1..GRID_W-2 are the only cells a road can occupy.  Their centres span
-    # sqrt(3) * size * (GRID_W - 2.5) across and 1.5 * size * (GRID_H - 3) down.
+    # A pointy-top hex of "size" (centre to vertex), placed so the INTERIOR
+    # cells (the outer ring is grass) fill the build box: their centres span
+    # sqrt(3) size (GRID_W - 2.5) across and 1.5 size (GRID_H - 3) down.
 
     def _hex_geometry(self):
-        """(size, origin_x, origin_y), computed once and cached."""
+        """(size, origin_x, origin_y), computed once and cached.
+
+        Sized so the ROAD fits the build box, not just the cell centres.  A
+        cell's road runs out to its face midpoints and its tile shapes bulge
+        toward its vertices, so the reach of an interior cell is bounded by
+        the hexagon itself: one apothem (size * sqrt(3) / 2) sideways and one
+        size vertically, added at both ends of the span of centres.
+
+        Why not bound only the centres: the road then runs one apothem past
+        the box on each side.  Measured over 20 random genomes (seed 21), a
+        centre-bounded grid (76.5 m apothem) puts the road at x = 40..1460 m
+        against the 100..1400 m box; this one puts it at 115..1385 m.  The
+        build box is what every representation shares, so a representation
+        that overflows it is not compared on equal terms.  The cost: the
+        smaller cell pulls the plain 120 degree corner under the 44 m
+        slow/medium class edge (see the radii above _HAIRPIN_LEG)."""
         if self._hex_geom is None:
             x0, y0, x1, y1 = self._build_box()
             bw, bh = x1 - x0, y1 - y0
-            span_w = np.sqrt(3.0) * (GRID_W - 2.5)
-            span_h = 1.5 * (GRID_H - 3)
+            # Interior centres span columns 1..GRID_W-2, with odd rows shifted
+            # half a hex right, and rows 1..GRID_H-2.
+            centres_w = np.sqrt(3.0) * (GRID_W - 2.5)
+            centres_h = 1.5 * (GRID_H - 3)
+            reach_w = centres_w + np.sqrt(3.0)   # + one apothem at each end
+            reach_h = centres_h + 2.0            # + one size at each end
             # The tighter of the two axes sets the size, so the grid fits the
             # box rather than overflowing it.
-            size = float(min(bw / span_w, bh / span_h))
-            # Centre the interior reach in the box.
-            ox = x0 + 0.5 * (bw - size * span_w) - 1.5 * np.sqrt(3.0) * size
-            oy = y0 + 0.5 * (bh - size * span_h) - 2.25 * size
+            size = float(min(bw / reach_w, bh / reach_h))
+            # Centre the reach in the box, then place the origin so the first
+            # interior centre sits one apothem (or one size) inside that reach.
+            ox = (x0 + 0.5 * (bw - size * reach_w) + size * np.sqrt(3.0) / 2.0
+                  - 1.5 * np.sqrt(3.0) * size)
+            oy = y0 + 0.5 * (bh - size * reach_h) + size - 2.25 * size
             self._hex_geom = (size, float(ox), float(oy))
         return self._hex_geom
 
@@ -246,24 +250,53 @@ class RacingTileHexProblem(RacingProblem):
     _WFC_WEIGHTS = None  # populated once (grass weighted heavily)
     _WFC_COMPAT  = None
 
-    # Boost-zone multiplier (Bailly and Levieux 2023, Sec. III-E use "a fixed
-    # and very high boosting factor").  1000 against a grass weight of 4 makes
-    # a requested tile win essentially whenever it is still legal, so the
-    # genome is expressive, while a request that propagation already ruled out
-    # stays impossible rather than becoming a contradiction.
-    _BOOST_FACTOR = 1000.0
+    # A legal request wins outright, as in racingtile (at a finite 1000,
+    # re-decoding a WFC-written genome changed 21 of 121 genes on 1 of 20).
 
     @classmethod
     def _weights(cls):
         if cls._WFC_WEIGHTS is None:
-            w = np.ones(_N_WFC_TILES, dtype=float)
+            # One weight for all curve tiles, as in racingtile.  The vocabulary
+            # against the corner census (curve tiles | circuits):
+            #
+            #   angle       slow          medium        fast          sweeper
+            #   20-52       0    | 0.01   0    | 0.04   0.12 | 0.12   0.06 | 0.07
+            #   52-75       0.06 | 0.06   0.12 | 0.08   0.06 | 0.05   0    | 0.01
+            #   75-105      0.18 | 0.12   0.12 | 0.07   0    | 0.06   0    | 0
+            #   105-127     0    | 0.04   0.06 | 0.03   0    | 0.02   0    | 0
+            #   127-150     0.12 | 0.05   0    | 0.03   0    | 0.01   0    | 0
+            #   150 and up  0.12 | 0.05   0    | 0.05   0    | 0.03   0    | 0
+            #
+            # The reached cells hold 0.69 of the corners; over them L1 0.26
+            # (the plain pairs with S, SHARP, HAIRPIN and kinks: 0.32, reaching
+            # 0.42).  calibration/vocab_share.py.  Weights swept as in
+            # racingtile; no setting passes a genome of 120 through gates,
+            # rules and typicality (tile_weights.py, 12 m road too), so that
+            # count cannot choose; hex tracks stop at typicality.
+            #
+            #   grass straight curve   class L1 (s21, s22, s23)   all four   turns
+            #     4     10     0.05    0.43                       1          33
+            #     4     10     0.1     0.42                       2          38
+            #     4     10     0.15    0.43                       0          45
+            #     4     10     0.3     0.46                       0          48
+            #     4     20     0.1     0.44  0.46  0.52           3  2  0    36 30 34   (in use)
+            #     4     40     0.1     0.44                       2          36
+            #     4     80     0.1     0.46  0.49  0.52           3  1  1    36 35 32
+            #     8     20     0.1     0.43                       1          33
+            #     8     40     0.1     0.44                       2          30
+            #
+            # Rule: the most tracks with all four, then the nearer mix.  No
+            # setting reaches the circuits' 15 turns: the 120 degree pairs carry
+            # three 140-180 degree tiles for one plain corner, and variants keep
+            # straights beside their arcs.  Variants at weight 0 give L1 0.40,
+            # 24 turns, 9 with all four (seed 21); variants requested only,
+            # L1 0.49, 21 turns, 16 / 11 / 19.  mix_sweep.py, tile_weights.py.
+            w = np.zeros(_N_WFC_TILES)
+            for i in range(1, _N_WFC_TILES):
+                w[i] = _STRAIGHT_WEIGHT if _TILE_KIND[i][0] == STRAIGHT else _CURVE_WEIGHT
             # Grass outweighs each road tile so WFC draws a loop through the
-            # grid rather than filling it.  The ratio also sets lap length: 4.0
-            # gives 4177 m against the 4650 m median of the 25 real circuits,
-            # where 6.0 gives 3903 m.  Hex is less sensitive to this knob than
-            # racingtile because 12 of its 15 road tiles are corners, so loops
-            # turn back on themselves before they grow long.
-            w[GRASS] = 4.0
+            # grid rather than filling it.
+            w[GRASS] = _GRASS_WEIGHT
             cls._WFC_WEIGHTS = w
         return cls._WFC_WEIGHTS
 
@@ -328,25 +361,6 @@ class RacingTileHexProblem(RacingProblem):
                 neighbors[(r, c)] = nbrs
         return neighbors
 
-    @staticmethod
-    def _connected_components(neighbors):
-        visited, components = set(), []
-        for seed in neighbors:
-            if seed in visited:
-                continue
-            comp, stack = [], [seed]
-            while stack:
-                cell = stack.pop()
-                if cell in visited:
-                    continue
-                visited.add(cell)
-                comp.append(cell)
-                for nb in neighbors.get(cell, []):
-                    if nb not in visited:
-                        stack.append(nb)
-            components.append(comp)
-        return components
-
     def _edge_midpoints(self, cells):
         """One waypoint per cell: the shared-face midpoint with the next cell."""
         n = len(cells)
@@ -362,20 +376,11 @@ class RacingTileHexProblem(RacingProblem):
         return points
 
     def _keep_largest_component(self, tiles):
-        """Keep only road tiles forming the largest single closed loop."""
-        neighbors = self._build_neighbor_graph(tiles)
-        components = self._connected_components(neighbors)
-
-        loops = []
-        for comp in components:
-            is_loop = all(len(neighbors.get(cell, [])) == 2 for cell in comp)
-            if is_loop:
-                loops.append(comp)
-
-        if not loops:
+        """Keep only road tiles forming the largest single closed loop
+        (racingtile's _largest_loop)."""
+        largest = _largest_loop(self._build_neighbor_graph(tiles))
+        if largest is None:
             return tiles
-
-        largest = set(max(loops, key=len))
         tiles = tiles.copy()
         for r in range(GRID_H):
             for c in range(GRID_W):
@@ -383,185 +388,28 @@ class RacingTileHexProblem(RacingProblem):
                     tiles[r, c] = GRASS
         return tiles
 
-    # ── WFC runner ────────────────────────────────────────────────────
+    # ── Hooks of _GeneticWFCProblem ───────────────────────────────────
 
-    def _run_wfc(self, wave, rng, compat, boosts=None):
-        """Observe (min-entropy) / collapse (weighted) / propagate (AC-3).
+    def _n_tiles(self):
+        return len(self._weights())   # the vocabulary, here or in a subclass
 
-        `boosts` is the genome's boost zones as a (GRID_H, GRID_W) int array,
-        one per cell (Bailly and Levieux 2023, Sec. III-E): entry 0 means no
-        boost, otherwise the tile index whose selection probability is
-        multiplied by _BOOST_FACTOR when this cell is collapsed.  The boost
-        only reweights choices that are still legal -- a tile already
-        eliminated by propagation has probability zero, and scaling zero leaves
-        it zero, so the genome can never force a constraint violation.
+    def _tile_weights(self):
+        return self._weights()
 
-        Returns a (GRID_H, GRID_W) tile-index array or None on contradiction."""
-        weights = self._weights()
-        while True:
-            min_e, candidates = float('inf'), []
-            for r in range(GRID_H):
-                for c in range(GRID_W):
-                    n = len(wave[r][c])
-                    if n > 1:
-                        if n < min_e:
-                            min_e, candidates = n, [(r, c)]
-                        elif n == min_e:
-                            candidates.append((r, c))
-            if not candidates:
-                break
-            r, c = candidates[int(rng.integers(len(candidates)))]
-            possible = list(wave[r][c])
-            w = weights[possible].astype(float)
-            if boosts is not None:
-                # Scale up the requested tile's weight.  Every cell carries a
-                # boost (gene 0 requests grass), so there is no "no request"
-                # case.  If propagation has already ruled that tile out it is
-                # absent from `possible`, so the request simply has no effect:
-                # nothing to detect, nothing to roll back.
-                w[np.asarray(possible) == boosts[r, c]] *= self._BOOST_FACTOR
-            w = w / w.sum()
-            chosen = possible[int(rng.choice(len(possible), p=w))]
-            wave[r][c] = {chosen}
-            if not self._wfc_propagate(wave, [(r, c)], compat):
-                return None
-        tiles = np.zeros((GRID_H, GRID_W), dtype=int)
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                tiles[r, c] = next(iter(wave[r][c])) if wave[r][c] else GRASS
+    def _ids_to_tiles(self, ids):
+        return ids
+
+    def _tile_ids(self, tiles):
         return tiles
 
-    @staticmethod
-    def _copy_wave(wave):
-        return [[set(cell) for cell in row] for row in wave]
+    def _fallback_tiles(self, rng):
+        return self._ring_fallback(rng)
 
-    def _decode_cache_store(self, prefs_arr, tiles, wave, raw=None):
-        """Insert a decoded genome into the bounded cache.
+    def _content_track_points(self, content, tiles):
+        return self._grid_to_track_points(tiles)
 
-        Pure memoization: with a fixed seed and no repair path, decoding is a
-        function of the genome alone, so a hit is indistinguishable from a
-        recompute.
-
-        `raw` is the WFC output BEFORE loop pruning, kept here rather than in a
-        separate dict so it is evicted together with its entry and can never go
-        missing while the decode is still cached (_reencode needs both)."""
-        key = prefs_arr.tobytes()
-        if key not in self._decode_cache:
-            self._decode_cache_keys.append(prefs_arr.copy())
-            while len(self._decode_cache_keys) > self._DECODE_CACHE_MAX:
-                oldest = self._decode_cache_keys.pop(0)
-                self._decode_cache.pop(oldest.tobytes(), None)
-                self._raw_wfc.pop(oldest.tobytes(), None)
-        self._decode_cache[key] = (tiles, wave)
-        self._raw_wfc[key] = np.asarray(tiles if raw is None else raw).copy()
-
-    def _decode_genome(self, tile_prefs):
-        """Decode a boost-zone genome to a (GRID_H, GRID_W) tile-index array.
-
-        This is Alg. 1 line 18 of Bailly and Levieux (2023), `l <- generate(c)`:
-        one full WFC pass per individual, with the genome supplying the boost
-        zones.  tile_prefs is a flat int array of length GRID_H*GRID_W holding
-        the module ID to boost in each cell; value 0 boosts grass, 1-15 boost
-        that face-pair road tile.  _run_wfc multiplies the requested module's
-        selection probability at each collapse, so the genome biases generation
-        but can never force a placement propagation has already ruled out.
-
-        Deterministic: the same genome always decodes to the same track,
-        because the first attempt always uses the same seed (the paper's "we
-        use the same random generator seed every time we generate a level")."""
-        tile_prefs = np.asarray(tile_prefs, dtype=int)
-        if tile_prefs.size != GRID_H * GRID_W:
-            raise ValueError(
-                "tile_prefs must have %d entries for this %dx%d grid, got %d"
-                % (GRID_H * GRID_W, GRID_H, GRID_W, tile_prefs.size))
-        key = tile_prefs.tobytes()
-        if key in self._decode_cache:
-            return self._decode_cache[key][0]
-
-        compat   = self._wfc_compat()
-        n_tiles  = _N_WFC_TILES
-        prefs_2d = tile_prefs.reshape(GRID_H, GRID_W)
-
-        # ── Full WFC from scratch ──────────────────────────────────────────
-        # The border is a hard constraint (level structure, not a genome
-        # request), so it is forced here.  The genome itself never touches the
-        # wave — it is passed to _run_wfc as boost zones, which only reweight
-        # choices that are already legal.
-        base_wave = [[set(range(n_tiles)) for _ in range(GRID_W)] for _ in range(GRID_H)]
-        border = []
-        for r in range(GRID_H):
-            for c in range(GRID_W):
-                if r == 0 or r == GRID_H - 1 or c == 0 or c == GRID_W - 1:
-                    base_wave[r][c] = {GRASS}
-                    border.append((r, c))
-        self._wfc_propagate(base_wave, border, compat)
-
-        # Seed a road if the genome asks for grass everywhere, else WFC has
-        # nothing to build a loop from.  Use a straight-through tile at centre.
-        if not np.any(prefs_2d[1:GRID_H - 1, 1:GRID_W - 1]):
-            sr, sc = GRID_H // 2, GRID_W // 2
-            straight = _EDGES_TO_TILE[frozenset({E, W})]
-            if straight in base_wave[sr][sc]:
-                base_wave[sr][sc] = {straight}
-                self._wfc_propagate(base_wave, [(sr, sc)], compat)
-
-        # Fixed seed sequence, NOT one derived from the genome.  A fixed stream
-        # gives parent and child the same dice, leaving the genome as the only
-        # difference between them, which is what makes the layout heritable; a
-        # genome-derived seed would hand every mutant an unrelated random
-        # stream and let a one-gene change redraw the whole track.  Still
-        # deterministic: the same genome decodes to the same track.
-        for attempt in range(100):
-            rng  = np.random.default_rng(attempt * 1_000_003 + 7)
-            wave = self._copy_wave(base_wave)
-            result = self._run_wfc(wave, rng, compat, boosts=prefs_2d)
-            if result is None:
-                continue
-            tiles = self._keep_largest_component(result)
-            if self._extract_loop(tiles) is not None:
-                # Store the RAW WFC output alongside: re-encoding must record
-                # what WFC placed, not what survived pruning (see _reencode).
-                self._decode_cache_store(tile_prefs, tiles, tiles.copy(), raw=result)
-                return tiles
-
-        # Total failure — deterministic hexagonal ring fallback.
-        rng   = np.random.default_rng(int(np.sum(tile_prefs)) % (2**31))
-        tiles = self._ring_fallback(rng)
-        self._decode_cache_store(tile_prefs, tiles, tiles.copy())
-        return tiles
-
-    def init_content(self, rng=None):
-        """Return a random dense boost-zone genome, one boost per cell.
-
-        Every cell carries a boost, as in Bailly and Levieux 2023 Sec. III-E
-        ("We use one boost zone per grid cell").  Gene 0 boosts grass and
-        1.._N_WFC_TILES-1 boost that face-pair road tile.
-
-        Density is what makes the genome expressive.  WFC collapses the
-        most-constrained cells first, so a cell carrying no boost is usually
-        decided by its neighbours long before its own gene would be consulted;
-        at a sparse ~15% of cells only ~13% of requests reach the layout.
-        Boosting every cell gives the genome a say wherever WFC looks, which is
-        what makes offspring resemble their parents.
-
-        Genes are drawn UNIFORMLY over the whole vocabulary, which is the
-        paper's "the first population is initialized with random chromosomes"
-        (Sec. III-E(c)).  Grass is one value of sixteen rather than a weighted
-        majority for two reasons.  Biasing the draw toward grass starves the
-        genome of road and roughly halves track length (1401 m mean at a 15%
-        road rate against 2706 m uniform, on a 3273 m min_length).  It also
-        keeps mutation effective, since contentSwap draws replacement genes
-        from this function and a grass-heavy draw would make most mutations
-        grass-onto-grass no-ops.  The preference for sparse loops lives in the
-        grass-weighted WFC collapse (_weights) instead, which is where it
-        belongs."""
-        if rng is None:
-            rng = np.random.default_rng()
-        elif isinstance(rng, int):
-            rng = np.random.default_rng(rng)
-        n = GRID_H * GRID_W
-        tile_prefs = rng.integers(0, _N_WFC_TILES, size=n).astype(int)
-        return {"tile_prefs": tile_prefs}
+    def _tile_background(self, img_w, img_h, content, tiles):
+        return self._make_tile_bg(img_w, img_h, tiles)
 
     def _ring_fallback(self, rng):
         """Deterministic closed hex ring as a last resort.
@@ -570,20 +418,7 @@ class RacingTileHexProblem(RacingProblem):
         the face-pair joining its previous and next neighbour.  Because face
         directions are parity-dependent on a hex grid, the pair is computed from
         the actual step directions, so the ring is always drivable."""
-        min_dim = 3
-        r0 = int(rng.integers(1, GRID_H - min_dim - 1))
-        c0 = int(rng.integers(1, GRID_W - min_dim - 1))
-        r1 = int(rng.integers(r0 + min_dim, min(r0 + min_dim + 5, GRID_H - 1) + 1))
-        c1 = int(rng.integers(c0 + min_dim, min(c0 + min_dim + 5, GRID_W - 1) + 1))
-        loop = []
-        for c in range(c0, c1):
-            loop.append((r0, c))
-        for r in range(r0, r1):
-            loop.append((r, c1))
-        for c in range(c1, c0, -1):
-            loop.append((r1, c))
-        for r in range(r1, r0, -1):
-            loop.append((r, c0))
+        loop = _rectangle_loop(rng)
 
         tiles = np.zeros((GRID_H, GRID_W), dtype=int)
         n = len(loop)
@@ -609,278 +444,67 @@ class RacingTileHexProblem(RacingProblem):
 
     # ── Decoding: tile grid -> track waypoints ────────────────────────
 
-    def _extract_loop(self, tiles):
-        """Traverse mutually-connected road tiles to find a closed loop."""
-        neighbors = self._build_neighbor_graph(tiles)
-        cycle_cells = {cell for cell, nbrs in neighbors.items() if len(nbrs) == 2}
-        if not cycle_cells:
-            return None
+    def _tile_polyline(self, tile):
+        """Road centre line of one tile, relative to its cell centre in metres.
 
-        start = next(iter(cycle_cells))
-        loop, prev, cur = [start], None, start
-        while True:
-            nxt = None
-            for nb in neighbors.get(cur, []):
-                if nb != prev and nb in cycle_cells:
-                    nxt = nb
-                    break
-            if nxt is None or nxt == start:
-                break
-            loop.append(nxt)
-            prev, cur = cur, nxt
+        Returns (entry face, points) from the midpoint of the entry face (the
+        lower-numbered open face) to the midpoint of the other.  Every road
+        crosses a face perpendicular to it, along the radial from the hex
+        centre, so consecutive tiles join without a kink.  The canonical path
+        from racingtile's _tile_points is in apothem units; the linear map that
+        sends its entry and exit face normals to this pair's face normals places
+        it in the map's y-down frame.  Both pairs of normals meet at the same
+        angle, so the map is a rotation or a reflection."""
+        tile = int(tile)
+        if tile in self._tile_polylines:
+            return self._tile_polylines[tile]
+        apothem = self._hex_size() * np.sqrt(3.0) / 2.0
+        entry, other = sorted(_OPEN_EDGES[tile])
+        kind, mirror, value = _TILE_KIND[tile]
+        sep = _separation(_OPEN_EDGES[tile])
+        turn = 180.0 - 60.0 * sep
+        pts = _tile_points(kind, turn,
+                           lambda radius, t: self._arc_samples(radius * apothem * abs(t)),
+                           mirror=mirror, hairpin_leg=_HAIRPIN_LEG.get(turn, 0.0),
+                           kink_strong=value if kind == KINK and value else _KINK_STRONG.get(turn, 0.4),
+                           sharp_radius=value if kind == SHARP else 0.6,
+                           ess=value if kind in (ESS, SWEEP) else None,
+                           s_chicane=_S_CHICANE_HEX)
+        n_in = np.array([np.cos(_FACE_ANGLE[entry]), np.sin(_FACE_ANGLE[entry])])
+        n_out = np.array([np.cos(_FACE_ANGLE[other]), np.sin(_FACE_ANGLE[other])])
+        if sep == 3:
+            # Canonical straight axis (1, 0) points at the exit face.
+            m = np.array([[n_out[0], -n_out[1]], [n_out[1], n_out[0]]])
+        else:
+            m = np.column_stack([n_in, n_out]) @ np.linalg.inv(
+                np.column_stack([[0.0, 1.0], _exit_port(turn)]))
+        self._tile_polylines[tile] = (entry, apothem * (pts @ m.T))
+        return self._tile_polylines[tile]
 
-        if len(loop) < 4 or start not in neighbors.get(loop[-1], []):
-            return None
-        return loop
-
-    # How many samples each corner tile's arc contributes to the polyline.
-    # Arc radius is apothem*tan(sep/2): 38 m for a 120 degree turn (adjacent
-    # faces), 113 m for a 60 degree turn.  _make_curve then re-spaces the
-    # polyline at 5.0 m, so the tight corner is a 6-sided approximation
-    # (0.6 m of corner-cutting, against a 16 m track width).
-    _ARC_SAMPLES = 6
-
-    def _loop_to_track_points(self, loop):
+    def _loop_to_track_points(self, loop, tiles):
         """Convert an ordered cell loop to waypoints following the road geometry.
 
-        Each road tile connects two of its faces.  The road crosses every face
-        PERPENDICULAR to that face (i.e. along the radial direction from the hex
-        centre), so a straight tile (opposite faces) is a line through the
-        centre, and a 60 or 120 degree tile is the unique circular arc tangent
-        to both faces' perpendiculars.  That arc is sampled _ARC_SAMPLES times.
-
-        Because every cell's road enters and leaves perpendicular to the shared
-        face, the piece in the next cell continues along the exact same
-        direction across that face: consecutive tiles link C1-smoothly with no
-        kink, which is what makes the whole loop read as one flowing track."""
+        Each tile contributes its centre line from _tile_polyline, reversed
+        when the loop enters through the other open face, without its first
+        point (the previous tile already ended there)."""
         n = len(loop)
         points = []
         for i, (r, c) in enumerate(loop):
             pr, pc = loop[(i - 1) % n]
-            nr, nc = loop[(i + 1) % n]
-            d_in  = self._direction_toward(r, c, pr, pc)
-            d_out = self._direction_toward(r, c, nr, nc)
-            if d_in is None or d_out is None:
-                # Non-adjacent step (should not happen for a valid loop) — emit
-                # the centre so the polyline stays continuous.
-                points.append(self._hex_center(r, c))
-                continue
-
-            exit_mid = self._face_midpoint(r, c, d_out)
-
-            # Straight tile: opposite faces -> single line through the centre,
-            # emit exit only (the densifier fills the segment).
-            if _OPPOSITE[d_in] == d_out:
-                points.append(exit_mid)
-                continue
-
-            # Corner tile: the arc tangent to both face perpendiculars.
-            arc = self._corner_arc(r, c, d_in, d_out)
-            points.extend(arc)
+            entry, local = self._tile_polyline(tiles[r, c])
+            if self._direction_toward(r, c, pr, pc) != entry:
+                local = local[::-1]
+            cx, cy = self._hex_center(r, c)
+            points.extend((cx + x, cy + y) for x, y in local[1:])
         return points
-
-    def _corner_arc(self, r, c, d_in, d_out):
-        """Sample the circular arc that crosses faces d_in and d_out of cell
-        (r, c) perpendicular to each face.
-
-        For a regular hexagon the perpendicular to a face is the radial
-        direction, so the road direction at a face midpoint is that face's
-        radial.  The arc tangent to both radials has its centre at the
-        intersection of the two FACE LINES (each tangent to the hexagon at its
-        face midpoint); the two radii are equal by symmetry.  Entering and
-        leaving along the face normals is exactly the "perpendicular exit"
-        requirement, and it is what lets neighbouring cells join without a kink.
-
-        Returns _ARC_SAMPLES points, ending at the d_out face midpoint."""
-        cx, cy = self._hex_center(r, c)
-        apothem = self._hex_size() * np.sqrt(3.0) / 2.0
-
-        a_in  = float(_FACE_ANGLE[d_in])
-        a_out = float(_FACE_ANGLE[d_out])
-        m_in  = np.array([cx + apothem * np.cos(a_in),  cy + apothem * np.sin(a_in)])
-        m_out = np.array([cx + apothem * np.cos(a_out), cy + apothem * np.sin(a_out)])
-
-        # Each face line passes through the face midpoint with direction
-        # perpendicular to that face's radial (i.e. tangent to the hexagon).
-        t_in  = np.array([-np.sin(a_in),  np.cos(a_in)])
-        t_out = np.array([-np.sin(a_out), np.cos(a_out)])
-
-        # Solve m_in + s*t_in = m_out + u*t_out for the arc centre.
-        A = np.array([[t_in[0], -t_out[0]], [t_in[1], -t_out[1]]])
-        b = m_out - m_in
-        det = A[0, 0] * A[1, 1] - A[0, 1] * A[1, 0]
-        if abs(det) < 1e-9:
-            # Parallel face lines (only the opposite-face straight, handled by
-            # the caller) — emit a straight sample as a safe fallback.
-            return [tuple(m_in + (m_out - m_in) * s / self._ARC_SAMPLES)
-                    for s in range(1, self._ARC_SAMPLES + 1)]
-        s = (b[0] * A[1, 1] - b[1] * A[0, 1]) / det
-        centre = m_in + s * t_in
-
-        radius = float(np.linalg.norm(centre - m_in))
-        a0 = np.arctan2(m_in[1]  - centre[1], m_in[0]  - centre[0])
-        a1 = np.arctan2(m_out[1] - centre[1], m_out[0] - centre[0])
-        sweep = (a1 - a0 + np.pi) % (2.0 * np.pi) - np.pi  # shortest way round
-        pts = []
-        for k in range(1, self._ARC_SAMPLES + 1):
-            a = a0 + sweep * k / self._ARC_SAMPLES
-            pts.append((float(centre[0] + radius * np.cos(a)),
-                        float(centre[1] + radius * np.sin(a))))
-        return pts
 
     def _grid_to_track_points(self, tiles):
         loop = self._extract_loop(tiles)
         if loop is None:
             return None
-        return self._loop_to_track_points(loop)
-
-    def _best_effort_path(self, tiles):
-        """For rendering: largest connected chain of road tiles, loop or not."""
-        neighbors = self._build_neighbor_graph(tiles)
-        components = self._connected_components(neighbors)
-        best = max(components, key=len) if components else []
-        if len(best) < 2:
-            return None
-
-        best_set = set(best)
-        start = best[0]
-        for cell in best:
-            in_chain = [nb for nb in neighbors.get(cell, []) if nb in best_set]
-            if len(in_chain) == 1:
-                start = cell
-                break
-
-        path, prev, cur = [start], None, start
-        while True:
-            nxt = None
-            for nb in neighbors.get(cur, []):
-                if nb != prev and nb in best_set:
-                    nxt = nb
-                    break
-            if nxt is None or nxt == path[0]:
-                break
-            path.append(nxt)
-            prev, cur = cur, nxt
-
-        if len(path) < 2:
-            return None
-        return self._edge_midpoints(path)
-
-    # ── Content extraction bridge ─────────────────────────────────────
-
-    def _genome_to_tiles(self, content):
-        return self._decode_genome(np.asarray(content["tile_prefs"], dtype=int))
-
-    def _extract_content(self, content):
-        if isinstance(content, dict) and "tile_prefs" in content:
-            tiles = self._genome_to_tiles(content)
-            pts = self._grid_to_track_points(tiles)
-            if pts is None:
-                pts = self._best_effort_path(tiles)
-            if pts is None:
-                pts = self._default_track_points
-            return np.array(pts)
-        return super()._extract_content(content)
-
-    def _make_curve(self, track_points):
-        """Waypoints already trace the road (arcs + straights); only re-space
-        them to the shared arc-length step."""
-        return self._resample_uniform(track_points, step=self._curve_step())
-
-    def _reencode(self, content, tiles):
-        """Rewrite the genome to record the tiles WFC actually placed.
-
-        A boost is only a request: WFC honours it when the tile is still legal
-        at the moment that cell collapses, and ignores it otherwise.  Measured
-        on random genomes, only ~13% of ROAD requests survive, so without this
-        step most genes would describe a track that was never built, crossover
-        would mix wishes rather than layouts, and offspring would share almost
-        nothing with their parents.
-
-        The paper's fix (Alg. 1 l.20, `c <- reencode(l)`) is to write the
-        chosen module back into the chromosome "as if it was the chromosome's
-        choice in the first place".  Every gene then describes a tile that
-        really exists, so crossover recombines buildable layouts.
-
-        The genome dict is mutated IN PLACE.  generators/search.py hands the
-        chromosome's own content object to env.evaluate() without copying it,
-        so writing here updates the individual the GA will breed from, which
-        is exactly the paper's ordering: generate, evaluate, re-encode.
-
-        What gets written back is the RAW WFC output, not the pruned loop.
-        The paper re-encodes "the ID number of the asset that has been placed
-        in the map", i.e. what the constructive algorithm chose.  Writing the
-        pruned layout instead would delete every road tile that
-        _keep_largest_component grassed over, and since that happens each
-        generation, road could only ever leave the genome: the population
-        ratchets down to tiny loops (measured: 29 road genes -> 4 in one
-        round).  Keeping the raw output preserves off-loop road as material
-        for later crossover.
-        """
-        prefs = content.get("tile_prefs", None)
-        if prefs is None:
-            return
-        raw = self._raw_wfc.get(np.asarray(prefs, dtype=int).tobytes(), None)
-        flat = np.asarray(raw if raw is not None else tiles, dtype=int).reshape(-1)
-        prefs_arr = np.asarray(prefs, dtype=int)
-        if flat.shape != prefs_arr.shape:
-            return
-        if isinstance(prefs, np.ndarray) and prefs.shape == flat.shape:
-            prefs[:] = flat          # keep the GA's own array object
-        else:
-            content["tile_prefs"] = flat
-
-    # ── Problem interface ─────────────────────────────────────────────
-
-    def info(self, content, trajectory=None, use_cache=True):
-        """Decode the genome to a tile loop, re-encode it, then score it.
-
-        Content that is not a tile genome (raw track points, a bare array, or
-        None) goes straight to the base problem.  That is the same test
-        _extract_content applies, so the two agree on what counts as a genome,
-        and every representation answers the same set of content forms.
-        """
-        if not (isinstance(content, dict) and "tile_prefs" in content):
-            return super().info(content, trajectory=trajectory, use_cache=use_cache)
-        tiles = self._genome_to_tiles(content)
-        self._reencode(content, tiles)
-        track_pts = self._grid_to_track_points(tiles)
-
-        if track_pts is None or len(track_pts) < 3:
-            return {
-                'num_points': 0, 'total_length': 0.0,
-                'avg_length': 0.0, 'max_length': 0.0, 'min_length': 0.0,
-                'avg_turn': 0.0, 'max_turn': 0.0, 'min_turn': 0.0,
-                'num_turns': 0, 'steps': 0, 'finished': False,
-                'track_points': np.zeros((0, 2)), 'trajectory_end': None,
-                'curve_points': np.zeros((0, 2)),
-            }
-
-        result = super().info(
-            {"track_points": np.array(track_pts)},
-            trajectory=trajectory,
-            use_cache=use_cache,
-        )
-        return result
+        return self._loop_to_track_points(loop, tiles)
 
     # ── Hex rendering ─────────────────────────────────────────────────
-
-    def render(self, content=None, **kwargs):
-        if isinstance(content, dict) and "tile_prefs" in content:
-            self._tile_render_content = content
-        else:
-            self._tile_render_content = None
-        return super().render(content, **kwargs)
-
-    def _render_track_bg(self, img_w, img_h, left_edge_f, right_edge_f, scaled_curve,
-                         grass_color, edge_color, road_color, centerline_color, scale=1.0):
-        content = getattr(self, '_tile_render_content', None)
-        if content is None:
-            return super()._render_track_bg(img_w, img_h, left_edge_f, right_edge_f,
-                                             scaled_curve, grass_color, edge_color,
-                                             road_color, centerline_color, scale=scale)
-        tiles = self._genome_to_tiles(content)
-        return self._make_tile_bg(img_w, img_h, tiles)
 
     def _make_tile_bg(self, img_w, img_h, tiles):
         bg   = Image.new("RGB", (img_w, img_h), (34, 139, 34))
@@ -910,28 +534,15 @@ class RacingTileHexProblem(RacingProblem):
         pts = [(x * sx, y * sy) for x, y in self._hex_corners(r, c)]
         draw.polygon(pts, outline=(20, 100, 20))
 
-    def _tile_road_polyline(self, r, c, d_a, d_b):
-        """The road piece inside one tile as a pixel polyline from face d_a to
-        face d_b: a straight through the centre for opposite faces, otherwise
-        the tangent arc (same geometry the scored centerline uses)."""
-        m_a = self._face_midpoint(r, c, d_a)
-        m_b = self._face_midpoint(r, c, d_b)
-        if _OPPOSITE[d_a] == d_b:
-            return [m_a, m_b]
-        arc = self._corner_arc(r, c, d_a, d_b)  # samples from just after m_a to m_b
-        return [m_a] + list(arc)
-
     def _draw_hex_road(self, draw, r, c, tile, sx, sy):
-        edges = _OPEN_EDGES[tile]
-        if not edges:
+        """Draw one tile's road at the track width along its centre line, so
+        the picture is the road the car drives: a dark line two pixels wider
+        per side under the grey road."""
+        if not _OPEN_EDGES[tile]:
             return
-        ROAD = (210, 210, 210)
-        width = max(2, int(self._hex_size() * 0.5 * ((sx + sy) / 2.0)))
-        d_a, d_b = tuple(edges)
-        poly = [(x * sx, y * sy) for x, y in self._tile_road_polyline(r, c, d_a, d_b)]
-        if len(poly) >= 2:
-            draw.line(poly, fill=ROAD, width=width, joint="curve")
-        # Round the caps so adjacent tiles' pieces butt together seamlessly.
-        rr = max(1, width // 2)
-        for px, py in (poly[0], poly[-1]):
-            draw.ellipse([px - rr, py - rr, px + rr, py + rr], fill=ROAD)
+        cx, cy = self._hex_center(r, c)
+        _, local = self._tile_polyline(tile)
+        poly = [((cx + x) * sx, (cy + y) * sy) for x, y in local]
+        road_px = max(1, int(round(self._track_width * 0.5 * (sx + sy))))
+        draw.line(poly, fill=(25, 25, 25), width=road_px + 4, joint="curve")
+        draw.line(poly, fill=(210, 210, 210), width=road_px, joint="curve")

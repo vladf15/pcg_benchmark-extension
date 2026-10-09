@@ -1,12 +1,11 @@
-"""Gymnasium environment for training a driver on the rescaled real circuits.
+"""Gymnasium environment for training a driver on the real circuits (1:1, metres).
 
-The physics is deliberately hidden behind a small adapter (`EngineBackedPhysics`)
-so the engine can be swapped (for example for a TORCS-style model) without
-touching the environment, observation, or reward. Everything else is fixed:
-centerline + constant track width, the same dimensions the benchmark uses.
+The physics sits behind a small adapter (EngineBackedPhysics), so the engine
+can be swapped without touching observation or reward.  Centreline and
+constant track width are the benchmark's own.
 
 Observation (21 floats, all roughly in [-4, 4]):
-    0  forward speed          / 83 (engine top speed)
+    0  forward speed          / 85.5 (engine top speed)
     1  lateral speed          / 10
     2  yaw rate               / 2 rad/s
     3  steering angle         / 30 deg
@@ -14,18 +13,12 @@ Observation (21 floats, all roughly in [-4, 4]):
     5  heading error          / pi (car heading vs centerline tangent)
     6  previous steer action
     7  previous throttle action
-    8-20  worst signed curvature in 13 SPEED-SCALED bands ahead, times 10
-          (positive = left turn; 10 x curvature = 10/radius in metres, so a
-          10 m hairpin reads 1.0 and a 100 m sweeper 0.1). Bands, not point
-          samples, so short corners cannot hide between samples. Band edges
-          are fixed TIMES ahead (0.2 s to 8.25 s), converted to metres with
-          the current speed, so the horizon breathes with pace like a real
-          driver's: at 83 m/s the last band reaches ~685 m (braking from
-          top speed takes ~293 m, so the braking point is visible with
-          seconds to spare), while at low speed the same bands wrap tightly
-          around the car for apex placement instead of describing track
-          half a minute away. Below LOOKAHEAD_MIN_SPEED the scaling is
-          frozen so the car is never blind at a standstill.
+    8-20  worst signed curvature in 13 bands ahead, times 10 (+ = left; a
+          10 m hairpin reads 1.0, a 100 m sweeper 0.1).  Bands, not samples,
+          so short corners cannot hide.  Edges are fixed TIMES ahead (0.2 to
+          8.25 s) scaled by speed: at 85.5 m/s the last band is ~705 m out
+          (braking from top speed takes ~330 m), at low speed the bands wrap
+          the car for apex placement; frozen below LOOKAHEAD_MIN_SPEED.
 
 Action (2 floats in [-1, 1]): steering, throttle/brake.
 
@@ -34,45 +27,27 @@ Reward per step:
              within the kerb limit)
     - 0.05 per step (time cost: the reason to go fast rather than far)
     - 0.05 * (change in steer action)^2  (suppresses oscillation)
-    off track (past the kerb, within 2 half-widths):
-           - overshoot * (1.5 + 4 * v/vmax) per step: the further off and
-             the faster, the worse. A hard cliff at the edge gave no
-             gradient about corner-entry speed and produced a constant-
-             pace policy that never braked for tight corners.
-    lap complete:  +20, plus up to +200 for finishing with steps to spare
-    departed the track (beyond 2 half-widths) or off the map:
-           -(20 + 30 * v/vmax) and the episode ends: failing fast is
-           much worse than failing slow, which is the point.
-    stuck (no progress for stuck_patience steps):
-           -40 and the episode ends. Larger than the crash penalty because
-           the timeout is short, so without it a stationary car pays less
-           total time cost than a car that drives and crashes, and standing
-           still becomes the cheapest ending available.
+    off track (past the kerb, within 2 half-widths): - 1.0 - overshoot *
+           (1.5 + 4 v/vmax) per step, overshoot past the outside wheels
+           (CAR_HALF_WIDTH); a hard cliff gave no gradient on entry speed
+    lap complete: +20, plus up to +200 for steps to spare
+    departed (beyond 2 half-widths) or off the map: -(20 + 30 v/vmax), end
+    stuck (no progress for stuck_patience steps): -40, end (more than a
+           crash, or standing still is the cheapest ending)
 
-This is the shape used by the racing RL literature: dense progress along
-the track plus penalties for leaving it (GT Sophy, Wurman et al. 2022) and
-the classic TORCS formulation v*cos(heading_error) (Lau 2016), which is
-what ds per step already equals. Two terms that appear in lane-keeping
-work are deliberately ABSENT here:
+The racing RL literature's shape: dense progress plus penalties for leaving
+the track (GT Sophy, Wurman et al. 2022: progress masked off course, an
+off-course penalty proportional to squared speed), and DDPG's TORCS reward
+(Lillicrap et al. 2016, Sec. 9.1: "the velocity of the car projected along
+the track direction", episodes ended after 500 frames without progress),
+which ds per step already is.  ABSENT on purpose: a flat alignment bonus
+(a survival stipend that recreates slow creeping) and a centreline-distance
+penalty (it makes lane keepers hug the middle).  The reward never says
+WHERE to drive: progress is along the centreline whatever the line (which
+blocks infield shortcuts), so a racing line must emerge.
 
-  - no flat alignment bonus (e.g. +c * cos(heading_error)): a constant
-    per-step bonus is a survival stipend that pays the agent for merely
-    existing on track, which re-creates the slow-creeping optimum. The
-    literature's version is speed-multiplied, and ds already is that.
-  - no centerline-distance penalty (e.g. -c * (lateral/half_width)^2):
-    that term is what makes lane keepers hug the centerline. A racing
-    agent must be free to use the full width; staying on track is handled
-    by termination, not by attraction to the middle.
-
-Note the reward never says WHERE on the road to drive. Progress is
-measured along the centerline whatever line the car takes (which is what
-blocks infield shortcuts), so a racing line has to emerge because it is
-the quickest way round, not because it was rewarded directly.
-
-Episodes end on: lap complete (terminated); failure (terminated) when the
-car departs the track (more than OFF_TRACK_LIMIT half-widths from the
-centerline), leaves the map, or makes no progress for `stuck_patience`
-steps; or the per-track step budget running out (truncated).
+Episodes end on lap complete, on failure (departed, off the map, or stuck),
+or when the per-track step budget runs out (truncated).
 """
 
 import os
@@ -100,12 +75,9 @@ CarState = namedtuple(
 
 
 class EngineBackedPhysics:
-    """Adapter around the benchmark's CarPhysicsEngine.
-
-    A replacement physics model (e.g. TORCS-style) only has to provide the
-    same three members: `dt`, `reset(position, heading) -> CarState`, and
-    `step(steer, throttle) -> CarState`, with steer/throttle in [-1, 1].
-    """
+    """Adapter around the benchmark's CarPhysicsEngine; a replacement needs
+    `dt`, `reset(position, heading) -> CarState` and `step(steer, throttle)
+    -> CarState` (inputs in [-1, 1])."""
 
     def __init__(self):
         from pcg_benchmark.probs.racing.engine import CarPhysicsEngine
@@ -128,9 +100,8 @@ class EngineBackedPhysics:
         self._engine.start_angle = float(heading)
         self._engine.reset()
         if speed:
-            # Rolling start: both engines store velocity in the world frame,
-            # and the auto gearbox picks the right gear from wheel speed on
-            # the first step, so setting velocity alone is a valid state.
+            # Rolling start: world-frame velocity alone is a valid state (the
+            # gearbox picks its gear on the first step).
             self._engine.velocity = speed * np.array(
                 [np.cos(heading), np.sin(heading)], dtype=float)
         return self._state()
@@ -140,62 +111,19 @@ class EngineBackedPhysics:
         return self._state()
 
 
-class LegacyPhysics(EngineBackedPhysics):
-    """Simcade physics (engine_legacy.py): substepped, load transfer, real grip
-    limits, human-limited inputs.
-
-    Kept alongside the benchmark engine because the two differ in how readily
-    the car spins under the near-random actions PPO starts from: measured over
-    200 random-action rollouts, peak yaw rate is 1.80 rad/s here against 4.38
-    for the benchmark engine.  A run that spins on most early episodes never
-    reaches the episode lengths where progress reward outweighs TIME_COST, so
-    which engine trains is a property worth being able to switch.
-    """
-
-    def __init__(self):
-        from engine_legacy import CarPhysicsEngineLegacy
-        self._engine = CarPhysicsEngineLegacy(start_position=(0.0, 0.0))
-        self.dt = float(self._engine.time_step)
-        self.max_speed = float(self._engine.max_speed)
-        self.max_steering = float(self._engine.max_steering)
-
-
-def make_physics(name="benchmark"):
-    """Physics for the training environment, by name.
-
-    'benchmark' is the car the GA quality function scores laps with, so a
-    policy trained on it is measuring the same vehicle the benchmark
-    simulates.  'legacy' is the separate simcade model that run10 was
-    trained on.  Training on 'legacy' and scoring on 'benchmark' means the
-    policy learned physics the benchmark never uses, which is why
-    'benchmark' is the default.
-    """
-    if name == "benchmark":
-        return EngineBackedPhysics()
-    if name == "legacy":
-        return LegacyPhysics()
-    raise ValueError("unknown physics '%s' (use 'benchmark' or 'legacy')" % name)
-
-
 class RacingEnv(gym.Env):
-    """Drive one lap on a (real, rescaled) circuit."""
+    """Drive one lap on a real circuit."""
 
     metadata = {"render_modes": []}
 
-    # Band edges for the curvature observation, in SECONDS ahead: slot i
-    # reports the worst curvature between edge i and i+1, so a short corner
-    # can never hide between two sample points. Edges are converted to
-    # metres with the current speed (see lookahead_edges), because fixed
-    # distances serve both ends badly: at 83 m/s a 325 m horizon left 0.4 s
-    # of look beyond the braking distance (blind at speed), while at 8 m/s
-    # the same horizon described track 40 s away (noise when slow). Near
-    # edges grow ~1.2x apart for apex resolution, far ones stretch for
-    # braking-point planning. 14 edges = 13 slots.
+    # Curvature band edges in SECONDS ahead, scaled by speed (lookahead_edges):
+    # fixed metres serve both ends badly (on the legacy engine at 83 m/s a
+    # 325 m horizon left 0.4 s beyond the braking distance; at 8 m/s it
+    # described track 40 s away).  Near edges ~1.2x apart for apexes, far
+    # ones stretched for braking points.  A MODELLING CHOICE, not swept.
     LOOKAHEAD_TIMES = (0.0, 0.20, 0.40, 0.65, 0.95, 1.30, 1.70, 2.20,
                        2.80, 3.55, 4.45, 5.50, 6.75, 8.25)
-    # Below this speed the band scale freezes (0.2 s * 15 m/s = 3 m, the
-    # centerline sampling interval, so the nearest band never collapses
-    # below one geometry sample and the car is never blind at a standstill).
+    # Below it the scale freezes: 0.2 s x 15 m/s = 3 m, one geometry sample.
     LOOKAHEAD_MIN_SPEED = 15.0
     _LOOKAHEAD_T = np.array(LOOKAHEAD_TIMES)
 
@@ -204,77 +132,60 @@ class RacingEnv(gym.Env):
         """Band edges in metres for the given forward speed (m/s)."""
         return max(float(v_forward), cls.LOOKAHEAD_MIN_SPEED) * cls._LOOKAHEAD_T
 
-    # Reward constants (see module docstring).
-    #
-    # PROGRESS_SCALE is per METRE of centerline arc covered, so a lap pays
-    # the same total however fast it is driven. That, plus a lap bonus worth
-    # only ~5% of a lap's reward, made speed almost worthless: measured on
-    # Spa, driving 2.3x faster raised the episode return from 608 to 620,
-    # about 2%. The agent correctly concluded that creeping safely beats
-    # driving quickly, which is exactly the "sticks to the centerline and
-    # wobbles slowly" behaviour that resulted.
-    #
-    # TIME_COST fixes it: every step costs, so the ONLY way to keep more of
-    # the progress reward is to cover the lap in fewer steps. This makes the
-    # reward a lap-time objective rather than a distance objective.
+    # Reward constants.  PROGRESS_SCALE pays per METRE, so a lap pays the same
+    # however fast: on Spa driving 2.3x faster raised the return only from
+    # 608 to 620, and the policy crept.  TIME_COST makes it a lap-time
+    # objective: the only way to keep more progress reward is fewer steps.
     PROGRESS_SCALE = 0.1
-    TIME_COST = 0.05          # per step; ~0.5 per second of lap time
-                              # (raised from 0.03 after run5: clean but
-                              # conservative at 16-17 m/s mean, so price
-                              # time higher to push lap time down)
+    TIME_COST = 0.05          # per step; ~0.5 per second of lap time.
+                              # At 0.03 run5 drove clean but at 16-17 m/s
+                              # mean; 0.05 prices time higher to push lap
+                              # time down
     STEER_RATE_SCALE = 0.05   # per (steer action change)^2: cheap for small
-                              # corrections, expensive for full-lock sawing
-    LAP_BONUS = 20.0
-    LAP_TIME_BONUS = 200.0    # was 30: now worth ~a third of a lap's reward
-    # Off-track penalties. A hard cliff at the edge (on-track = no signal,
-    # one step over = flat -10 and done) gives the policy NO gradient about
-    # how badly it missed: run4 plateaued for 2.5M steps at a constant-pace
-    # policy that carried 21-32 m/s into corners survivable at 10-17,
-    # because nothing in the reward distinguished "clipped the kerb" from
-    # "flew off at speed". So the penalty scales with BOTH how far off the
-    # car is and how fast it is going (GT Sophy scales its off-course and
-    # wall penalties with kinetic energy for the same reason): per step in
-    # the off-track band, overshoot * (OFFROAD_SCALE + OFFROAD_SPEED * v/vmax),
-    # and on termination FAIL_PENALTY + FAIL_SPEED_PENALTY * v/vmax.
-    OFFROAD_SCALE = 1.5       # raised from 1.0 alongside TIME_COST so the
+                              # corrections, expensive for full-lock sawing;
+                              # a modelling choice, not swept
+    LAP_BONUS = 20.0          # a modelling choice, not swept
+    LAP_TIME_BONUS = 200.0    # ~a third of a lap's reward (30 was ~5%)
+    # Off-track penalties scale with how far off AND how fast (as GT Sophy's
+    # scale with squared speed): a hard cliff (-10 and done) gave no gradient,
+    # and run4 plateaued 2.5M steps carrying 21-32 m/s into corners
+    # survivable at 10-17.  Per step: overshoot * (OFFROAD_SCALE +
+    # OFFROAD_SPEED v/vmax); on termination FAIL_PENALTY + FAIL_SPEED_PENALTY
+    # v/vmax.
+    OFFROAD_SCALE = 1.5       # set with TIME_COST (1.0 with 0.03) so the
                               # extra pace pressure cannot be paid for by
                               # running wide more often
-    OFFROAD_SPEED = 4.0
-    FAIL_PENALTY = 20.0        # also the off-map penalty (at v ~ 0)
+    OFFROAD_SPEED = 4.0       # a modelling choice, not swept
+    # Flat cost per step past the edge: above the most one step can earn
+    # (0.1 x 85.5 m/s x 0.1 s = 0.855), so no step off pays for itself.
+    # Without it (run14) the circuits went 33.4 m/s against run13's 20.4 but
+    # off the road on 22 against 11 (share 0.0128 against 0.0048).  Not a
+    # termination: that is run4's cliff again.
+    OFFROAD_STEP = 1.0
+    # Both modelling choices, not swept; STUCK_PENALTY below is sized
+    # against FAIL_PENALTY.
+    FAIL_PENALTY = 20.0       # also the off-map penalty (at v ~ 0)
     FAIL_SPEED_PENALTY = 30.0
-    # Ending an episode by not moving has to cost more than any attempt to
-    # drive, or standing still is a cheap way out of the time cost. Measured
-    # net return over an episode, benchmark car: standing still -25.1,
-    # driving at 10 m/s -21.1, crashing at 30 m/s -25.0. That landscape is
-    # flat, and run11 converged onto it exactly, its evaluation return pinned
-    # at -25.1 (101 steps, the stuck timeout) for all 5M steps. The escape
-    # hatch is the timeout itself: a stationary car ends its episode after
-    # 101 steps having paid 5.1 of time cost, while a car that drives badly
-    # pays the same 20 having at least covered ground.
-    #
-    # 40 restores the slope that trained run10, where the same comparison ran
-    # -43.9 (standing) against -20.8 (driving at 10 m/s), a 23-point gap:
-    # -101*0.05 - 40 = -45.1 against -21.1 is a 24-point gap. Sized to that
-    # measurement, not chosen for roundness. 20 (leaving it equal to
-    # FAIL_PENALTY) is the flat landscape above; 80 was not tried, since a
-    # penalty far above the worst crash would teach the car to drive off the
-    # track deliberately rather than risk stopping.
-    #
-    # Validated by a 5M-step run on the benchmark car (runs/run12_stuckfix,
-    # seed 0, 12 envs, otherwise run11's settings): evaluation return
-    # -45.1 -> 482.6 and 4 of 5 held-out circuits lapped, against run11's
-    # -25.1 frozen for all 5M steps and 0 of 5. From a standing start on Monza
-    # it reaches 24.8 m/s in 40 steps where run11 reaches 3.7. The escape from
-    # the flat region comes later than on the legacy engine, at about 3.7M steps
-    # against run10's 1.7M, so a run shorter than ~4M looks like a failure
-    # while it is still climbing.
+    # Stopping must cost more than driving.  With it equal to FAIL_PENALTY
+    # the returns were flat (standing -25.1, driving at 10 m/s -21.1,
+    # crashing at 30 m/s -25.0) and run11 sat at -25.1 for all 5M steps.  40
+    # restores run10's slope (-45.1 standing against -21.1 driving, a 24-point
+    # gap against its 23), sized to that measurement; far above the worst
+    # crash would teach driving off deliberately.  Validated (run12_stuckfix,
+    # 5M steps): return -45.1 -> 482.6, 4 of 5 held-out circuits lapped
+    # against 0; the escape comes at ~3.7M steps, so shorter runs look failed.
     STUCK_PENALTY = 40.0
-    # The edge is 1.0 half-widths (point car); KERB_LIMIT adds a tolerance
-    # inside which progress still counts, so clipping an apex kerb is not
-    # treated as leaving the track. Beyond OFF_TRACK_LIMIT the car has
-    # genuinely departed: terminate. Progress reward stops at the kerb, so
-    # cutting across the infield earns nothing (blocks the shortcut exploit).
-    KERB_LIMIT = 1.1
+    # Progress stops at 1.0 half-widths, the benchmark's off-road line, so
+    # the policy trains on what it is scored by; cutting the infield earns
+    # nothing.  Why not 1.1: a slightly wide line was net positive (+0.25
+    # progress against 0.13 penalty per step), and run13 spent up to 3.8% of
+    # a lap past the edge.
+    KERB_LIMIT = 1.0
+    # Edge terms act at the outside wheels, half the 992's published 1852 mm
+    # width inside the edge, so the centre stays 0.93 m inside.  At the centre
+    # (run15) the policy ran apexes on the edge, off the road on 9 of 24.
+    CAR_HALF_WIDTH = 0.926
+    # Termination at two half-widths from the centreline: a modelling choice.
     OFF_TRACK_LIMIT = 2.0
 
     def __init__(self, track_names=None, physics=None, randomize=True,
@@ -311,7 +222,7 @@ class RacingEnv(gym.Env):
             }
         self._names = list(self._geoms.keys())
 
-        self._margin = track_loader.MARGIN  # benchmark edge margin (10 m)
+        self._margin = track_loader.MARGIN  # benchmark edge margin (8 m: half the width + 2)
 
         n_obs = 8 + len(self.LOOKAHEAD_TIMES) - 1
         self.observation_space = spaces.Box(low=-4.0, high=4.0,
@@ -322,9 +233,8 @@ class RacingEnv(gym.Env):
         self._geom = None
         self._track_name = None
         self._car = None
-        # Non-randomized envs walk the track list in order, one circuit per
-        # reset. Without this every evaluation episode would replay the first
-        # circuit, so a held-out set of five would only ever test one of them.
+        # Non-randomised envs walk the track list, one circuit per reset, so an
+        # evaluation covers the whole held-out set.
         self._cycle_idx = 0
 
     # ── read-only accessors (for visualization and analysis) ──────────────
@@ -357,23 +267,17 @@ class RacingEnv(gym.Env):
             if self._randomize:
                 name = self._names[self._rng.integers(len(self._names))]
             else:
-                # Deterministic round-robin: consecutive resets visit every
-                # circuit in turn, so an eval callback that just calls
-                # reset() repeatedly covers the whole held-out set.
+                # Round-robin over the circuits.
                 name = self._names[self._cycle_idx % len(self._names)]
                 self._cycle_idx += 1
         if self._randomize:
             reverse = bool(options.get("reverse", self._rng.integers(2)))
             mirror = bool(options.get("mirror", self._rng.integers(2)))
             start_frac = float(options.get("start_frac", self._rng.random()))
-            # Rolling start. From a standstill, ~100 steps of near-random
-            # throttle cover under a metre, so every early episode ends in
-            # the same stuck-failure and PPO collapses to "never move" (the
-            # reshaped pilot sat at reward -13.2 / 101 steps for all 1.5M
-            # steps). Spawning already moving means progress reward and its
-            # gradient are felt from step one; low speeds stay in the range
-            # so launching from rest is still learned. Eval keeps standing
-            # starts.
+            # Rolling start: from rest, ~100 near-random steps cover under a
+            # metre and PPO collapses to "never move" (a pilot sat at -13.2
+            # for 1.5M steps).  Low speeds stay in the range so launching is
+            # still learned; evaluation keeps standing starts.
             start_speed = float(options.get("start_speed",
                                             self._rng.uniform(0.0, 30.0)))
         else:
@@ -385,9 +289,7 @@ class RacingEnv(gym.Env):
         self._track_name = name
         self._geom = self._geoms[name][(reverse, mirror)]
         self._map_size = self._geom.map_size
-        # Step budget: enough for a slow-but-moving lap (8 m/s average),
-        # bounded so no episode drags on forever. Real circuits are 2.3-7 km,
-        # so the cap sits at 10000 steps (Spa at 8 m/s needs ~8750).
+        # Step budget for a slow lap (8 m/s), capped at 10000 (Spa needs ~8750).
         self.max_episode_steps = int(np.clip(
             self._geom.length / (self._physics.dt * 8.0), 1000, 10000))
 
@@ -421,9 +323,12 @@ class RacingEnv(gym.Env):
 
         half_width = self._geom.half_width
         offset_hw = abs(lateral) / half_width          # offset in half-widths
-        overshoot = max(0.0, abs(lateral) - half_width)
-        if overshoot > 0.0:
-            self._offroad_steps += 1
+        # Past the wheel line (see CAR_HALF_WIDTH).  offset_hw, the car's
+        # centre, still decides the off-track termination.
+        wheel_line = half_width - self.CAR_HALF_WIDTH
+        overshoot = max(0.0, abs(lateral) - wheel_line)
+        if offset_hw > 1.0:
+            self._offroad_steps += 1        # the benchmark's off-road: centre past the edge
 
         # Progress pays only up to the kerb: arc swept while off the track
         # is arc the car cut, not drove.
@@ -436,7 +341,7 @@ class RacingEnv(gym.Env):
         if overshoot > 0.0:
             # Graded off-track band: the further off and the faster, the
             # worse. This is the gradient that teaches corner-entry speed.
-            reward -= (overshoot / half_width) * (
+            reward -= self.OFFROAD_STEP + (overshoot / half_width) * (
                 self.OFFROAD_SCALE + self.OFFROAD_SPEED * speed_frac)
         self._last_action = action
 
@@ -444,11 +349,8 @@ class RacingEnv(gym.Env):
         truncated = False
         info = {}
 
-        # Failures are checked first and are exclusive with a finished lap:
-        # a car that is off the map or off the track has not completed a
-        # valid lap, whatever its progress counter says. Checking the lap
-        # first would let a single step award the lap bonus and the failure
-        # penalty at once, and report both flags in info.
+        # Failures first, exclusive with a finished lap (otherwise one step
+        # could award the lap bonus and the failure penalty at once).
         m = self._margin
         if not (m <= car.x <= self._map_size - m and m <= car.y <= self._map_size - m):
             # Failure: left the map entirely.
@@ -456,8 +358,7 @@ class RacingEnv(gym.Env):
             reward -= self.FAIL_PENALTY + self.FAIL_SPEED_PENALTY * speed_frac
             info["off_map"] = True
         elif offset_hw > self.OFF_TRACK_LIMIT:
-            # Failure: genuinely departed the track. Penalty scales with the
-            # speed it happened at: flying off costs ~2.5x dribbling off.
+            # Failure: departed the track, costing more the faster (~2.5x).
             terminated = True
             reward -= self.FAIL_PENALTY + self.FAIL_SPEED_PENALTY * speed_frac
             info["off_track"] = True
@@ -495,18 +396,33 @@ class RacingEnv(gym.Env):
         """Build the observation. The caller passes the projection results it
         already computed; projecting is the most expensive thing done per
         step, so it is done once and shared."""
-        g = self._geom
-        heading_err = (car.heading - heading_ref + np.pi) % (2.0 * np.pi) - np.pi
-        curv = g.curvature_ahead(self._s, self.lookahead_edges(car.v_forward))
+        return self.build_observation(
+            self._geom, self._s, lateral, heading_ref, car.heading, car.v_forward,
+            car.v_lateral, car.yaw_rate, car.steering, self._last_action,
+            self._physics.max_speed, self._physics.max_steering)
 
-        obs = np.empty(8 + len(self.LOOKAHEAD_TIMES) - 1, dtype=np.float32)
-        obs[0] = car.v_forward / self._physics.max_speed
-        obs[1] = car.v_lateral / 10.0
-        obs[2] = car.yaw_rate / 2.0
-        obs[3] = car.steering / self._physics.max_steering
-        obs[4] = lateral / g.half_width
+    @classmethod
+    def build_observation(cls, geom, s, lateral, heading_ref, heading, v_forward,
+                          v_lateral, yaw_rate, steering, last_action,
+                          max_speed, max_steering):
+        """The policy's observation, from the car's state and its projection
+        onto the centreline (arc position s, signed lateral offset, heading
+        of the centreline there).  The benchmark's driver
+        (pcg_benchmark/probs/racing/rl_agent.py) calls this too, so the
+        vector the policy is scored with is the one it was trained on: the
+        input layer is positional, and swapping two entries gives a driver
+        that still runs and still returns actions, just bad ones."""
+        heading_err = (heading - heading_ref + np.pi) % (2.0 * np.pi) - np.pi
+        curv = geom.curvature_ahead(s, cls.lookahead_edges(v_forward))
+
+        obs = np.empty(8 + len(cls.LOOKAHEAD_TIMES) - 1, dtype=np.float32)
+        obs[0] = v_forward / max_speed
+        obs[1] = v_lateral / 10.0
+        obs[2] = yaw_rate / 2.0
+        obs[3] = steering / max_steering
+        obs[4] = lateral / geom.half_width
         obs[5] = heading_err / np.pi
-        obs[6] = self._last_action[0]
-        obs[7] = self._last_action[1]
+        obs[6] = last_action[0]
+        obs[7] = last_action[1]
         obs[8:] = curv * 10.0
         return np.clip(obs, -4.0, 4.0)

@@ -5,9 +5,9 @@ converts them to the benchmark's world units.
 
 Scale: the benchmark's simulation world is metric, 1 world unit = 1 metre
 (the engine integrates position with velocity in m/s; the 1500x1500 map and
-the 16 m track width are metres; problem.py's PX_PER_M = 5.0 is only the
+the 12 m track width are metres; problem.py's PX_PER_M = 5.0 is only the
 world-to-pixel factor used when rendering images). So the circuits are
-imported at 1:1 — every circuit at the exact same scale, with real corner
+imported at 1:1: every circuit at the exact same scale, with real corner
 radii and lengths. Each circuit is translated so its bounding box starts at
 the benchmark's edge margin; real circuits span 813-2171 m, so each track
 carries its own `map_size` (bounding square + margins) rather than sharing
@@ -31,16 +31,17 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 TRACKS_DIR = os.path.normpath(os.path.join(_HERE, "..", "racetrack-database-master", "tracks"))
 
-# Benchmark dimensions (mirror racing/problem.py: track_width 16 m and the
+# Benchmark dimensions (mirror racing/problem.py: track_width 12 m and the
 # out-of-bounds margin of half a track width plus 2). One world unit is one
 # metre, same as the benchmark's simulation world.
 METERS_PER_UNIT = 1.0
-TRACK_WIDTH = 16.0
+TRACK_WIDTH = 12.0
 MARGIN = TRACK_WIDTH * 0.5 + 2.0
 # Distance from the world edge to the centerline bounding box. Must exceed
-# MARGIN (where the out-of-world check fires) by more than the road half
-# width plus the environment's off-track allowance (3 half-widths = 24 m),
-# so a car at the circuit's extremes always trips off_track before off_map.
+# MARGIN (where the out-of-world check fires) by more than the environment's
+# off-track limit (racing_env OFF_TRACK_LIMIT, 2 half-widths = 12 m from the
+# centreline), so a car at the circuit's extremes always trips off_track
+# before off_map; 3.5 half-widths (21 m) leaves 9 m to spare.
 PADDING = MARGIN + 3.5 * (TRACK_WIDTH * 0.5)
 
 
@@ -89,7 +90,7 @@ def load_track(name, tracks_dir=TRACKS_DIR, resample_spacing=None):
 
     Returns a dict:
         points        Nx2 centerline in world units (= metres), closed loop
-        track_width   constant benchmark width (16.0)
+        track_width   constant benchmark width (12.0)
         map_size      side of the square world holding this track (bounding
                       box max side + a margin on each edge)
         name          circuit name

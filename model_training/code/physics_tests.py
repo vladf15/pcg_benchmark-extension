@@ -1,8 +1,16 @@
 """Acceptance tests for the benchmark car physics.
 
-Scripted maneuvers on an open plane with pass ranges taken from the target
-car (992 Carrera S on track tires). Run after ANY physics change; each test
+Scripted maneuvers on an open plane. Run after ANY physics change; each test
 prints PASS/FAIL and the script exits nonzero on failure.
+
+Where the pass ranges come from.  Two bracket published figures of the 992
+Carrera S (Porsche 2020 technical data): top speed 285-315 km/h around the
+published 191 mph (307 km/h), and 0-60 mph 3.0-4.5 s around the published
+3.3 s with launch control and 3.5 s without.  The others are MODELLING CHOICES,
+with no published figure for this car behind them: braking 30-42 m, steady
+cornering 1.10-1.50 g, yaw overshoot under 0.30, lock-to-lock 0.6-1.6 s, and
+the qualitative tests (trail braking, load sensitivity, invariants).  Power
+oversteer is reported but not required (see test_power_oversteer).
 
     python physics_tests.py
 """
@@ -57,23 +65,26 @@ def check(name, value, lo, hi, unit=""):
 
 def test_acceleration():
     eng = _make()
-    t, t100 = 0.0, None
+    t, t60 = 0.0, None
     prev_v = 0.0
-    while t < 60.0:
+    # Top speed is drag limited, so the car closes on it slowly: 300.0 km/h
+    # at 60 s, 307.1 at 120 s, 307.4 from 200 s.  The run ends once a step
+    # adds under 0.0001 m/s, within 0.1 km/h of the settled speed.
+    while t < 300.0:
         eng.step({"steering": 0.0, "throttle": 1.0})
         t += eng.time_step
         v = _speed(eng)
-        if t100 is None and v >= 27.78:
-            t100 = t
-        if t > 30.0 and v - prev_v < 0.005:
+        if t60 is None and v >= 26.82:      # 60 mph
+            t60 = t
+        if t > 30.0 and v - prev_v < 0.0001:
             break
         prev_v = v
     print("acceleration:")
     # 3.0-4.5 s: the upper end allows for the traction-limited launch a
-    # 500 hp rear-drive car actually has. With combined slip solved
+    # 443 hp rear-drive car has. With combined slip solved
     # properly the tire spins off the line rather than delivering
     # whatever the engine asks, which costs ~0.3 s and is correct.
-    check("0-100 km/h", t100 if t100 else 99.0, 3.0, 4.5, " s")
+    check("0-60 mph", t60 if t60 else 99.0, 3.0, 4.5, " s")
     check("top speed", _speed(eng) * 3.6, 285, 315, " km/h")
 
 
@@ -112,8 +123,9 @@ def _steady_lat_g(eng, steer_norm, target_v, seconds=8.0):
 
 def test_cornering():
     # Max sustainable lateral g at 20 m/s. The steering grid stays in the
-    # physically meaningful band: at 20 m/s the grip limit (about 1.3 g)
-    # corresponds to roughly 5.5 deg of road-wheel angle, so commands far
+    # physically meaningful band: at 20 m/s the tyre limit (mu 1.3, which
+    # the car turns into about 1.11 g) corresponds to roughly 5.5 deg of
+    # road-wheel angle, so commands far
     # above that are beyond-limit inputs and MUST slide, not corner.
     best = 0.0
     for steer in np.arange(0.04, 0.40, 0.02):
@@ -146,6 +158,12 @@ def test_step_steer():
 
 
 def test_power_oversteer():
+    # Reported, not counted (user decision, 2026-10-02): with the 0.50 m cg
+    # height derived for the 992 (engine.py h_cg) the car no longer breaks
+    # the rear out under power here (body slip 2.9 degrees against a 6.9
+    # degree threshold; 7.2 at 0.47 m, the only height tried that passed),
+    # and the cited cg height is kept over the behaviour.
+    #
     # Hold a corner NEAR the limit (not beyond it), then floor the throttle:
     # the drive force must be able to break the rear out (no lateral-
     # priority clamp makes this impossible by construction). Detected as
@@ -172,9 +190,7 @@ def test_power_oversteer():
         if broke:
             break
     print("power-on oversteer (aids off):")
-    ok = broke
-    RESULTS.append(ok)
-    print(f"  [{'PASS' if ok else 'FAIL'}] rear breaks away under power: {broke}")
+    print(f"  [INFO] rear breaks away under power: {broke} (reported, not counted)")
 
 
 def test_trail_braking():
@@ -227,11 +243,9 @@ def test_load_sensitivity():
     ref = eng.load_rear_static
     mu_light = grip(0.6 * ref, ref) / (0.6 * ref)
     mu_heavy = grip(1.6 * ref, ref) / (1.6 * ref)
-    # Upper bound raised from 0.35 when the two engines were merged.  The old
-    # figure fitted a linear load-sensitivity model with a 10% coefficient;
-    # the engine now uses TORCS' published curve (lfMin 0.8, lfMax 1.6), which
-    # is steeper by construction and lands at 0.36.  The band tracks the model
-    # in use, so it follows TORCS rather than the model that was deleted.
+    # The engine uses TORCS' published load-sensitivity curve (lfMin 0.8,
+    # lfMax 1.6), which lands at 0.36; the 0.45 upper bound follows that
+    # curve.  A linear model with a 10% coefficient would stay under 0.35.
     check("mu drop from 0.6x to 1.6x load", mu_light - mu_heavy, 0.03, 0.45, "")
 
 
@@ -290,16 +304,15 @@ def test_invariants():
             eng.step({"steering": 0.3, "throttle": 0.8})
         out[n] = _speed(eng)
     spread = (max(out.values()) - min(out.values())) / max(out.values())
-    # Tolerance raised from 0.08 when the two engines were merged, because
-    # this manoeuvre starts from a standstill and the launch is now traction
-    # limited: first gear is short enough to spin the rear wheels, which puts
+    # The tolerance allows for this manoeuvre starting from a standstill,
+    # where the launch is traction limited: first gear is short enough to spin the rear wheels, which puts
     # the tire right on the peak of its curve, where the integrator is at its
     # stiffest.  That is the hardest case in the model, not a typical one.
-    # Measured on actual laps, the physics rate does not move the result:
-    # mean quality is 0.7587 / 0.7579 / 0.7581 at 100 / 200 / 400 Hz with the
-    # same laps finished, for four times the cost.  So the default stays at
-    # 100 Hz and this checks that the launch stays sane, not that it has
-    # converged to four figures.
+    # Measured on actual laps, the physics rate does not move the result
+    # (engine.py physics_substeps: mean quality 0.7719 / 0.7720 / 0.7669 at
+    # 50 / 100 / 200 Hz).  So the default stays at 50 Hz (5 substeps) and
+    # this checks that the launch stays sane, not that it has converged to
+    # four figures.
     check("substep convergence spread", spread, 0.0, 0.15, "")
 
 

@@ -4,42 +4,23 @@ import numpy as np
 
 
 class SteeringAgent:
-    """Path-following agent: pure-pursuit steering with a cross-track trim,
-    and a speed target taken from a precomputed speed profile.
+    """Path follower: pure-pursuit steering with a cross-track trim, tracking
+    a speed profile computed once per track, the standard racing-line way:
+    the corner limit v = sqrt(ay_max / curvature) at every point, a backward
+    pass (v^2 <= v_next^2 + 2 a_brake ds, so it brakes before corners) and a
+    forward pass (v^2 <= v_prev^2 + 2 a_accel ds).  a_brake and a_accel come
+    from the car, not constants: the grip a corner uses is not available
+    for braking or accelerating, and drivetrain, power and drag limit them
+    too (_available_ax).  Steering is normalised to [-1, 1]."""
 
-    The speed profile is the standard racing-line approach, computed once per
-    track in three steps:
-
-      1. Corner limit: at every path point the lateral grip bound gives a
-         maximum cornering speed  v = sqrt(ay_max / curvature).
-      2. Backward pass: driving toward a corner, speed may exceed the corner
-         limit only by what braking can shed over the remaining distance
-         (v^2 <= v_next^2 + 2 * a_brake * ds), so the car brakes *before*
-         corners instead of reacting inside them.
-      3. Forward pass: speed may rise out of a corner only as fast as the car
-         accelerates (v^2 <= v_prev^2 + 2 * a_accel * ds), so corner exits ramp
-         up smoothly instead of snapping to full throttle.
-
-    What makes the profile match the car rather than a set of hand-picked
-    constants is that a_brake and a_accel are not constants: grip is one
-    circle, so the share left for accelerating or braking depends on how much
-    the corner is already using, and both are also limited by the drivetrain,
-    by engine power at speed, and by drag.  See _available_ax.
-
-    act() then steers at a lookahead point and tracks the profile, which keeps
-    the per-step work small and the behavior explainable.  Steering output is
-    normalized to [-1, 1] for the engine.
-    """
-
-    def __init__(self, curve_points, track_width=12.0, max_speed=25.0, engine=None):
-        """Create a steering agent for the given path.
-
-        `engine` is an optional CarPhysicsEngine whose mass, grip and
-        drivetrain limits the speed profile is built from, so the plan is made
-        for the car that will actually drive it.  Without one the defaults
-        below describe the same 992 Carrera S.
-        """
+    def __init__(self, curve_points, track_width=12.0, max_speed=None, engine=None):
+        """`engine`: the CarPhysicsEngine whose limits the plan is built from
+        (defaults describe the same 992).  `max_speed` caps the plan, by
+        default the car's own 85.5 m/s (a 25 m/s cap held it to 24.1 m/s on
+        the circuits, against 61.7 uncapped)."""
         self.track_width = float(track_width)
+        if max_speed is None:
+            max_speed = getattr(engine, 'max_speed', 85.5)
         self.max_speed = float(max_speed)
 
         self.last_lookahead_point = None
@@ -47,100 +28,104 @@ class SteeringAgent:
         # ── Car parameters, read from the engine when one is supplied ──
         g = 9.81
         self.wheelbase       = float(getattr(engine, 'length', 2.45))
-        mass                 = float(getattr(engine, 'mass', 1555.0))
+        mass                 = float(getattr(engine, 'mass', 1534.0))
         tire_mu              = float(getattr(engine, 'tire_mu', 1.3))
         tire_mu_rear         = float(getattr(engine, 'tire_mu_rear', tire_mu))
-        rear_load_share      = float(getattr(engine, 'lf', 1.47)) /                                float(getattr(engine, 'length', 2.45))
+        rear_load_share      = (float(getattr(engine, 'lf', 1.47))
+                                / float(getattr(engine, 'length', 2.45)))
         max_drive_force      = float(getattr(engine, 'max_drive_force', 12700.0))
         max_brake_force      = float(getattr(engine, 'max_brake_force', 18700.0))
         self._max_power      = float(getattr(engine, 'max_power', 331000.0))
         self._mass           = mass
-        # Resistance the car always carries, subtracted from the acceleration
-        # it can plan on and added to what braking achieves.
+        # Resistance: against acceleration, with braking.
         self._drag_k         = 0.5 * float(getattr(engine, 'rho_air', 1.225)) \
-                                   * float(getattr(engine, 'cd_a', 0.60)) / mass
+                                   * float(getattr(engine, 'cd_a', 0.58)) / mass
         self._roll_a         = float(getattr(engine, 'c_rr', 0.015)) * g
 
-        # Fraction of the limit the plan aims for.  Not a fudge: a plan that
-        # asks for 100% of grip leaves the controller nothing to correct with,
-        # and racing bots (TORCS, Speed Dreams) plan corner speed at 80-90% for
-        # exactly that reason.  One factor for all three axes, so the margin is
-        # the same whichever direction the car is loaded in.
-        self.grip_utilisation = 0.9
+        # "Swept" below: the 24 circuits plus 20 random genomes per
+        # representation (racing, tile, hex, voronoi; seed 21, seed 7 for the
+        # final settings), 104 laps, one constant at a time, on the 16 m road
+        # (edge at 8 m): laps finished, tracks with any off-road step, the
+        # car's largest offset from the centreline, mean lap speed.  Not
+        # circles: they punish no aggressive correction, and gains that halve
+        # circle error measured far worse on generated tracks.
+        # calibration/driver_sweep.py.
 
-        # Tire limits.  Cornering and braking use every tire, so their ceiling
-        # is the whole car's grip.  ACCELERATING does not: this is a rear-drive
-        # car, and only the rear axle can push, so its ceiling is that axle's
-        # share of the weight against its own tire.  Planning acceleration
-        # against the whole car's grip asks for around 11.5 m/s^2 where the
-        # rear can deliver about 7.6, and the car simply spins its wheels on
-        # every corner exit instead of following the plan.
+        # Fraction of the limit the plan aims for (100% leaves nothing to
+        # correct with), one factor on every axis.  Swept at 1.12 g cornering
+        # (0.47 m cg), every other setting as below:
+        #
+        #   utilisation   laps     tracks off-road   worst offset   circuit speed
+        #   0.80          103/104        5           838 m            29.4 m/s
+        #   0.77          104/104        0           2.6 m (2.1)      28.9 m/s
+        #   0.75          104/104        0           1.8 m (1.7)      28.6 m/s
+        #   0.72          104/104        0           1.6 m            28.1 m/s
+        #
+        # (seed 7 in brackets.)  At 0.80 a car leaves the map on a hex track.
+        # 0.75 over 0.77 (1% slower) keeps more margin, since the search makes
+        # harder corners than random genomes.
+        self.grip_utilisation = 0.75
+
+        # Tyre limits: cornering and braking use every tyre; accelerating only
+        # the driven rear axle (planning on the whole car asks 11.5 m/s^2 of a
+        # rear that gives 7.6, and the wheels spin on every exit).
         self.ay_max          = self.grip_utilisation * tire_mu * g
         self.ax_max_brake_tires = self.ay_max
         self.ax_max_accel_tires = self.grip_utilisation * tire_mu_rear * rear_load_share * g
-        # Machine limits, separate from the tires exactly as TUM's
-        # trajectory_planning_helpers separates ggv (tire) from ax_max_machines
-        # (drivetrain): the tires say how much force the road will take, the
-        # drivetrain says how much the car can produce.
+        # Machine limits, separate from the tyres as TUM's
+        # trajectory_planning_helpers separates ggv from ax_max_machines.
         self.ax_max_drive  = self.grip_utilisation * max_drive_force / mass
         self.ax_max_brake  = self.grip_utilisation * max_brake_force / mass
-        # Friction-ellipse exponent.  1 is a diamond (linear trade), 2 a true
-        # ellipse; TUM's calc_vel_profile exposes the same parameter over the
-        # same range and 1.4 sits where measured tire data usually falls.
+        # Friction-ellipse exponent (1 linear, 2 an ellipse; the same parameter
+        # as TUM's calc_vel_profile, Heilmeier et al. 2020).  Swept: 1.0 costs
+        # 0.4 m/s, 2.0 takes a track off the road (12.0 m); 1.4 neither.
         self.friction_exponent = 1.4
-        self.min_speed     = 4.0    # never plan slower than this
 
-        # Steering law.  Lookahead grows with speed so the aim point stays
-        # roughly a fixed time ahead of the car.
+        # Lookahead grows with speed (a roughly fixed time ahead).  Swept: a
+        # 5 m base takes a track off the road, 12 m doubles the offset; gains
+        # 0.5 / 0.35 / 0.25 / 0.15 m per m/s give a median worst offset of 1.9
+        # / 1.5 / 1.3 / 1.0 m, and 0.1 or 0 the same as 0.15, the smallest that
+        # still grows with speed.  No cap needed (17 m at 62 m/s).
         self.lookahead_base = 8.0    # metres at standstill
-        self.lookahead_gain = 0.35   # extra metres per m/s of speed
-        self.lookahead_max  = 30.0
-        # Cross-track gain, tuned on generated tracks rather than on circles.
-        # A sweep over constant-radius circles prefers 1.6, which more than
-        # halves the tracking error there, and it is much worse where it
-        # matters: on real content it drops the two spline representations
-        # from 6 of 8 laps finished to 1 and 0.  Circles have no corner tight
-        # enough to punish an aggressive correction, and generated tracks are
-        # full of them, so the circle result does not transfer.
+        self.lookahead_gain = 0.15   # extra metres per m/s of speed
+        # Cross-track gain.  Circles prefer 1.6 (half their error), which drops
+        # the spline representations from 6 of 8 laps to 1 and 0.  At full top
+        # speed 0.2 raises the worst offset to 4.1 m, 0.5 takes a track off.
         self.stanley_k      = 0.35
+        # Keeps the Stanley term finite at a standstill; 0.5, 1.5 and 3 m/s
+        # measure the same (a modelling choice).
         self.stanley_v0     = 1.5
-        self.yaw_damp_gain  = 0.05   # seconds; rate feedback, see act()
-        # Divisor that turns a wanted wheel angle into the [-1, 1] command.  It
-        # equals the engine's steering lock, and the engine now applies that
-        # angle unaltered, so the command is exact at every speed.
+        # Yaw-rate feedback gain (s, see act()).  Without it 7 tracks leave the
+        # road; 0.05 / 0.1 / 0.15 / 0.2 s give a worst offset of 3.8 / 1.8 /
+        # 2.6 / 9.8 m.
+        self.yaw_damp_gain  = 0.1
+        # The engine's lock, which it applies unaltered: the command is exact.
         self.nominal_max_steer_rad = float(getattr(engine, 'max_steering',
                                                    math.radians(30.0)))
-        # Below this heading error (radians) on a near-centered car, hold
-        # straight instead of chasing tiny errors (deadzone stops twitching).
-        self.steer_deadzone_rad = math.radians(0.6)
 
-        # Slow down when the car drifts outside the usable corridor
-        # (half width minus a margin).
-        self.corridor_margin = max(1.0, 0.18 * self.track_width)
-
-        # Speed tracking: full throttle / full brake at these speed errors
-        # (m/s).  Braking is stiffer than accelerating so the car does not
-        # lag behind a falling profile and enter corners too fast.
+        # Full throttle / brake at these speed errors (m/s), proportional in
+        # between.  Mean circuit lap speed:
         #
-        # The throttle side is deliberately gentle.  First gear is short
-        # enough to overwhelm the rear tires, so flooring the pedal out of a
-        # slow corner spins them; a driver squeezes instead.  Swept over all
-        # five representations, laps finished run 34, 35, 35, 38, 37 at a
-        # deficit of 5, 8, 12, 18, 25 m/s, and off-road time falls from 0.104
-        # to 0.029 across the same range.
-        self.accel_deficit_full = 18.0
+        #   full throttle at   18    12     8     5     3     2     1
+        #   circuit speed    26.7  27.6  28.3  29.0  29.6  30.0  30.0 m/s
+        #
+        # Clean down to 2, at 1 a car leaves the map; 3 keeps one clean
+        # setting from the failure.  Full brake at 2.5 / 4 / 6: the first two
+        # clean, 6 takes 4 tracks off; 2.5 likewise keeps a margin.
+        self.accel_deficit_full = 3.0
         self.brake_excess_full  = 2.5
-        self.react_time         = 0.3
 
-        # Projection window (path indices): search a window around the last
-        # known segment so progress stays monotonic.
+        # Projection window (segments) around the last one, so progress is
+        # monotonic.  From the geometry: a step covers at most 8.6 m (under
+        # two 5 m segments), so 12 per step and 55 ahead never bind; 15 back
+        # covers a car sliding back after a spin.
         self.search_ahead = 55
         self.search_back = 15
         self.max_index_advance = 12
 
         self.current_idx = 0
         self._prev_angle = None      # for the yaw-rate estimate in act()
-        self._dt = 0.1               # engine control interval
+        self._dt = float(getattr(engine, 'time_step', 0.1))
         self.curve_points = curve_points  # setter precomputes everything
 
     # ── Path geometry and speed profile (once per track) ─────────────────
@@ -165,9 +150,6 @@ class SteeringAgent:
         seg_len = np.linalg.norm(seg, axis=1)
         seg_tan = np.zeros_like(seg)
         nonzero = seg_len > 1e-9
-        # Unit tangent per segment: divide each (x, y) by the segment length.
-        # reshape(-1, 1) turns the lengths into a column so numpy divides the
-        # x and y of each row by that row's length.
         seg_tan[nonzero] = seg[nonzero] / seg_len[nonzero].reshape(-1, 1)
 
         self._seg_a = pts[:-1]
@@ -185,20 +167,10 @@ class SteeringAgent:
         self._speed_profile = self._compute_speed_profile(pts, seg_tan, seg_len)
 
     def _available_ax(self, speed, curvature, braking):
-        """Longitudinal acceleration still available at `speed` on a corner of
-        `curvature`, in m/s^2 and always positive.
-
-        Lateral and longitudinal grip come out of one friction circle, so
-        whatever the corner is already using is not available for accelerating
-        or braking.  The trade follows the friction ellipse
-
-            ax_avail = ax_max * (1 - (ay_used / ay_max)^n)^(1/n)
-
-        which is the form TUM's calc_vel_profile uses, with n = 1 a linear
-        trade and n = 2 a true ellipse.  Whichever of the tires and the
-        drivetrain binds first wins, and drag and rolling resistance are then
-        applied with their real sign: they fight acceleration and help braking.
-        """
+        """Longitudinal acceleration left at `speed` on `curvature` (m/s^2,
+        >= 0): ax_max (1 - (ay_used / ay_max)^n)^(1/n), TUM's calc_vel_profile
+        form, the tighter of tyres and drivetrain, then drag and rolling
+        resistance with their real sign."""
         ay_used = speed * speed * abs(curvature)
         ratio = ay_used / self.ay_max
         if ratio >= 1.0:
@@ -214,8 +186,6 @@ class SteeringAgent:
         else:
             ax_machine = self.ax_max_drive
             if speed > 1e-3:
-                # Above the crossover the engine cannot deliver peak force any
-                # more and power sets the ceiling.
                 ax_power = self.grip_utilisation * self._max_power / (self._mass * speed)
                 if ax_power < ax_machine:
                     ax_machine = ax_power
@@ -232,9 +202,7 @@ class SteeringAgent:
         n = len(pts)
         m = len(seg_len)  # = n - 1 segments
 
-        # Curvature at each interior vertex: turn angle between the two
-        # adjacent segments divided by the local arc length.  Kept, because the
-        # passes below need to know how loaded the tires are at every point.
+        # Curvature at each interior vertex: turn angle over the local arc.
         curvature = np.zeros(n, dtype=float)
         for i in range(1, m):
             t0, t1 = seg_tan[i - 1], seg_tan[i]
@@ -256,12 +224,11 @@ class SteeringAgent:
         v_corner = np.full(n, self.max_speed, dtype=float)
         nonzero = curvature > 1e-12
         v_corner[nonzero] = np.sqrt(self.ay_max / curvature[nonzero])
-        profile = np.clip(v_corner, self.min_speed, self.max_speed)
+        profile = np.minimum(v_corner, self.max_speed)
 
-        # Backward pass: entering point i at profile[i] must allow braking down
-        # to profile[i+1] over segment i, at the deceleration actually left
-        # over once point i+1's corner has taken its share of the grip.  For
-        # closed loops run the pass twice so the constraint crosses the seam.
+        # Backward pass: point i must allow braking to profile[i+1] over
+        # segment i, at the deceleration left by i+1's corner; twice on a
+        # closed loop so the constraint crosses the seam.
         rounds = 2 if self._closed else 1
         for _ in range(rounds):
             for i in range(m - 1, -1, -1):
@@ -272,8 +239,7 @@ class SteeringAgent:
             if self._closed:
                 profile[-1] = profile[0] = min(profile[0], profile[-1])
 
-        # Forward pass: speed builds only as fast as the grip left over at
-        # point i allows, so a corner exit ramps up as the wheel unwinds.
+        # Forward pass: speed builds only as fast as the grip left at i allows.
         for _ in range(rounds):
             for i in range(m):
                 a = self._available_ax(profile[i], curvature[i], braking=False)
@@ -369,14 +335,8 @@ class SteeringAgent:
 
     @property
     def progress_fraction(self):
-        """Fraction of the lap reached, in [0, 1].
-
-        A fraction rather than a segment index because the two drivers index
-        different polylines: this agent walks the benchmark's own curve, while
-        RLAgent walks a ring TrackGeometry resamples at a fixed 3 m spacing,
-        about 10x as many points on a typical track.  RacingProblem compares
-        progress against a fraction of the lap, so it has to be handed one.
-        """
+        """Fraction of the lap reached, in [0, 1] (a fraction, since the two
+        drivers index different polylines)."""
         nseg = max(1, len(self.path_points) - 1)
         return float(min(max(int(self.current_idx), 0), nseg)) / nseg
 
@@ -393,20 +353,15 @@ class SteeringAgent:
     # ── Control ───────────────────────────────────────────────────────────
 
     def act(self, car_state):
-        """Return an action dict `{steering, throttle}` for the current state.
-
-        `car_state` is `[x, y, angle, speed, steering_angle, ...]`.  Later
-        elements carry body-frame velocity for the learned driver; a path
-        follower plans from the centerline and does not read them.
-        """
+        """{steering, throttle} for car_state [x, y, angle, speed, ...] (the
+        body-frame elements after are for the learned driver)."""
         x, y, angle, speed = car_state[0], car_state[1], car_state[2], car_state[3]
         if len(self.path_points) < 2:
             return {'steering': 0.0, 'throttle': 0.0}
         pos = np.array([float(x), float(y)])
         spd = float(speed)
 
-        # Track progress: project onto the path near the last known segment,
-        # never jumping backward past the window or too far forward at once.
+        # Progress: project near the last segment, within the window.
         seg_idx, proj = self._find_projection(pos, start_idx=self.current_idx)
         cur = int(self.current_idx)
         if seg_idx < cur:
@@ -416,13 +371,9 @@ class SteeringAgent:
         self.current_idx = int(seg_idx)
 
         # ── Steering: pure pursuit + cross-track trim + rate feedback ──
-        # Aiming from the car (not from its projection) means that when the
-        # car is pushed off the road, the geometry itself points back toward
-        # the track, so recovery needs no special case.
-        # lookahead_base already equals the smallest useful lookahead, so
-        # only the upper end needs clamping.
+        # Aimed from the car, not its projection, so off the road the geometry
+        # itself points back: recovery needs no special case.
         lookahead = self.lookahead_base + self.lookahead_gain * spd
-        lookahead = min(lookahead, self.lookahead_max)
         look_pt = self._point_at_distance_ahead(self.current_idx, proj, lookahead)
         self.last_lookahead_point = (float(look_pt[0]), float(look_pt[1]))
 
@@ -430,22 +381,11 @@ class SteeringAgent:
         heading_err = math.atan2(to_aim[1], to_aim[0]) - float(angle)
         heading_err = (heading_err + math.pi) % (2.0 * math.pi) - math.pi
 
-        # Pure pursuit: the wheel angle that puts the car on the circular arc
-        # through its current pose and the aim point,
-        #     delta = atan(2 * L * sin(eta) / ld),
-        # with ld the true distance to the aim point rather than the requested
-        # lookahead, since on a curve the two differ.  This is the geometry the
-        # car actually needs; using the heading error raw asks for 1.6x to 6x
-        # more than that and only stays stable if something downstream divides
-        # it back out.
-        #
-        # Past a quarter turn the geometry stops being usable: sin(eta) falls
-        # back toward zero as the aim point swings behind the car, so the arc
-        # solution asks for LESS steering the more wrong the car is pointed,
-        # and at 180 degrees it asks for none at all.  A car that overshoots a
-        # corner too tight to make would then drive away in a straight line.
-        # Outside the quarter turn the answer is simply full lock toward the
-        # aim point, which is the standard treatment of pursuit's blind spot.
+        # Pure pursuit (Coulter 1992): delta = atan(2 L sin(eta) / ld), the arc
+        # through the pose and the aim point, ld its true distance (the raw
+        # heading error asks 1.6-6x more).  Past a quarter turn sin(eta) falls
+        # back to zero and asks LESS steering the worse the heading, so there
+        # it is full lock toward the aim point, the standard treatment.
         ld = float(np.linalg.norm(to_aim))
         if ld <= 1e-6:
             delta_pursuit = 0.0
@@ -454,24 +394,20 @@ class SteeringAgent:
         else:
             delta_pursuit = math.atan2(2.0 * self.wheelbase * math.sin(heading_err), ld)
 
-        # Path curvature at the car, used below to tell the rate feedback what
-        # yaw rate the corner actually calls for.
         curvature_ref = 0.0
         if len(self._path_curvature) > 0:
             curvature_ref = float(self._path_curvature[
                 min(self.current_idx, len(self._path_curvature) - 1)])
         lat_off = self._signed_lateral_offset(pos, self.current_idx)
+        # Cross-track term of the Stanley controller (Hoffmann et al. 2007,
+        # Eq. 9), atan(k * e / (k_soft + v)); k_soft (stanley_v0) keeps it
+        # finite at a standstill, and they found 1 m/s appropriate.
         stanley = math.atan2(self.stanley_k * (-lat_off), spd + self.stanley_v0)
 
-        # Rate feedback.  The pursuit arc and the cross-track trim are both
-        # proportional terms, and on their own they ring: the car corrects, the
-        # yaw it built carries it past the line, and it corrects back.
-        #
-        # What is damped is the yaw rate ERROR against the rate the path itself
-        # calls for, v * curvature, not the yaw rate outright.  Damping the raw
-        # rate would fight steady cornering, where a large yaw rate is exactly
-        # what the corner needs; damping the error only resists rotating faster
-        # or slower than the corner asks for.
+        # Rate feedback, the k_d,yaw (r_meas - r_traj) term of Hoffmann et al.'s
+        # Eq. 9: the two proportional terms alone ring.  It damps the yaw rate
+        # ERROR against the path's v * curvature, not the raw rate, which
+        # would fight steady cornering.
         yaw_rate_measured = 0.0
         if self._prev_angle is not None:
             d = (float(angle) - self._prev_angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -482,34 +418,18 @@ class SteeringAgent:
 
         steer_rad = delta_pursuit + stanley + delta_damp
 
-        # Deadzone: on a near-straight aim, hold the wheel still rather than
-        # chasing sub-degree errors (removes idle twitching).
-        if abs(heading_err) < self.steer_deadzone_rad and abs(lat_off) < 0.5:
-            steer_rad = 0.0
-
         steering = steer_rad / self.nominal_max_steer_rad
         steering = min(max(steering, -1.0), 1.0)
 
-        # ── Throttle: track the speed profile over a short horizon ──
-        # Taking the minimum over now / react_time / 2*react_time ahead makes
-        # braking start early enough that the proportional controller does
-        # not lag behind a falling profile.
+        # ── Throttle: the profile at the car (it already brakes ahead) ──
+        # Reading the minimum 0.1-0.5 s ahead too costs 0.4-1.5 m/s for no
+        # tighter line.  No off-road slow-down or steering deadzone: neither
+        # engaged on the 104 laps swept.
         s_here = self._arc_position(self.current_idx, proj)
         total_len = float(self._cum_s[-1])
-        target = self.max_speed
-        for dt_ahead in (0.0, self.react_time, 2.0 * self.react_time):
-            s = s_here + spd * dt_ahead
-            if self._closed and total_len > 1e-9:
-                s = s % total_len
-            target = min(target, float(np.interp(s, self._cum_s, self._speed_profile)))
-
-        # Off the corridor the plan no longer applies: slow down instead.
-        half_width = 0.5 * self.track_width
-        corridor = max(1.0, half_width - self.corridor_margin)
-        abs_off = abs(lat_off)
-        if abs_off > corridor:
-            over = min((abs_off - corridor) / max(half_width - corridor, 1e-6), 1.0)
-            target = max(self.min_speed, target * (1.0 - 0.8 * over))
+        if self._closed and total_len > 1e-9:
+            s_here = s_here % total_len
+        target = float(np.interp(s_here, self._cum_s, self._speed_profile))
 
         err = target - spd
         if err >= 0.0:

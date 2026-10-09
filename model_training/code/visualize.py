@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
 import track_loader
+from baseline import make_policy
 from racing_env import RacingEnv
-from sanity_check import heuristic_policy
 
 
 def rollout(env, policy, track=None, options=None):
@@ -75,7 +75,7 @@ def plot_run(path, speeds, geom, info, ax=None, title=None):
     seg = np.stack([path[:-1], path[1:]], axis=1)
     lc = LineCollection(seg, cmap="viridis", linewidths=1.8)
     lc.set_array(speeds[:-1])
-    lc.set_clim(0.0, 83.0)
+    lc.set_clim(0.0, 85.5)     # the engine's max_speed
     ax.add_collection(lc)
     plt.colorbar(lc, ax=ax, label="speed (m/s)", shrink=0.75)
 
@@ -99,19 +99,6 @@ def plot_run(path, speeds, geom, info, ax=None, title=None):
     ax.legend(loc="upper right", fontsize=8)
     ax.set_xlabel("metres")
     return ax
-
-
-def make_policy(model_path):
-    """Heuristic policy, or a trained SB3 policy if a model path is given."""
-    if model_path is None:
-        return heuristic_policy, "heuristic"
-    from stable_baselines3 import PPO
-    model = PPO.load(model_path)
-
-    def _policy(obs):
-        action, _ = model.predict(obs, deterministic=True)
-        return action
-    return _policy, os.path.basename(model_path)
 
 
 def main():

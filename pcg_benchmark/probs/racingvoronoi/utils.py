@@ -13,7 +13,7 @@ def lloyd_relaxation(cell_sites: np.ndarray, num_iterations: int,
 
     Boundary-adjacent cells can have finite regions whose centroid lies far
     outside the map (their Voronoi vertices are unbounded in practice), which
-    would drag sites — and with them the whole diagram — off the canvas.
+    would drag sites, and with them the whole diagram, off the canvas.
     `bounds` (xmin, ymin, xmax, ymax) clamps every relaxed site back inside.
     """
     num_cells = len(cell_sites)
@@ -72,95 +72,133 @@ def _ray_bbox_intersect(
     return np.array([x0 + t * dx, y0 + t * dy], dtype=float)
 
 
-def build_voronoi_cell_graph(num_cells: int, box, voronoi_seed: int, lloyd_iterations: int = 2) -> dict:
-    """Generate a Voronoi grid covering `box`, without guard/boundary points.
+def generate_sites(num_cells: int, region, voronoi_seed: int, lloyd_iterations: int = 0,
+                   num_guard_points: int = 0, guard_outer=None, guard_inner=None) -> np.ndarray:
+    """Sites of the diagram: num_cells selectable sites drawn uniformly from
+    `region` (x0, y0, x1, y1), optionally Lloyd-relaxed, followed by
+    num_guard_points guard sites drawn uniformly from the `guard_outer`
+    rectangle minus the `guard_inner` one.  Guards give the cells near the
+    region's edge a neighbour beyond it, so those cells close; they take
+    indices num_cells and up and are never selectable.  The same draws as
+    racingvoronoiold's build_voronoi_cell_graph, so equal seeds give equal
+    sites."""
+    x0, y0, x1, y1 = (float(v) for v in region)
+    rng = np.random.default_rng(voronoi_seed)
+    cell_sites = rng.uniform(low=[x0, y0], high=[x1, y1], size=(num_cells, 2)).astype(float)
+    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations, bounds=(x0, y0, x1, y1))
+    guards = []
+    if num_guard_points > 0:
+        ox0, oy0, ox1, oy1 = (float(v) for v in guard_outer)
+        ix0, iy0, ix1, iy1 = (float(v) for v in guard_inner)
+        while len(guards) < num_guard_points:
+            gx, gy = rng.uniform(low=[ox0, oy0], high=[ox1, oy1])
+            if not (ix0 <= gx <= ix1 and iy0 <= gy <= iy1):
+                guards.append((float(gx), float(gy)))
+    return np.vstack([cell_sites, np.asarray(guards, dtype=float).reshape(-1, 2)])
 
-    `box` is (x0, y0, x1, y1), the region the track may occupy.  Scattering the
-    sites over exactly that region rather than over the whole map is what keeps
-    the cells large: a cell is only selectable if its polygon stays inside the
-    box, so sites spread wider would push most of the diagram out of reach and
-    force a much finer, more corner-dense grid to compensate.
 
-    Cells with semi-infinite edges are added to boundary_cells (ineligible for selection).
-    Each semi-infinite edge is clipped to the bounding box and appended to the vertex/edge
-    arrays so the full diagram renders correctly.
+def build_power_cell_graph(sites: np.ndarray, num_cells: int, weights: np.ndarray,
+                           clip_box) -> dict:
+    """Power diagram (Laguerre-Voronoi diagram) of weighted sites.
+
+    The cell of site i is the set of points p where |p - s_i|^2 - w_i is
+    smallest (Aurenhammer 1987).  With every weight equal it is the Voronoi
+    diagram.  A larger weight moves each edge of that cell away from its site:
+    the edge between i and j stays perpendicular to s_i s_j and shifts by
+    (w_i - w_j) / (2 |s_i - s_j|) toward j.  A cell can also be empty, when
+    its neighbours' weights exceed its own by enough.
+
+    Built as Aurenhammer does, by lifting each site to (x, y, x^2 + y^2 - w)
+    and taking the lower convex hull: each lower facet is a vertex of the
+    diagram (the point with equal power to its three sites), two lower facets
+    sharing an edge give the diagram edge between that edge's two sites, and
+    a lower facet edge on the hull's rim gives a semi-infinite edge.  A site
+    on no lower facet has an empty cell.  Why not scipy.spatial.Voronoi: it
+    has no weights.  Why not a raster (label each pixel by least power): the
+    track runs along the cell edges, and a raster would move them by up to a
+    pixel and turn every straight edge into a staircase.
+
+    `weights` holds one weight per site, guards included (m^2).  Semi-infinite
+    edges are cut at `clip_box` (x0, y0, x1, y1) so the full diagram can be
+    drawn; their cells are boundary cells and never selectable.
 
     Returns a dict with:
-        cell_sites          (N, 2) float
-        voronoi_vertices    (V, 2) float     - finite vertices + clipped ray endpoints.
-        all_edges_full      (E, 2) int
-        all_edge_pairs_full (E, 2) int
-        cell_neighbours     list[list[int]]
-        boundary_cells      set[int]
+        cell_sites          (num_cells, 2) float, the selectable sites
+        voronoi_vertices    (V, 2) float, diagram vertices + clipped ray ends
+        all_edges_full      (E, 2) int, vertex index pairs
+        all_edge_pairs_full (E, 2) int, the two sites each edge separates
+        cell_neighbours     list[list[int]], selectable neighbours per cell
+        boundary_cells      set[int], selectable cells with a semi-infinite edge
+        empty_cells         set[int], selectable cells with no region
     """
-    x0, y0, x1, y1 = (float(v) for v in box)
-
-    cell_sites = np.random.default_rng(voronoi_seed).uniform(
-        low=[x0, y0], high=[x1, y1], size=(num_cells, 2),
-    ).astype(float)
-
-    cell_sites = lloyd_relaxation(cell_sites, lloyd_iterations, bounds=(x0, y0, x1, y1))
-
+    sites = np.asarray(sites, dtype=float)
+    w = np.asarray(weights, dtype=float).ravel()
+    cx0, cy0, cx1, cy1 = (float(v) for v in clip_box)
+    # Centred before lifting, which the power function does not notice and
+    # which keeps the lifted z coordinates small enough for Qhull.
+    origin = sites.mean(axis=0)
+    local = sites - origin
+    lifted = np.column_stack([local, np.sum(local * local, axis=1) - w])
     try:
-        voronoi = scipy.spatial.Voronoi(cell_sites) 
+        hull = scipy.spatial.ConvexHull(lifted)
     except scipy.spatial.QhullError:
-        rng = np.random.default_rng(voronoi_seed)
-        cell_sites = cell_sites + rng.normal(scale=1e-6, size=cell_sites.shape)
-        voronoi = scipy.spatial.Voronoi(cell_sites)
+        rng = np.random.default_rng(0)
+        hull = scipy.spatial.ConvexHull(lifted + rng.normal(scale=1e-6, size=lifted.shape))
+    eq = hull.equations
+    lower = eq[:, 2] < 0.0
+    # The lower facet z = a x + b y + c holds the point with equal power to
+    # its three sites at (a / 2, b / 2).
+    facet_vertex = {}
+    vertices = []
+    for f in np.flatnonzero(lower):
+        a, b = -eq[f, 0] / eq[f, 2], -eq[f, 1] / eq[f, 2]
+        facet_vertex[int(f)] = len(vertices)
+        vertices.append(origin + 0.5 * np.array([a, b]))
 
-    center   = cell_sites.mean(axis=0)
-    vertices = list(np.asarray(voronoi.vertices, dtype=float))
-
-    edges_dict:     dict[tuple[int, int], tuple[int, int]] = {}
-    boundary_cells: set[int]                               = set()
-    neighbour_sets: list[set[int]]                         = [set() for _ in range(num_cells)]
-
-    for (va, vb), (p1, p2) in zip(voronoi.ridge_vertices, voronoi.ridge_points):
-        p1, p2 = int(p1), int(p2)
-
-        if va >= 0 and vb >= 0:
-            edges_dict[(min(va, vb), max(va, vb))] = (p1, p2)
-            neighbour_sets[p1].add(p2)
-            neighbour_sets[p2].add(p1)
-        else:
-            boundary_cells.add(p1)
-            boundary_cells.add(p2)
-            finite_v = va if va >= 0 else vb
-            tangent  = cell_sites[p2] - cell_sites[p1]
-            normal   = np.array([-tangent[1], tangent[0]], dtype=float)
-            nlen     = np.linalg.norm(normal)
+    edges, pairs = [], []
+    boundary_cells: set[int] = set()
+    neighbour_sets: list[set[int]] = [set() for _ in range(num_cells)]
+    on_lower = set()
+    for f in np.flatnonzero(lower):
+        f = int(f)
+        simplex = hull.simplices[f]
+        on_lower.update(int(v) for v in simplex)
+        for k in range(3):
+            p1, p2 = (int(v) for v in np.delete(simplex, k))
+            nb = int(hull.neighbors[f][k])
+            if lower[nb]:
+                if f < nb:                          # each shared edge once
+                    edges.append((facet_vertex[f], facet_vertex[nb]))
+                    pairs.append((p1, p2))
+                    if p1 < num_cells and p2 < num_cells:
+                        neighbour_sets[p1].add(p2)
+                        neighbour_sets[p2].add(p1)
+                continue
+            # Rim of the lower hull: a semi-infinite edge, perpendicular to
+            # s1 s2 and heading away from the facet's third site.
+            boundary_cells.update(p for p in (p1, p2) if p < num_cells)
+            tangent = sites[p2] - sites[p1]
+            normal = np.array([-tangent[1], tangent[0]])
+            nlen = float(np.linalg.norm(normal))
             if nlen < 1e-10:
                 continue
             normal /= nlen
-            if np.dot(normal, (cell_sites[p1] + cell_sites[p2]) * 0.5 - center) < 0:
+            if np.dot(normal, sites[int(simplex[k])] - sites[p1]) > 0:
                 normal = -normal
-            # Clipped against the build box, the same rectangle the caller
-            # tests cells against.  Clipping from 0 instead put the low ends
-            # one border width outside it while the high ends landed on it, so
-            # the diagram overhung on two sides and not the other two.
-            clipped = _ray_bbox_intersect(
-                voronoi.vertices[finite_v], normal, x0, x1, y0, y1)
+            clipped = _ray_bbox_intersect(vertices[facet_vertex[f]], normal, cx0, cx1, cy0, cy1)
             if clipped is not None:
-                new_idx = len(vertices)
+                edges.append((facet_vertex[f], len(vertices)))
+                pairs.append((p1, p2))
                 vertices.append(clipped)
-                edges_dict[(finite_v, new_idx)] = (p1, p2)
-
-    voronoi_vertices = np.array(vertices, dtype=float)
-    sorted_keys      = sorted(edges_dict)
-    if sorted_keys:
-        all_edges_full      = np.array(sorted_keys,                          dtype=int)
-        all_edge_pairs_full = np.array([edges_dict[k] for k in sorted_keys], dtype=int)
-    else:
-        all_edges_full      = np.zeros((0, 2), dtype=int)
-        all_edge_pairs_full = np.zeros((0, 2), dtype=int)
 
     return {
-        'cell_sites':          cell_sites,
-        'voronoi_vertices':    voronoi_vertices,
-        'all_edges_full':      all_edges_full,
-        'all_edge_pairs_full': all_edge_pairs_full,
-        'cell_neighbours':     [sorted(s) for s in neighbour_sets],
+        'cell_sites':          sites[:num_cells],
+        'voronoi_vertices':    np.asarray(vertices, dtype=float).reshape(-1, 2),
+        'all_edges_full':      np.asarray(edges, dtype=int).reshape(-1, 2),
+        'all_edge_pairs_full': np.asarray(pairs, dtype=int).reshape(-1, 2),
+        'cell_neighbours':     [sorted(n) for n in neighbour_sets],
         'boundary_cells':      boundary_cells,
+        'empty_cells':         {i for i in range(num_cells) if i not in on_lower},
     }
 
 
@@ -230,7 +268,8 @@ def find_boundary_cycle(boundary_edges: np.ndarray, voronoi_vertices: np.ndarray
             continue
 
         positions = voronoi_vertices[np.array(cycle, dtype=int)]
-        perimeter = float(np.sum(np.linalg.norm(positions[1:] - positions[:-1], axis=1)))
+        # Closed perimeter: the last vertex joins the first.
+        perimeter = float(np.sum(np.linalg.norm(np.roll(positions, -1, axis=0) - positions, axis=1)))
         if perimeter > longest_perimeter:
             longest_perimeter = perimeter
             best_cycle        = cycle

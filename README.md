@@ -21,6 +21,63 @@ This repo contains the framework that is used in our paper: [https://arxiv.org/a
 }
 ```
 
+## Racing extension (MSc thesis)
+
+This fork adds 2D racetrack generation to the benchmark: seven problems
+that share one quality function, one car (a two-axle model of a Porsche 911
+Carrera S, `pcg_benchmark/probs/racing/engine.py`) and one driver (a PPO
+policy, `model_training/runs/run16/selected/policy.zip`), and differ only in
+how a genome becomes a track.
+
+| Problem | Representation | In the thesis comparison |
+|---|---|---|
+| `racing-v0` | spline through evolved control points | yes |
+| `racingtile-v0` | square tiles, genome-guided Wave Function Collapse | yes |
+| `racingtilehex-v0` | hexagonal tiles, the same method | yes |
+| `racingtilediag-v0` | square tiles with roads through cell corners | yes |
+| `racingtilehexdiag-v0` | hexagonal tiles with roads through cell corners | yes |
+| `racingvoronoi-v0` | cell cluster on an evolved power diagram | yes |
+| `racingradial-v0` | polar control points | no |
+
+`racingvoronoiold-v0` is the earlier Voronoi representation, kept for
+comparison; nothing the thesis reports runs it. `model_training/runs/`
+holds the driver (`run20/selected`, trained on the 12 m road) and its
+parent run16.
+
+`thesis/CODE_EXPLAINED.md` (in the thesis folder next to this repository)
+walks through the code. Every tuned constant cites, in its comment, the
+script in `model_training/code/calibration/` that measured it.
+
+### Reproducing
+
+```
+pip install -r requirements.txt
+pip install -e .
+python model_training/code/memcap.py 3000 tests/test_racing.py
+```
+
+`tests/test_racing.py` checks determinism, the validity gates, the FIA
+rules, that the typicality constants match a fresh fit on the reference
+circuits, which circuits reach quality 1.0, the physics harness
+(`model_training/code/physics_tests.py`, 12 counted checks) and the
+regression reference (`model_training/code/regression_check.py`, scores
+pinned to 1e-9). The last two take several minutes; `RACING_SLOW=0` skips
+them. The experiments (search runs, statistics) are in the sibling
+repository `benchmark_experiments-extension`: its `tools/` folder holds
+`run_batch.py`, `view_track.py` (the viewer for saved runs and the reference
+circuits), `thesis_stats.py` and `torcs_check.py`; `run.py`,
+`data_processing.py` and `generators/` are the upstream files.
+
+`memcap.py` runs a script under a hard memory cap and needs Windows. On
+other systems, run the scripts with `python` directly.
+
+### Data and licences
+
+The 24 reference circuits are the TUMFTM racetrack database (Heilmeier et
+al. 2020), distributed under the GNU LGPL v3 in
+`model_training/racetrack-database-master`. The upstream benchmark is by
+Khalifa et al. (2025); see `LICENSE.md`.
+
 ## Installation
 There is two ways to install this repo, directly from github or by cloning locally then installing it
 

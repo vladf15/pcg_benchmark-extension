@@ -2,14 +2,14 @@
 
 Three groups of functions:
 - Spline interpolation (`interpolate_curves`): turn sparse control points
-  into the dense closed Kochanek-Bartels curve that simulation, scoring,
+  into the dense closed centripetal Catmull-Rom curve that simulation, scoring,
   and rendering all run on.
 - Self-intersection counting (`count_self_intersections`,
   `count_track_area_intersections`): the geometry soundness checks behind
-  quality()'s geom_score.  Both use a uniform grid to prune segment pairs,
+  the self-overlap gate in quality().  Both use a uniform grid to prune segment pairs,
   so they stay near-linear in the number of segments.
-- `lowest_turn_seam_index`: picks the smoothest vertex of a closed loop so
-  the start/finish seam never sits in the middle of a corner.
+- Turning functions (`turning_function`, `turning_distance`): the shape
+  comparison behind diversity().
 """
 import functools
 from typing import Dict, List, Set, Tuple
@@ -25,35 +25,77 @@ def _points_as_tuples(points):
     return tuple(tuple(p) for p in np.asarray(points))
 
 
-def lowest_turn_seam_index(points) -> int:
-    """Index of the vertex with the smallest local turn angle.
+def turning_function(curve, samples=128):
+    """Turning function of a closed curve (Arkin et al. 1991).
 
-    Used to place the seam of a closed loop at its smoothest spot, so the
-    start/end joint does not sit in the middle of a corner.
-    """
-    pts = np.asarray(points, dtype=float)
-    n = len(pts)
-    best_i = 0
-    best_ang = float('inf')
-    for i in range(n):
-        v1 = pts[i] - pts[(i - 1) % n]
-        v2 = pts[(i + 1) % n] - pts[i]
-        n1 = float(np.linalg.norm(v1))
-        n2 = float(np.linalg.norm(v2))
-        if n1 < 1e-6 or n2 < 1e-6:
-            continue
-        d = float(np.dot(v1, v2) / (n1 * n2))
-        d = max(-1.0, min(1.0, d))
-        ang = float(np.arccos(d))
-        if ang < best_ang:
-            best_ang = ang
-            best_i = i
-    return best_i
+    The heading of the curve as a function of arc length, with arc length
+    normalised to [0, 1) and the heading unwrapped, so it rises by 2*pi per
+    lap.  Returns (headings at `samples` evenly spaced arc positions,
+    winding number), or None for a curve with fewer than three distinct
+    points.  The function is a step function between the curve's vertices,
+    as in the paper.
+
+    The loop is traced anticlockwise.  A decoder's choice of direction is not
+    part of the layout, and left unoriented a track against itself traced
+    backwards measured a distance of 1.07 (in the pi units diversity() uses),
+    more than any pair of distinct reference circuits oriented the same way
+    (max 0.96).  Oriented, it measures 0.024.
+
+    128 samples: on the 24 reference circuits the p10, median and p90
+    pairwise distances are 0.293 / 0.382 / 0.474 at 128, 0.293 / 0.382 /
+    0.475 at 256 and 0.295 / 0.387 / 0.477 at 64, and a comparison costs
+    0.10 ms at 128 against 0.32 ms at 256."""
+    c = np.asarray(curve, dtype=float).reshape(-1, 2)
+    if len(c) > 1 and np.allclose(c[0], c[-1]):
+        c = c[:-1]
+    seg = np.roll(c, -1, axis=0) - c
+    seg_len = np.linalg.norm(seg, axis=1)
+    keep = seg_len > 1e-9
+    if np.count_nonzero(keep) < 3:
+        return None
+    seg, seg_len = seg[keep], seg_len[keep]
+    heading = np.arctan2(seg[:, 1], seg[:, 0])
+    turn = np.angle(np.exp(1j * (np.roll(heading, -1) - heading)))
+    winding = int(round(float(np.sum(turn)) / (2.0 * np.pi)))
+    if winding < 0:
+        return turning_function(c[::-1], samples)
+    theta = heading[0] + np.concatenate([[0.0], np.cumsum(turn[:-1])])
+    start = np.concatenate([[0.0], np.cumsum(seg_len)[:-1]]) / float(np.sum(seg_len))
+    at = np.arange(samples) / float(samples)
+    return theta[np.searchsorted(start, at, side="right") - 1], winding
+
+
+def turning_distance(tf1, tf2):
+    """Arkin et al.'s (1991) L2 distance between two turning functions, in
+    radians: the root-mean-square heading difference, minimised over the
+    start point of one curve (every cyclic shift of the samples) and over a
+    rotation (a constant heading offset, whose optimum is the mean
+    difference, so the residual is the standard deviation).  The distance
+    is unchanged by translating, rotating or scaling either curve."""
+    h1, w1 = tf1
+    h2, w2 = tf2
+    n = len(h1)
+    idx = np.arange(n)[:, None] + np.arange(n)[None, :]
+    # Shifting past the end of the lap continues into the next lap, which
+    # sits 2*pi*winding higher.
+    diff = h1[idx % n] + 2.0 * np.pi * w1 * (idx >= n) - h2[None, :]
+    var = np.mean(diff * diff, axis=1) - np.mean(diff, axis=1) ** 2
+    return float(np.sqrt(max(float(np.min(var)), 0.0)))
 
 
 @functools.lru_cache(maxsize=128)
 def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
-    """Closed (periodic) Kochanek-Bartels spline polyline.
+    """Closed (periodic) centripetal Catmull-Rom spline polyline.
+
+    Each segment p1 -> p2 is a cubic Hermite curve.  Its end tangents are the
+    Catmull-Rom ones with the knot spacing of each chord set to the square
+    root of the chord length (centripetal parameterization, Yuksel, Schaefer
+    and Keyser 2011).  With equal spacing (uniform Catmull-Rom) a segment
+    next to a short chord or a sharp control point can loop or form a cusp;
+    centripetal spacing rules both out within a segment.  Measured on 40
+    random racing genomes (seed 21): the centreline crosses itself on 25
+    tracks with uniform spacing, 13 with centripetal and 19 with chordal
+    (spacing = chord length).
 
     Returns an explicitly closed polyline (last point equals first).
     """
@@ -83,29 +125,24 @@ def interpolate_curves_closed_cached(points_tuple, samples_per_segment=20):
 
     for i in range(1, n + 1):
         p0, p1, p2, p3 = pad[i - 1], pad[i], pad[i + 1], pad[i + 2]
-        # Neutral spline parameters (Catmull-Rom-style tangents).
-        m1 = 0.5 * (p2 - p0)
-        m2 = 0.5 * (p3 - p1)
+        # Knot spacing of the three chords: the square root of each length.
+        d0, d1, d2 = (max(float(np.linalg.norm(b - a)) ** 0.5, 1e-9)
+                      for a, b in ((p0, p1), (p1, p2), (p2, p3)))
+        # Catmull-Rom tangents at p1 and p2 for that spacing, scaled to this
+        # segment.  With d0 = d1 = d2 they reduce to 0.5 (p2 - p0), 0.5 (p3 - p1).
+        m1 = ((p1 - p0) / d0 - (p2 - p0) / (d0 + d1) + (p2 - p1) / d1) * d1
+        m2 = ((p2 - p1) / d1 - (p3 - p1) / (d1 + d2) + (p3 - p2) / d2) * d1
         pts = h1 * p1 + h2 * p2 + h3 * m1 + h4 * m2
         curve_points[idx:idx + samples_per_segment] = pts
         idx += samples_per_segment
 
     curve_points[-1] = points[0]
 
-    # Place the seam at a low-curvature location to avoid a visible kink.
-    poly = curve_points[:-1]
-    if len(poly) >= 4:
-        best_i = lowest_turn_seam_index(poly)
-        if best_i != 0:
-            poly = np.vstack([poly[best_i:], poly[:best_i]])
-            curve_points[:-1] = poly
-            curve_points[-1] = poly[0]
-
     return curve_points
 
 
 def interpolate_curves(points, samples_per_segment=20):
-    """Interpolate control points into a Kochanek-Bartels spline polyline.
+    """Interpolate control points into a centripetal Catmull-Rom polyline.
 
     Racing tracks are closed circuits, so the spline is always periodic."""
     pts = np.asarray(points)
@@ -290,6 +327,44 @@ def _count_polyline_crossings_grid(
     return count
 
 
+def local_radius(points: np.ndarray) -> np.ndarray:
+    """Radius of the circle through each sample and its two neighbours, on a
+    closed curve (first point repeated at the end or not)."""
+    c = np.asarray(points, dtype=float).reshape(-1, 2)
+    if len(c) > 1 and np.allclose(c[0], c[-1], atol=1e-9, rtol=0.0):
+        c = c[:-1]
+    if len(c) < 3:
+        return np.full(len(c), np.inf)
+    a, b = np.roll(c, 1, axis=0), np.roll(c, -1, axis=0)
+    cross = np.abs((c - a)[:, 0] * (b - a)[:, 1] - (c - a)[:, 1] * (b - a)[:, 0])
+    return (np.linalg.norm(c - a, axis=1) * np.linalg.norm(b - c, axis=1)
+            * np.linalg.norm(b - a, axis=1) / np.maximum(2.0 * cross, 1e-12))
+
+
+def fold_count(points: np.ndarray, track_width: float) -> int:
+    """Samples of a closed centreline where the road's inner edge folds: the
+    local radius (local_radius) is under half the track width.
+
+    Where a curve's radius of curvature is under the offset distance d, the
+    offset curve at d passes a cusp and runs back on itself (Farouki and
+    Neff 1990, Analytic properties of plane offset curves, Computer Aided
+    Geometric Design 7: the offset is irregular where the curvature is
+    1/d), so the inner road edge overlaps itself there.
+
+    Why the radius and not the drawn edges: compute_offset_edges moves each
+    sample along the bisector of its two segments by half the width, and
+    that polyline only runs backwards once the turn at one 5 m sample passes
+    2 asin(5 / width), 77 degrees at 16 m, against 36 degrees for the fold
+    itself (a 5 m step turning 36 degrees is an 8 m radius).  Measured on the
+    seed-1 runs' final tracks (TORCS arc radius, the same quantity at the
+    5 m step): 124 of 200 spline and 38 of 100 Voronoi tracks had a sample
+    under 8 m, 109 and 14 of them at quality 1.0, and the edge crossing
+    tests below caught 7 and 1 of them; no tile track had one.  Of the 24
+    reference circuits only Shanghai has one, and it already failed on that
+    fold.  The radius is the one _overlap_spot uses to place a repair."""
+    return int(np.count_nonzero(local_radius(points) < 0.5 * float(track_width)))
+
+
 def count_track_area_intersections(
     points: np.ndarray,
     track_width: float,
@@ -299,10 +374,14 @@ def count_track_area_intersections(
     """Count intersections in the rendered track area (accounts for width).
 
     We approximate the road boundaries as left/right offset polylines and flag:
+    - samples where the inner edge folds (fold_count)
     - left edge self-intersections
     - right edge self-intersections
     - left/right edge crossovers
     """
+    folds = fold_count(points, track_width)
+    if folds > 0:
+        return folds
     left_edge, right_edge = compute_offset_edges(points, track_width=float(track_width))
     left_self = count_self_intersections(left_edge)
     if left_self > 0:

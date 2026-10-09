@@ -32,9 +32,6 @@ FIELDS = ["track", "outcome", "finished", "progress_frac", "offroad_frac",
           "laptime_steps", "laptime_s", "length_m", "mean_speed",
           "max_speed", "grip_used", "slip_p95", "steer_jerk", "reward"]
 
-# Tire grip limit, for reporting how much of it a policy actually uses.
-_MU = 1.3
-_MASS = 1500.0
 _G = 9.81
 
 
@@ -51,7 +48,9 @@ def _grip_and_slip(env):
     car = env.car_state
     engine = getattr(env._physics, "_engine", None)
     forces = getattr(engine, "debug_forces", None)
-    grip = abs(forces[6]) / (_MASS * _G * _MU) if forces else float("nan")
+    # Against the car's own weight and tyre mu (1534 kg, 1.3).
+    grip = (abs(forces[6]) / (engine.mass * _G * engine.tire_mu)
+            if forces else float("nan"))
     slip = abs(math.degrees(math.atan2(car.v_lateral, max(car.v_forward, 0.5))))
     return grip, slip
 
@@ -114,7 +113,7 @@ def make_policy(model_path):
     def _policy(obs):
         action, _ = model.predict(obs, deterministic=True)
         return action
-    return _policy, os.path.basename(model_path)
+    return _policy, os.path.splitext(os.path.basename(model_path))[0]
 
 
 def main():

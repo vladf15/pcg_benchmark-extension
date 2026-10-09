@@ -1,6 +1,6 @@
 """Precomputed geometry for a closed racetrack centerline.
 
-Takes a centerline polyline (map units, already scaled by track_loader),
+Takes a centerline polyline (metres, as track_loader loads it),
 resamples it to uniform spacing and precomputes everything the RL
 environment asks about every step:
 
@@ -149,12 +149,10 @@ class TrackGeometry:
         out = np.empty(len(edges) - 1)
         i0 = int(round((s % self.length) / self.spacing))
         for b in range(len(edges) - 1):
-            # Offsets are relative to i0; keep them relative until the end.
-            # (A previous version compared the upper offset against the
-            # ABSOLUTE lower index, which made every band scan to roughly
-            # twice the car's position: every band saw every corner within
-            # 2*s, phantom hairpins pinned the speed target everywhere, and
-            # the scripted driver crawled at ~9 m/s on every circuit.)
+            # Offsets are relative to i0 until the modulo below.  Comparing
+            # an offset with the absolute index would make every band scan
+            # to about twice the car's position and see every corner within
+            # 2 s.
             lo = int(np.floor(edges[b] / self.spacing))
             hi = max(int(np.ceil(edges[b + 1] / self.spacing)), lo + 1)
             idx = np.arange(i0 + lo, i0 + hi) % self.n

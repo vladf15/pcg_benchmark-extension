@@ -15,14 +15,21 @@ import argparse
 import numpy as np
 from gymnasium.utils.env_checker import check_env
 
-from racing_env import RacingEnv
+from racing_env import EngineBackedPhysics, RacingEnv
+from track_loader import TRACK_WIDTH
 
 
-_TOP_SPEED = 83.0      # engine max speed, m/s
-# Usable fractions of what the car can actually do (measured: 1.30 g of
-# cornering grip, 1.20 g of braking). A competent-but-not-heroic driver
-# leaves some margin; these are the two knobs that set how hard the
-# scripted baseline pushes.
+# The car the observation describes: obs[0] is forward speed over the
+# engine's max_speed and a steering command of 1 is its max_steering.
+_PHYSICS = EngineBackedPhysics()
+_TOP_SPEED = _PHYSICS.max_speed                    # 85.5 m/s
+_STEER_LOCK = _PHYSICS.max_steering                # 30 degrees
+_WHEELBASE = float(_PHYSICS._engine.length)        # 2.45 m
+# Usable fractions of what the car can do (tyre mu 1.3; physics_tests
+# measure 1.11 g sustained cornering and 1.20 g braking). A
+# competent-but-not-heroic driver leaves some margin; these are the two
+# knobs that set how hard the scripted baseline pushes.  0.65 is a MODELLING
+# CHOICE, not swept.
 _GRIP_FRAC = 0.65
 _MU_G = _GRIP_FRAC * 1.3 * 9.81      # usable cornering accel (m/s^2)
 # Assumed braking decel must be close to the real value. Setting it far
@@ -51,7 +58,7 @@ def heuristic_policy(obs):
     # tuned at 15 m/s saturate the tires at 40. Ask for an acceleration,
     # convert to curvature, then to a wheel angle. Lateral error is the P
     # term, v * heading_err its derivative along the path.
-    lateral_m = lateral * 8.0                  # half width is 8 m
+    lateral_m = lateral * 0.5 * TRACK_WIDTH    # lateral is in half-widths
     a_des = -0.5 * lateral_m - 1.4 * speed * heading_err
     # The correction budget scales with heading error: a small cap trims
     # the line nicely but is far too weak to catch a slide (at 1.3 rad of
@@ -60,13 +67,13 @@ def heuristic_policy(obs):
     a_cap = 4.0 + urgency * (_MU_G - 4.0)
     kappa_cmd = curv_now + np.clip(a_des, -a_cap, a_cap) / max(speed, 5.0) ** 2
 
-    # Wheel angle: kinematic (wheelbase 3 m) + small understeer allowance,
+    # Wheel angle: kinematic (the car's wheelbase) + small understeer allowance,
     # then countersteer into any slide. Countersteer is what a path-only
     # controller lacks: a slide is not a path error yet, so without this
     # the car leaves the track sideways with the wheel nearly straight.
     body_slip = np.arctan2(v_lateral, max(speed, 3.0))
-    wheel_angle = (3.0 + 0.002 * speed ** 2) * kappa_cmd + 0.75 * body_slip
-    steer = wheel_angle / np.radians(33.0)     # engine steering lock
+    wheel_angle = (_WHEELBASE + 0.002 * speed ** 2) * kappa_cmd + 0.75 * body_slip
+    steer = wheel_angle / _STEER_LOCK
 
     # Entry-speed rule per lookahead sample: in a corner of radius r the car
     # can do v_corner = sqrt(mu*g*r); a corner d metres ahead allows a higher

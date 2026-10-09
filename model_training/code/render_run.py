@@ -29,8 +29,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import track_loader
+from baseline import make_policy
 from racing_env import RacingEnv
-from sanity_check import heuristic_policy
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUT = os.path.normpath(os.path.join(_HERE, "..", "renders"))
@@ -45,7 +45,8 @@ C_CAR = (228, 64, 52)
 C_TRAIL = (250, 196, 60)
 C_TEXT = (240, 240, 240)
 
-CAR_LEN = 4.5      # metres, drawn to scale
+# Drawn to scale: the 992 is 4519 x 1852 mm (Porsche 2020 technical data).
+CAR_LEN = 4.5
 CAR_WID = 1.9
 
 
@@ -222,18 +223,6 @@ def save_gif(path, frames, duration_ms, palette_colors=128):
     first.save(path, save_all=True, append_images=rest(), loop=0,
                duration=duration_ms, optimize=False, disposal=1)
     return info
-
-
-def make_policy(model_path):
-    if model_path is None:
-        return heuristic_policy, "heuristic"
-    from stable_baselines3 import PPO
-    model = PPO.load(model_path)
-
-    def _policy(obs):
-        action, _ = model.predict(obs, deterministic=True)
-        return action
-    return _policy, os.path.splitext(os.path.basename(model_path))[0]
 
 
 def main():

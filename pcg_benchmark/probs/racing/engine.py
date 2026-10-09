@@ -10,67 +10,52 @@ class CarPhysicsEngine:
     - `steering` in [-1, 1]
     - `throttle` in [-1, 1] (positive drive, negative brake)
 
-    Every force in the model comes from a physical mechanism: Pacejka tire
-    curves on load-sensitive, transferred axle loads, a torque curve through an
-    auto gearbox, brake hardware, aerodynamic drag and downforce, and tire
-    relaxation lag.  There is no speed-scheduled steering assist, no artificial
-    yaw or sideslip damping, no slip-angle clamp and no top-speed clamp; a yaw
-    rate is resisted only by the slip angles it creates, the tire is free to
-    run past its grip peak and break away, and top speed falls out of the rev
-    limiter in top gear against drag.
+    Every force comes from a physical mechanism: Pacejka tyre curves on
+    load-sensitive, transferred axle loads, a torque curve through an auto
+    gearbox, brakes, aerodynamic drag and downforce, and tyre relaxation.
+    No steering assist, artificial damping, slip clamp or speed clamp: yaw is
+    resisted only by the slip it creates, a tyre can pass its peak and break
+    away, and top speed is power against drag.  Combined slip follows TORCS:
+    one magic formula on the slip vector's magnitude, split along its
+    direction, so the friction circle holds by construction.
 
-    Combined slip follows TORCS: ONE magic formula evaluated on the magnitude
-    of the slip vector, split back along its direction, so the friction circle
-    holds by construction rather than being imposed by a clamp.
-
-    Two deliberate simplifications remain, both documented where they occur.
-    The pedal demands a FORCE and the slip that delivers it is solved for,
-    rather than a wheel spinning up under torque, so wheelspin and lockup have
-    their consequences but no dynamics of their own.  And the car has two axles
-    rather than four wheels, so there is no differential and no true left/right
-    load split; lateral transfer enters only as the grip it costs.
+    Two simplifications, documented where they occur: the pedal demands a
+    FORCE and the slip delivering it is solved for (wheelspin and lockup have
+    consequences, not dynamics); and two axles, not four wheels (no
+    differential; lateral transfer enters only as the grip it costs).
     """
 
-    # Magic-formula shape, from TORCS' defaults for a tire (simuv2 wheel.cpp):
-    # Ca 30, RFactor 0.8, EFactor 0.7, combined as
-    #     C = 2 - asin(RFactor) * 2 / pi,   B = Ca / C,   E = EFactor.
-    # The shape matters more than it looks.  The curve this replaces peaked at
-    # 26.1 degrees of slip, so at the 2 degrees a car actually corners on it
-    # produced 0.39 of its peak force where this one produces 0.74, and a car
-    # on tires half as stiff as they should be understeers until it cannot
-    # reach its own grip: measured sustained cornering was 5.4 m/s^2 against
-    # the 12.8 that mu implies.  This curve peaks at 10.0 degrees, which is
-    # where a real tire peaks.
+    # Magic-formula shape, TORCS' defaults for a tire (Wymann et al., TORCS;
+    # source src/modules/simu/simuv2/wheel.cpp, read in the jeremybennett/torcs
+    # mirror of the SourceForge tree: Ca 30, RFactor 0.8, EFactor 0.7, lines
+    # 47-49), combined as
+    #     C = 2 - asin(RFactor) * 2 / pi,   B = Ca / C,   E = EFactor
+    # (lines 88-90), on the slip magnitude capped at 1.5 (line 221).  It peaks
+    # at slip 0.18 (10.2 degrees), where a real tyre does.  Why not softer: a
+    # curve peaking at 26.1 degrees gives 0.39 of its peak at the 2 degrees a
+    # car corners on (0.74 here), and the car understeered to 5.4 m/s^2
+    # against the 12.8 mu implies.
     _MF_RFACTOR = 0.8
     _MF_EFACTOR = 0.7
     _MF_CA = 30.0
-    # Load sensitivity, also TORCS': grip per newton falls as a tire is loaded,
-    # so mu runs from lf_max at zero load down towards lf_min when heavily
-    # loaded, passing through the nominal value at the operating load.
-    #     mu(Fz) = mu * (lfMin + (lfMax - lfMin) * exp(lfK * Fz / opLoad))
-    # This is what makes load transfer change the car's balance rather than
-    # just move numbers around, and it is why the outside tire in a corner
-    # cannot simply take over from the inside one.
+    # Load sensitivity, also TORCS': grip per newton falls with load,
+    #     mu(Fz) = mu * (lfMin + (lfMax - lfMin) * exp(lfK * Fz / opLoad)),
+    # so load transfer changes the balance and the outside tyre cannot just
+    # take over from the inside one.  lfMin 0.8, lfMax 1.6, operating load
+    # 1.2 x static: TORCS' defaults (wheel.cpp lines 50-52, 228).
     _LF_MIN = 0.8
     _LF_MAX = 1.6
     _OP_LOAD_FACTOR = 1.2        # operating load, as a multiple of static load
 
     def _build_pacejka_lut(self):
-        """Precompute the combined-slip magic formula over a fixed grid.
-
-        One curve, not two.  TORCS evaluates a single magic formula on the
-        MAGNITUDE of the combined slip vector and then splits the result along
-        that vector's direction, which keeps the total force inside the
-        friction circle by construction instead of computing two forces
-        independently and clamping them afterwards.
-        """
+        """Precompute the combined-slip magic formula over a fixed grid: one
+        curve on the slip MAGNITUDE (as TORCS), not two forces clamped after."""
         self._mf_C = 2.0 - math.asin(self._MF_RFACTOR) * 2.0 / math.pi
         self._mf_B = self._MF_CA / self._mf_C
         self._mf_E = self._MF_EFACTOR
         self._lf_k = math.log((1.0 - self._LF_MIN) / (self._LF_MAX - self._LF_MIN))
 
-        # Slip magnitude is non-negative and TORCS caps it at 1.5, past which
-        # the tire is fully sliding and the curve is flat anyway.
+        # TORCS caps the slip magnitude at 1.5; past it the curve is flat.
         slips = np.linspace(0.0, 1.5, 151)
         self._lut_s_min = float(slips[0])
         self._lut_s_max = float(slips[-1])
@@ -78,6 +63,17 @@ class CarPhysicsEngine:
         bx = self._mf_B * slips
         self.lut_combined = np.sin(
             self._mf_C * np.arctan(bx * (1.0 - self._mf_E) + self._mf_E * np.arctan(bx)))
+
+        # Per lateral slip sy, the longitudinal slip where F(|s|) sx / |s|
+        # peaks: the force is monotone in sx only up to there, so the search
+        # for the slip meeting a demand stops there.  On the LUT's grid, so
+        # it matches the engine's force.
+        sx = np.linspace(0.0, 1.5, 1501)
+        self._peak_sx = np.empty_like(slips)
+        for i, sy in enumerate(slips):
+            mag = np.minimum(np.hypot(sx, sy), 1.5)
+            fx = np.interp(mag, slips, self.lut_combined) * sx / np.maximum(np.hypot(sx, sy), 1e-12)
+            self._peak_sx[i] = sx[int(np.argmax(fx))]
 
     def _get_combined_force_coeff(self, slip_magnitude):
         """Normalized tire force for a combined slip magnitude."""
@@ -87,22 +83,25 @@ class CarPhysicsEngine:
         )
 
     def _grip(self, load, static_load, mu_nominal=None):
-        """Peak tire force available at this vertical load, in newtons.
-
-        Grip per newton falls as a tire is pressed harder, so doubling the
-        load does not double the force.  That is what makes weight transfer a
-        change in the car's BALANCE rather than a zero-sum move of a fixed
-        grip budget between the axles.
-        """
-        # physics_tests.test_load_sensitivity calls this with two arguments to
-        # measure the load-sensitivity curve on its own, so the nominal mu has
-        # to default.
+        """Peak tyre force at this vertical load (N); doubling the load does
+        not double it, which makes weight transfer change the BALANCE."""
+        # Defaults so physics_tests can measure the load curve on its own.
         if mu_nominal is None:
             mu_nominal = self.tire_mu
         op_load = max(self._OP_LOAD_FACTOR * static_load, 1e-6)
         mu = mu_nominal * (self._LF_MIN + (self._LF_MAX - self._LF_MIN)
                            * math.exp(self._lf_k * load / op_load))
         return mu * load
+
+    def _axle_grip(self, load, transfer, static_load, mu_nominal):
+        """Peak force of an axle's two tires, in newtons, with `transfer`
+        newtons moved from the inside tire to the outside one.  A tire cannot
+        pull on the road, so once the inside tire is unloaded it lifts and
+        the outside one carries the whole axle."""
+        half, half_static = 0.5 * load, 0.5 * static_load
+        shift = min(transfer, half)
+        return (self._grip(half + shift, half_static, mu_nominal)
+                + self._grip(half - shift, half_static, mu_nominal))
 
     def _lut_interp_uniform(self, y, x, x_min, x_max, inv_step):
         """Fast scalar interpolation for a uniformly spaced LUT grid."""
@@ -122,33 +121,23 @@ class CarPhysicsEngine:
         start_position,
         start_angle=0.0,
         time_step=0.1,
-        # 30 deg road-wheel lock: passenger cars run 30-40 deg and performance
-        # cars sit at the low end for high-speed stability.  With the 2.45 m
-        # wheelbase this gives a 4.24 m minimum turn radius (11.2 m kerb-to-kerb
-        # circle, the real 911 figure).  steering=1 maps to this angle at every
-        # speed and the tires receive exactly it, so the command means one thing
-        # throughout, as the Simulated Car Racing interface requires.
+        # 30 deg road-wheel lock (passenger cars 30-40, performance cars at the
+        # low end): with the 2.45 m wheelbase a 4.24 m radius, the 911's real
+        # 11.2 m kerb-to-kerb circle.  steering=1 is this angle at every speed,
+        # as the Simulated Car Racing interface requires.
         max_steering=np.deg2rad(30.0),
-        # Nominal top speed, kept only as a scale for observation
-        # normalisation.  It does NOT clamp anything: the real top speed comes
-        # out of the rev limiter in top gear against aerodynamic drag.
-        max_speed=85.5,                     # nominal only, see below
-        # 60 deg/s at the road wheels.  Through a sports-car steering ratio of
-        # ~15:1 that is 900 deg/s at the steering wheel, already a violent
-        # input (a sharp evasive input measures ~140 deg/s there).  Slow enough
-        # that the limit actually binds: reaching full lock takes 5 control
-        # steps, so the controller cannot slam lock-to-lock between them.
+        max_speed=85.5,      # observation scale only; top speed is power against drag
+        # 60 deg/s at the road wheels: through the 992's 15.0-12.25:1 ratio
+        # (Porsche 2020) 900 deg/s at the wheel, a fast evasive input (FMVSS
+        # 126's sine-with-dwell, 49 CFR 571.126 S7.9, peaks at 2 pi 0.7 270 =
+        # 1190 deg/s).  A modelling choice; it binds (lock takes 5 steps).
         steering_rate=np.deg2rad(60.0),
         length=2.45,                        # 992 wheelbase (m)
-        # Integration substeps per control step: 5 gives 50 Hz physics under a
-        # 10 Hz controller.  Chosen by measurement, not by taste.  Scoring is
-        # flat across rates and cost is not: over 40 genomes on all five
-        # representations, mean quality is 0.7613 / 0.7719 / 0.7720 / 0.7669
-        # at 30 / 50 / 100 / 200 Hz, with 36 / 38 / 38 / 37 laps finished, for
-        # 0.257 / 0.300 / 0.454 / 0.787 seconds per evaluation.  50 Hz is the
-        # cheapest rate that scores the same as every rate above it; 30 Hz is
-        # the first that does not.  TORCS runs 500 Hz because it renders to a
-        # human, which is a different requirement from scoring a lap.
+        # 5 substeps: 50 Hz physics under a 10 Hz controller.  Over 40 genomes
+        # (all representations) mean quality 0.7613 / 0.7719 / 0.7720 / 0.7669
+        # and laps 36 / 38 / 38 / 37 at 30 / 50 / 100 / 200 Hz, for 0.257 /
+        # 0.300 / 0.454 / 0.787 s per evaluation: 50 Hz is the cheapest rate
+        # that scores as every rate above it.  (TORCS's 500 Hz serves rendering.)
         physics_substeps=5,
     ):
         self.time_step = time_step
@@ -160,141 +149,142 @@ class CarPhysicsEngine:
         self.start_position = np.array(start_position, dtype=float)
         self.start_angle = start_angle
 
-        # Car spec: Porsche 911 Carrera S (992) on track tires.  Figures below
-        # are the published car, not round numbers: 1555 kg kerb (manual),
-        # 2.45 m wheelbase, 40/60 front/rear (the real car is ~39/61), 308 km/h.
-        # With the 30 deg lock the bicycle-model radius is 4.24 m, an 11.2 m
-        # kerb-to-kerb circle over a 1.55 m track, which is the published
-        # turning circle.
-        self.mass = 1555.0
+        # Car: Porsche 911 Carrera S (992.1, PDK), from Porsche's 2020 US
+        # technical data ("Porsche 2020") unless marked: wheelbase 2450 mm,
+        # rear track 1557 mm, 308 km/h, turning circle 11.2 m, tyres 245/35
+        # ZR20 and 305/30 ZR21, 1534 kg (the 3382 lb curb weight, the same
+        # document the drivetrain is calibrated to).  40/60 front/rear is a
+        # MODELLING CHOICE (not published).
+        self.mass = 1534.0
         self.lf = self.length * 0.60        # cg sits nearer the rear axle
         self.lr = self.length * 0.40
-        # Yaw inertia from the dynamic-index-1 relation Izz = m * lf * lr,
-        # giving ~2240 kg m^2, inside the 1700-2500 range measured for sports
-        # cars.
+        # Yaw inertia from a dynamic index Izz / (m lf lr) of 1 (near 1 for
+        # most cars; Milliken and Milliken 1995, not re-read): 2210 kg m^2.
+        # ESTIMATED (not published).  NHTSA's database (Heydinger et al.
+        # 1999) gives 0.854-1.243, median 1.095, over 94 passenger cars.
         self.inertia_z = self.mass * self.lf * self.lr
-        # Centre-of-gravity height, the lever arm that turns longitudinal
-        # acceleration into load transfer between the axles.  ESTIMATED, not
-        # published: manufacturers do not quote cg height, and 0.45-0.50 m is
-        # the usual range for a low sports car.  Load transfer scales linearly
-        # with it, so a 10% error here is a 10% error in how much the car
-        # pitches its grip about under braking and power.
-        self.h_cg = 0.47
+        # Cg height, the lever arm of load transfer.  DERIVED from the car's
+        # 1300 mm height (Porsche 2020): cg over roof height averages 0.388 in
+        # NHTSA's database (Heydinger et al. 1999; 38 cars with a driver, sd
+        # 0.012, range 0.365-0.415, independent of class and mass, Fig. 4), so
+        # 0.50 m (0.47-0.54).  Caveat: those cars are 1.33-1.50 m high, the
+        # 911 just below them.  Why not the database's lowest car (0.489 m):
+        # it ignores the 911 being 30 mm lower than any.  A 10% error is 10%
+        # in load transfer.  Accepted cost (user decision): from 0.48 m up the
+        # car no longer oversteers under power in physics_tests (2.9 degrees
+        # body slip against 6.9).  calibration/nhtsa_cgroof.py, oversteer_cg.py.
+        self.h_cg = 0.50
+        # Rolling resistance.  ESTIMATED, and high: the EU tyre label
+        # (Regulation (EU) 2020/740, Annex I Part A) runs from class A (6.5
+        # N/kN) to E (10.6 and above); 0.015 is 15 N/kN, 229 N against 2686 N
+        # of drag at top speed, so it barely moves the car.
         self.c_rr = 0.015
-        self.rho_air = 1.225
-        self.cd_a = 0.60                    # Cd 0.29 x frontal area ~2.07 m^2
-        # Downforce, which adds grip with v^2.  ESTIMATED: lift and downforce
-        # coefficients are not published for road cars, and a 911 without a
-        # wing makes little either way, so this is deliberately small next to
-        # cd_a.  It only matters near the top of the speed range, which the
-        # benchmark never reaches (the agent plans to 25 m/s), so it is close
-        # to inert here and is present for completeness rather than effect.
-        # Split slightly rearward to match where the car carries its weight,
-        # so the aero does not shift the balance with speed.
+        self.rho_air = 1.225                # ISA sea-level air density, kg/m^3
+        # Drag area.  Cd 0.31 is published (Porsche 2020); frontal area is
+        # not, so cd_a is a CALIBRATION, fitted with driveline_eff to the
+        # published gears and figures: 0.56 / 0.57 / 0.58 m^2 give 310.8 /
+        # 309.1 / 307.4 km/h, 0.58 the published 191 mph.  It implies 1.87 m^2,
+        # 0.78 of the car's width-by-height box, and carries the rolling and
+        # downforce estimates with it.  calibration/porsche_fit.py.
+        self.cd_a = 0.58
+        # Downforce.  ESTIMATED (not published; a wingless 911 makes little):
+        # 165 N (1.1% of weight) at 30 m/s, 700 N at 61.7 m/s.  Split like the
+        # weight so it does not shift the balance with speed (a MODELLING
+        # CHOICE).
         self.cl_a = 0.30
         self.aero_front_share = 0.40
 
         # ── Drivetrain: torque curve through an auto gearbox ──────────────
         # The published engine, not a constant force: 530 N.m from 2300 to
-        # 5000 rpm and 331 kW (450 PS) at 6500.  Torque reaches the road
+        # 5000 rpm, 331 kW (443 hp, 450 PS) at 6500, maximum engine speed
+        # 7500 rpm (Porsche 2020).  The point at 6500 rpm (486 N.m) follows
+        # from the power; those at 0, 1500 and 7500 rpm (300, 450, 400 N.m)
+        # are ESTIMATED, since the curve outside the plateau is not
+        # published.  The shift points (7200 up, 3200 down) are a MODELLING
+        # CHOICE: 7200 rpm sits under the 7500 rpm limiter, with hysteresis so
+        # the gearbox cannot hunt (an upshift on the published ratios drops
+        # to 4700-5800 rpm).  Upshifting at 6800 / 7200 / 7500 rpm gives a
+        # quarter mile of 11.80 / 11.71 / 11.67 s.  Torque reaches the road
         # through whichever gear is engaged, so acceleration falls away with
         # speed and steps at each shift, the way a real car does.
         self._torque_rpm = np.array([0.0, 1500.0, 2300.0, 5000.0, 6500.0, 7500.0])
         self._torque_nm  = np.array([300.0, 450.0, 530.0, 530.0, 486.0, 400.0])
         self.limiter_rpm  = 7500.0
-        self.shift_up_rpm = 6800.0
+        self.shift_up_rpm = 7200.0
         self.shift_down_rpm = 3200.0
-        # Engine speed the clutch holds while it is still slipping, which is
-        # how a car launches: below this the wheels are turning too slowly to
-        # spin the engine, and without it the model would launch on idle
-        # torque and take 4.1 s to 100 km/h instead of the published 3.5.
+        # Clutch-slip engine speed off the line: 3000 rpm models launch
+        # control, against Porsche's launch figures of 3.3 s to 60 mph and an
+        # 11.7 s quarter mile (model: 3.24, 11.71 s).  A check, not a fit: at 0
+        # the model gives 3.41 and 11.88 s against the published 3.5 and 11.9 s
+        # without launch control.  A CALIBRATION.
         self.launch_rpm = 3000.0
-        self.driveline_eff = 0.90
-        self.wheel_radius = 0.358           # 305/30 R21 rear, rolling radius
-        # Overall ratios (gearbox x final drive).  These are the first six of
-        # the 992's eight-speed PDK (whose overall ratios run 18.9, 11.4, 7.5,
-        # 5.7, 4.4, 3.4, 2.8, 2.2), shortened about 3% so top gear reaches the
-        # published 308 km/h exactly at the limiter.  The seventh and eighth
-        # are overdrive ratios for economy and are above the car's top speed,
-        # so dropping them changes nothing that is simulated here.  First is short
-        # on purpose: a 450 hp rear-drive car is TRACTION limited off the
-        # line, not force limited, so a tall first would quietly make the car
-        # unable to spin its rear wheels at all.
-        self.gear_ratios = (18.40, 11.00, 7.40, 5.54, 4.40, 3.29)
-        # 100-0 km/h in ~32 m = 1.23 g = 18.7 kN.  Sits just under the tire
-        # limit (mu 1.3 gives 19.8 kN), so grip and not the brakes is the
-        # binding constraint, as on the real car.
+        # Driveline efficiency.  A CALIBRATION with cd_a: 0.73 gives the 11.7 s
+        # quarter mile (0.70 / 0.72 / 0.74 / 0.76 / 0.80 / 0.90 give 11.88 /
+        # 11.75 / 11.63 / 11.52 / 11.50 / 11.16 s at cd_a 0.54).  Below
+        # friction alone because it also stands in for rotating inertia; why
+        # not model that: its per-gear figures are not published, while this
+        # is pinned by a published time.  calibration/porsche_fit.py.
+        self.driveline_eff = 0.73
+        # Unloaded radius of the 305/30 ZR21 rear tyre: 21 x 25.4 / 2 + 0.30 x
+        # 305 = 358 mm.  DERIVED.
+        self.wheel_radius = 0.358
+        # Overall ratios: the PDK's 4.89 ... 0.61 through the 3.39 axle and 0.92
+        # rear constant (Porsche 2020), 4.89 x 3.39 x 0.92 = 15.25 and so on.
+        # PUBLISHED.  Top speed comes in sixth at 6670 rpm, drag limited.
+        self.gear_ratios = (15.25, 9.89, 6.71, 4.87, 3.68, 2.93, 2.37, 1.90)
+        # 18.7 kN = 1.24 g, a 32 m stop from 100 km/h.  ESTIMATED (no 100-0
+        # figure for the 992 found); just under the tyre limit (19.6 kN), so
+        # grip binds, not the brakes.  physics_tests measures 32.7 m.
         self.max_brake_force = 18700.0
 
-        # Peak drive force (first gear, peak torque) and peak power.  The
-        # engine does not use these: they exist so a planner can ask what the
-        # car is roughly capable of without simulating the gearbox.
+        # Peak drive force and power, unused by the engine: a planner's rough
+        # capability figures.
         self.max_drive_force = (float(np.max(self._torque_nm))
                                 * self.gear_ratios[0] * self.driveline_eff
                                 / self.wheel_radius)
         self.max_power = 331000.0           # 331 kW (450 PS), 992 Carrera S
 
         self._throttle_state = 0.0
+        # Pedal travel: 0 to full in 0.17 s, so a controller cannot swap full
+        # brake and full throttle within one step.  ESTIMATED; brake the same.
         self.throttle_slew_rate = 6.0
 
-        # Peak friction coefficient.  A MODELLING CHOICE, not a measurement:
-        # 1.3 is typical of a warm performance road tire on dry asphalt, and it
-        # is what sets the car's 1.17 g cornering.  Every grip number in the
-        # model scales with it.
+        # Peak friction, a MODELLING CHOICE: 1.3 is typical of a warm
+        # performance road tyre on dry asphalt and sets the 1.11 g cornering
+        # (physics_tests); every grip number scales with it.
         self.tire_mu = 1.3
 
-        # Staggered tires, front narrower than rear, as fitted to the real car
-        # (245/35 R20 front, 305/30 R21 rear).  This is not a detail: with the
-        # cg 60% rearward and the same tire at both ends, the rear axle runs
-        # out of grip before the front and the car oversteers into a spin the
-        # moment it is asked to brake and turn together.  A wider rear tire is
-        # how the real 911 is made stable, and it is what gives this model a
-        # positive understeer gradient instead of an artificial yaw damper.
-        #
-        # Grip is taken proportional to contact width, normalised about the
-        # mean so the car's overall grip stays at tire_mu and only the balance
-        # between the axles moves.
-        #
-        # The size of the stagger decides whether the car is stable at all.
-        # Equilibrium in a steady corner needs Fy_f / Fy_r = lr / lf = 0.667,
-        # so the front must run out of grip first, which needs
-        # mu_f*Fz_f / mu_r*Fz_r below 0.667.  The static load split alone gives
-        # exactly 0.667, i.e. neutral with no margin, and the car then rings at
-        # its limit instead of settling: measured, it held a 1.4 Hz yaw
-        # oscillation indefinitely and never converged.  These widths give
-        # 0.536 and the car settles.
+        # Staggered tyres as on the real car (245 front, 305 rear).  With the
+        # cg 60% rearward and equal tyres the rear runs out of grip first and
+        # the car spins under trail braking; the wider rear gives a positive
+        # understeer gradient instead of an artificial yaw damper.  Grip is
+        # proportional to width, normalised so overall grip stays tire_mu.
+        # A steady corner needs Fy_f / Fy_r = lr / lf = 0.667, so the front
+        # must saturate first (mu_f Fz_f / mu_r Fz_r < 0.667); equal tyres give
+        # exactly 0.667 and the car held a 1.4 Hz yaw oscillation; these
+        # widths give 0.536 and it settles.
         self.tire_width_front = 0.245
         self.tire_width_rear = 0.305
         width_mean = 0.5 * (self.tire_width_front + self.tire_width_rear)
         self.tire_mu_front = self.tire_mu * self.tire_width_front / width_mean
         self.tire_mu_rear = self.tire_mu * self.tire_width_rear / width_mean
 
-        # Tire relaxation length: the distance the wheel rolls before lateral
-        # force reaches 63% of its steady-state value.  Lateral force therefore
-        # lags a slip-angle change by sigma/v seconds, which is the physical
-        # mechanism behind the delay a driver feels on turn-in, and it is what
-        # damps the yaw transient.  0.5 m sits in the usual passenger-car range.
-        #
-        # It also removes the low-speed singularity without a guard: the lag
-        # constant sigma/v grows without bound as the car slows, so the slip
-        # angle freezes instead of diverging when forward speed reaches zero.
+        # Tyre relaxation length: lateral force lags a slip change by sigma/v,
+        # the turn-in delay, and it damps the yaw transient.  ESTIMATED,
+        # inside the measured range: Alcazar Vargas et al. (2022) measured
+        # 0.3-0.9 m on a passenger tyre, their model 0.5-0.6 m at 10 m/s for
+        # these loads.  It also freezes the slip at zero speed instead of a
+        # singularity.
         self.relaxation_length = 0.5
 
-        # Axle track, the lever lateral load transfer acts over.
-        self.track_width = 1.55             # 992 rear track (m)
+        self.track_width = 1.55             # lateral transfer lever: 992 rear track (Porsche 2020)
 
-        # No slip-angle clamp and no artificial yaw damper.  Both were needed
-        # only while the tire was too soft: on the previous curve, which peaked
-        # at 26 degrees of slip, the car could not reach its own grip and had
-        # to be held straight by hand.  A tire that peaks where a real one does
-        # generates its restoring moment early enough that the tires damp yaw
-        # themselves, which is what they do on a real car.
+        # No slip clamp or yaw damper: a tyre peaking where a real one does
+        # (10 degrees) damps yaw itself; only a too-soft tyre would need them.
 
         self.g = 9.81
         self.normal_load = self.mass * self.g
-        # Static axle loads follow from where the cg sits, so the 40/60 split
-        # is a consequence of lf and lr rather than a second, independent
-        # figure that could drift out of step with them.
+        # Static axle loads from lf and lr, so the split cannot drift from them.
         self.load_front_static = self.normal_load * (self.lr / self.length)
         self.load_rear_static = self.normal_load * (self.lf / self.length)
 
@@ -310,8 +300,7 @@ class CarPhysicsEngine:
         self.yaw_rate = 0.0
         self.steering_angle = 0.0
         self._throttle_state = 0.0
-        # Lagged slip angles (tire relaxation), the accelerations that drive
-        # load transfer, and the gearbox, all at rest.
+        # Lagged slip angles, load-transfer accelerations and gearbox at rest.
         self._slip_angle_front = 0.0
         self._slip_angle_rear = 0.0
         self._ax_body = 0.0
@@ -323,20 +312,11 @@ class CarPhysicsEngine:
         return self.get_state()
 
     def step(self, action):
-        """Advance one CONTROL step, integrating the physics in substeps.
-
-        The control rate and the integration rate are separate concerns, which
-        is how TORCS is arranged too: it integrates at 0.002 s while the
-        controller acts every 0.02 s.  Here the agent still acts every
-        time_step, but the body is integrated physics_substeps times at
-        time_step/physics_substeps with the action held constant.
-
-        The substep count is set by convergence, not by taste.  Measured
-        against a 500 Hz reference on the same chicane: one substep (10 Hz)
-        carries 7.9 m of RMS position error on a road whose half-width is 8 m,
-        a full track width of error from the timestep alone, while 10 substeps
-        (100 Hz) carry 1.0 m for roughly twice the physics cost.
-        """
+        """Advance one CONTROL step, integrating physics_substeps times with
+        the action held (as TORCS separates its 0.002 s physics from 0.02 s
+        control).  Against a 500 Hz reference on a chicane, one substep
+        carries 7.9 m of RMS position error, ten carry 1.0 m; five is set on
+        scoring against cost (__init__)."""
         n = max(1, int(self.physics_substeps))
         dt = self.time_step / n
         state = None
@@ -345,14 +325,10 @@ class CarPhysicsEngine:
         return state
 
     def _drive_force(self, v_forward):
-        """Drive force available at the rear wheels right now, in newtons.
-
-        Engine speed follows road speed through the engaged gear, since there
-        is no wheel-spin state, and the gearbox shifts on its own with
-        hysteresis so it cannot hunt between two ratios.  Torque comes off the
-        published curve, which is why acceleration falls away with speed and
-        steps at every shift instead of being one flat number.
-        """
+        """Drive force at the rear wheels (N).  Engine speed follows road
+        speed through the engaged gear (no wheel-spin state); the gearbox
+        shifts with hysteresis; torque comes off the published curve, so
+        acceleration falls with speed and steps at each shift."""
         omega_wheel = max(v_forward, 0.0) / self.wheel_radius
         top = len(self.gear_ratios) - 1
 
@@ -375,32 +351,40 @@ class CarPhysicsEngine:
         return (torque * self.gear_ratios[self.gear] * self.driveline_eff
                 / self.wheel_radius)
 
-    def _slip_for_force(self, force_fraction, slip_angle):
+    def _slip_for_force(self, force_fraction, slip_angle, braking=False):
         """Longitudinal slip that delivers `force_fraction` of the tire's peak
         alongside an existing `slip_angle`.
 
-        The pedal asks for FORCE, not slip.  On a real car the wheel spins up
-        until its slip produces the torque the engine is making; with no wheel
-        state, solving for that slip is the equivalent step, and skipping it
-        quietly loses the request whenever the car is cornering.  Adding a
-        small longitudinal slip to a large slip angle barely rotates the
-        combined slip vector, so a straight fixed slip ratio delivers only a
-        fraction of what was asked for mid-corner.
+        The pedal asks for FORCE: a real wheel spins up until its slip makes
+        the engine's torque, and with no wheel state solving for that slip is
+        the equivalent (a fixed slip ratio barely rotates the slip vector
+        mid-corner and delivers a fraction of the request).
 
-        Bisected because the combined force is monotone in slip up to
-        saturation.  If even the largest slip searched cannot meet the demand,
-        the tire is over-driven and that slip is returned, which is a spinning
-        or locked wheel.
+        Bisected up to the slip where the force peaks (_peak_sx), where it is
+        monotone; over [0, 1] any demand above F(1) = 0.90 of peak reads as
+        unreachable and locks the wheel, as it did under trail braking.
+
+        A demand above the peak: under power the wheel spins (slip 1); under
+        braking ABS (standard on the 992) caps slip at the straight-line peak
+        (0.18), since ABS regulates slip, not force; holding the combined
+        peak (0.38-1.5 with slip angle) would slide past lock.  A modelling
+        choice.  Why not model the ABS cycle: its 4-20 Hz modulation is beyond
+        a 10 Hz controller, and it holds the tyre around this slip.
         """
+        lateral = math.sin(slip_angle)       # the lateral slip axle_forces uses
+
         def fx_at(sx):
-            mag = math.hypot(sx, slip_angle)
+            mag = math.hypot(sx, lateral)
             if mag < 1e-9:
                 return 0.0
             return self._get_combined_force_coeff(min(mag, 1.5)) * sx / mag
 
-        hi = 1.0
+        hi = self._lut_interp_uniform(self._peak_sx, abs(lateral), self._lut_s_min,
+                                      self._lut_s_max, self._lut_s_inv_step)
+        if braking:
+            hi = min(hi, float(self._peak_sx[0]))
         if fx_at(hi) < force_fraction:
-            return hi
+            return hi if braking else 1.0
         lo = 0.0
         for _ in range(12):                 # resolves slip to ~0.01 degrees
             mid = 0.5 * (lo + hi)
@@ -418,12 +402,10 @@ class CarPhysicsEngine:
         """
 
         # ── Inputs: steering lock, pedal slew, steering rate limit ────────
-        # The lock clamped here is speed-independent, so steering=1 always maps
-        # to the same 30 deg command.  The Simulated Car Racing Championship
-        # interface (Loiacono et al., arXiv:1304.1672) fixes steering=1 to one
-        # constant angle for the same reason: the command has to mean one thing.
-        # The tires receive exactly this angle, so the agent's division by the
-        # same figure is exact at every speed.
+        # A speed-independent lock: steering=1 is always 30 deg, as the
+        # Simulated Car Racing interface fixes it to one angle (Loiacono,
+        # Cardamone and Lanzi 2013, Table 3: "corresponds to an angle of
+        # 0.366519 rad"), so the command means one thing at every speed.
         max_steering = float(self.max_steering)
 
         steering_input = float(action.get('steering', 0.0))
@@ -480,19 +462,13 @@ class CarPhysicsEngine:
         resist_force = (rolling_force + drag_force) * (1.0 if v_forward >= 0.0 else -1.0)
 
         v = abs(v_forward)
-        # The tires receive the commanded angle unaltered.
-        delta = self.steering_angle
+        delta = self.steering_angle           # the tyres get the commanded angle unaltered
 
         # ── Load transfer ─────────────────────────────────────────────────
-        # Accelerating pitches load onto the rear axle and braking onto the
-        # front, by dFz = m * ax * h_cg / L about the cg.  ax is taken from the
-        # previous substep, which is the usual explicit treatment: solving it
-        # simultaneously with the tire forces it feeds would need an inner
-        # iteration for a correction that is already small at 100 Hz.
-        #
-        # Loads are floored at zero because a tire can be unloaded but cannot
-        # be pulled into the road; that is the physical limit of the model, not
-        # a tuning guard.
+        # Longitudinal: dFz = m ax h_cg / L, with ax from the previous substep
+        # (the usual explicit treatment; a simultaneous solve needs an inner
+        # iteration for a correction 0.02 s late).  Loads floor at zero: a
+        # tyre can be unloaded, not pulled into the road.
         downforce = 0.5 * self.rho_air * self.cl_a * v * v
         dFz = self.mass * float(self._ax_body) * self.h_cg / self.length
         Fz_f = self.load_front_static + downforce * self.aero_front_share - dFz
@@ -502,29 +478,22 @@ class CarPhysicsEngine:
         if Fz_r < 0.0:
             Fz_r = 0.0
 
-        # Grip per newton falls as a tire is loaded, so the axle that load
-        # transfer pushes down does not gain grip in proportion.  This is what
-        # makes braking into a corner shift the balance toward the front and
-        # power-on shift it toward the rear, rather than leaving the car's
-        # behaviour the same everywhere.
-
-        # Lateral load transfer.  A two-axle model has no separate left and
-        # right tire to move load between, but the cost of moving it is real
-        # and follows from the same load sensitivity: the outside tire gains
-        # less grip than the inside one loses, so hard cornering shrinks an
-        # axle's total grip.  Modelled as that net loss, from how much lateral
-        # acceleration the car is pulling against how far it can lean on its
-        # track width before a wheel lifts.
-        lateral_shift = min(abs(self._ay_body) * self.h_cg
-                            / (self.g * self.track_width), 1.0)
-        # The 0.25 is a CHOSEN coefficient, not a measured one: it sets how
-        # much of the load-sensitivity swing a full lateral transfer costs.
-        # The shape (quadratic in the transfer) follows from grip falling off
-        # with load, but the magnitude is a modelling choice, and it is the
-        # least defensible number in this file.
-        lateral_grip_loss = 1.0 - (self._LF_MAX - self._LF_MIN) * 0.25 * lateral_shift ** 2
-        muFzf = self._grip(Fz_f, self.load_front_static, self.tire_mu_front) * lateral_grip_loss
-        muFzr = self._grip(Fz_r, self.load_rear_static, self.tire_mu_rear) * lateral_grip_loss
+        # Lateral: with load sensitivity the outside tyre gains less than the
+        # inside one loses, so cornering shrinks an axle's grip.  Cornering at
+        # ay moves m ay h_cg / track of load outward (the total; roll centres
+        # only split it); each axle is evaluated as two tyres through _grip,
+        # so the transfer costs what TORCS' curve says.  Split between axles
+        # by static load, a modelling choice (the real split follows roll
+        # stiffness, not published), which keeps the stagger's balance.  Why
+        # not a fixed grip-loss coefficient: a free number.  Why not four
+        # wheels (TORCS): needs roll stiffnesses and per-wheel state for a
+        # loss this reproduces per axle.
+        transfer = self.mass * abs(float(self._ay_body)) * self.h_cg / self.track_width
+        front_share = self.load_front_static / self.normal_load
+        muFzf = self._axle_grip(Fz_f, transfer * front_share,
+                                self.load_front_static, self.tire_mu_front)
+        muFzr = self._axle_grip(Fz_r, transfer * (1.0 - front_share),
+                                self.load_rear_static, self.tire_mu_rear)
 
         # ── Lateral tire forces from per-axle slip angles ─────────────────
         vxf = v_forward
@@ -532,20 +501,14 @@ class CarPhysicsEngine:
         vxr = v_forward
         vyr = v_lateral - self.lr * yaw_rate
 
-        # Steady-state slip angles in each axle frame.  atan2 is defined at
-        # zero forward speed, so no floor on the divisor is needed.
+        # Steady-state slip angles (atan2 needs no floor at zero speed).
         slip_ss_front = delta - math.atan2(vyf, vxf)
         slip_ss_rear = -math.atan2(vyr, vxr)
 
-        # Tire relaxation: lateral force cannot appear instantly, it builds as
-        # the tire rolls, with time constant sigma/v.  The exponential form is
-        # the exact solution of the first-order lag over one substep, so it is
-        # stable for any timestep instead of only for dt < sigma/v.
-        #
-        # At a standstill the factor is zero and the slip angles hold their
-        # last value, which is what keeps the model finite at v = 0 without a
-        # clamp: the ill-conditioned steady-state value is computed but never
-        # blended in.
+        # Tyre relaxation, time constant sigma/v, as the exact solution of the
+        # first-order lag over a substep (stable at any step).  At a
+        # standstill the factor is zero and the slip angles hold, keeping the
+        # model finite at v = 0 without a clamp.
         relax = 1.0 - math.exp(-v * time_step / max(self.relaxation_length, 1e-9))
         self._slip_angle_front += (slip_ss_front - self._slip_angle_front) * relax
         self._slip_angle_rear += (slip_ss_rear - self._slip_angle_rear) * relax
@@ -553,15 +516,11 @@ class CarPhysicsEngine:
         slip_angle_rear = self._slip_angle_rear
 
         # ── Longitudinal slip demand ──────────────────────────────────────
-        # The pedal demands a slip ratio directly.  TORCS derives it from wheel
-        # spin, sx = (v_tangent - omega * r) / |v_tangent|, which needs a
-        # rotational state per wheel; without one the pedal stands in for it,
-        # so drive force cannot persist after a lift and response time is set
-        # by the throttle slew rate alone.  This is the one place the model
-        # stays simpler than TORCS on purpose.
-        # Rear-wheel drive: traction through the rear axle only, braking
-        # shared by the TRANSFERRED loads so the front takes a larger share the
-        # harder the car brakes, as it does on the road.
+        # The pedal demands a force; _slip_for_force solves for its slip.
+        # TORCS derives slip from wheel spin, which needs per-wheel rotation;
+        # without it drive force cannot persist after a lift and response is
+        # the throttle slew alone, the one place this is simpler than TORCS on
+        # purpose.  Rear-wheel drive; braking shared by the transferred loads.
         drive_available = self._drive_force(v_forward)   # also shifts gears
         if throttle_input >= 0.0:
             demand_f, demand_r = 0.0, throttle_input * drive_available
@@ -569,10 +528,8 @@ class CarPhysicsEngine:
             demand_f = demand_r = 0.0   # standing still: brakes hold
         else:
             total = throttle_input * self.max_brake_force   # negative
-            # Split by each axle's GRIP, not its load.  A brake system is
-            # proportioned so both axles reach their limit together, and with
-            # a narrower tire at the front, splitting by load alone would lock
-            # the front first and lengthen the stop.
+            # Split by GRIP, not load, so both axles reach their limit
+            # together (by load the narrower front would lock first).
             share_f = muFzf / max(muFzf + muFzr, 1e-6)
             demand_f = total * share_f
             demand_r = total * (1.0 - share_f)
@@ -582,18 +539,16 @@ class CarPhysicsEngine:
             if mu_load <= 1e-6 or abs(demand) < 1e-9:
                 return 0.0
             fraction = min(abs(demand) / mu_load, 1.0)
-            return math.copysign(self._slip_for_force(fraction, abs(slip_angle)), demand)
+            return math.copysign(self._slip_for_force(fraction, abs(slip_angle), demand < 0.0),
+                                 demand)
 
         kappa_f = slip_for(demand_f, muFzf, slip_angle_front)
         kappa_r = slip_for(demand_r, muFzr, slip_angle_rear)
 
-        # ── Combined-slip tire forces, one axle at a time ─────────────────
-        # TORCS' formulation: build the slip VECTOR from longitudinal slip and
-        # sin(slip angle), run one magic formula on its magnitude, and split
-        # the resulting force back along the vector.  The friction circle then
-        # holds by construction, so there is no clamp to apply afterwards and
-        # no choice to make about which of the two components to sacrifice.
-        # Asking for more of one automatically leaves less of the other.
+        # ── Combined-slip tyre forces, one axle at a time ─────────────────
+        # TORCS' formulation: the slip VECTOR (longitudinal slip, sin(slip
+        # angle)), one magic formula on its magnitude, the force split back
+        # along it, so the friction circle holds with no clamp.
         def axle_forces(slip_angle, slip_ratio, mu_load):
             lateral_slip = math.sin(slip_angle)
             magnitude = math.hypot(slip_ratio, lateral_slip)
@@ -606,13 +561,10 @@ class CarPhysicsEngine:
         Fx0_f, Fy_f = axle_forces(slip_angle_front, kappa_f, muFzf)
         Fx0_r, Fy_r = axle_forces(slip_angle_rear, kappa_r, muFzr)
 
-        # No drivetrain ceiling applied here any more: the torque curve and
-        # the brake hardware already bounded the DEMAND above, and the tire
-        # decides how much of it reaches the road.  An over-demand shows up as
-        # a spinning or locked wheel losing grip, which is what it is, rather
-        # than as a number being clipped.
-
-        # Rotate front-axle tire forces from wheel frame into body frame.
+        # No ceiling here: torque curve and brakes bound the demand, the tyre
+        # decides what reaches the road (an over-demand is a spinning or
+        # locked wheel losing grip).
+        # Front-axle forces from wheel frame into body frame.
         c = math.cos(delta)
         s = math.sin(delta)
         Fx_f = Fx0_f * c - Fy_f * s
@@ -625,19 +577,11 @@ class CarPhysicsEngine:
         Fy_body = Fy_f_b + Fy_r_b
 
         # ── Integrate the body (velocities, yaw, pose) ────────────────────
-        # No Coriolis terms here, deliberately.  The body-frame equations
-        #     v_x_dot = Fx/m + r*v_y,   v_y_dot = Fy/m - r*v_x
-        # apply when the VELOCITY ITSELF is the body-frame state being carried
-        # forward.  Here it is not: self.velocity is stored in world axes, and
-        # every substep projects it into the body frame, integrates, and
-        # projects it back through the heading of that same substep.  That
-        # round trip already accounts for the frame turning, so adding the
-        # terms as well rotates the velocity vector twice per step.
-        #
-        # The effect was not subtle.  The car's path curved at twice its yaw
-        # rate, sideslip grew until the tires balanced the surplus, and its
-        # sustained cornering came out at exactly half of what the tire forces
-        # supported: 5.81 m/s^2 measured against 11.63 m/s^2 of tire force.
+        # No Coriolis terms (v_x_dot = Fx/m + r v_y ...): those apply when the
+        # body-frame velocity is the state.  Here velocity is stored in world
+        # axes and projected in and out each substep, which already accounts
+        # for the frame turning; with the terms the path curves at twice the
+        # yaw rate and cornering halves (5.81 against 11.63 m/s^2).
         ax = Fx_body / self.mass
         ay = Fy_body / self.mass
         v_forward += ax * time_step
@@ -646,21 +590,12 @@ class CarPhysicsEngine:
         mz = (self.lf * Fy_f_b) - (self.lr * Fy_r_b)
         yaw_rate += (mz / max(self.inertia_z, 1.0)) * time_step
 
-        # Only the reverse guard remains.  Top speed is not clamped: the rev
-        # limiter in top gear and aerodynamic drag settle it between them,
-        # which is what sets a real car's top speed.
-        if v_forward < 0.0:
+        if v_forward < 0.0:                   # the only guard: no reversing; top speed is not clamped
             v_forward = 0.0
+        self.yaw_rate = yaw_rate              # damped only by the tyres' slip angles
 
-        # Nothing damps sideways velocity or yaw artificially.  Both are
-        # resisted only by the tires: a yaw rate builds slip angles at both
-        # axles, those slip angles generate the restoring moment, and the
-        # relaxation lag sets how quickly it arrives.
-        self.yaw_rate = yaw_rate
-
-        # Longitudinal acceleration in the body frame, kept for the next
-        # substep's load transfer.  Fx_body already carries drag and rolling
-        # resistance, so this is what the chassis actually feels.
+        # Body-frame accelerations (drag included) for the next substep's
+        # load transfer.
         self._ax_body = Fx_body / self.mass
         self._ay_body = Fy_body / self.mass
         # Last substep's force breakdown, read by the physics harness.
@@ -676,21 +611,10 @@ class CarPhysicsEngine:
         return self.get_state()
 
     def get_state(self):
-        """Return the current state as a preallocated ndarray.
-
-        Callers that keep the value across steps must copy it: this is one
-        buffer, rewritten in place on every call.
-
-        Element 3 is speed ALONG THE CAR, not the magnitude of the velocity
-        vector.  The two differ while the car is sliding, and the agent's speed
-        profile plans forward progress, so forward speed is the quantity it
-        needs.
-
-        Elements 5 and 6 are lateral speed and yaw rate, the two body-frame
-        quantities a learned driver reads that a path follower does not.
-        Appending them keeps indices 0-4 at their existing meaning, so every
-        caller that slices the first five stays correct.
-        """
+        """The state [x, y, angle, forward speed, steering, lateral speed,
+        yaw rate] in one buffer rewritten each call (copy to keep it).
+        Element 3 is speed ALONG the car, what a speed profile plans; 5 and 6
+        are what a learned driver reads beyond a path follower."""
         cos_a = math.cos(self.angle)
         sin_a = math.sin(self.angle)
         vx = float(self.velocity[0])

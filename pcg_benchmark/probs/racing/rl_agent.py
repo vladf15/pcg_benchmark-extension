@@ -11,9 +11,10 @@ way:
 
   1. Observation and geometry are imported from the training code rather than
      reimplemented: TrackGeometry does the arc-length resampling, projection
-     and curvature-ahead sampling, and _build_observation mirrors
-     RacingEnv._observe term by term.  A reimplementation would be a second
-     definition of the contract, free to drift from the one that trained.
+     and curvature-ahead sampling, and RacingEnv.build_observation builds the
+     vector for training and for this driver alike.  A reimplementation would
+     be a second definition of the contract, free to drift from the one that
+     trained.
   2. The two scaling constants that are NOT read from the track come from the
      checkpoint rather than from the car (see OBS_MAX_SPEED below).
 
@@ -244,38 +245,20 @@ class RLAgent:
     # ------------------------------------------------------------------
 
     def _build_observation(self, car_state, lateral, heading_ref):
-        """Mirror of RacingEnv._observe.
-
-        Kept term-for-term in the same order, because the policy's input layer
-        is positional: swapping two entries produces a driver that still runs
-        and still returns actions, just bad ones.
-        """
-        g = self._geom
-        x, y, heading, v_forward, steering = car_state
-        # Velocity in the car frame, the same decomposition
-        # EngineBackedPhysics._state does.
-        heading_err = (heading - heading_ref + np.pi) % (2.0 * np.pi) - np.pi
-        curv = g.curvature_ahead(self._s, self._env_cls.lookahead_edges(v_forward))
-
-        obs = np.empty(8 + len(self._env_cls.LOOKAHEAD_TIMES) - 1,
-                       dtype=np.float32)
-        obs[0] = v_forward / self._max_speed_norm
-        obs[1] = self._v_lateral / 10.0
-        obs[2] = self._yaw_rate / 2.0
-        obs[3] = steering / self._max_steering_norm
-        obs[4] = lateral / g.half_width
-        obs[5] = heading_err / np.pi
-        obs[6] = self._last_action[0]
-        obs[7] = self._last_action[1]
-        obs[8:] = curv * 10.0
-        return np.clip(obs, -4.0, 4.0)
+        """RacingEnv.build_observation on the benchmark car's state, with the
+        checkpoint's scaling constants (OBS_MAX_SPEED, OBS_MAX_STEERING)."""
+        _x, _y, heading, v_forward, steering = car_state
+        return self._env_cls.build_observation(
+            self._geom, self._s, lateral, heading_ref, heading, v_forward,
+            self._v_lateral, self._yaw_rate, steering, self._last_action,
+            self._max_speed_norm, self._max_steering_norm)
 
     def act(self, car_state):
         """Return the engine action dict for a benchmark car state.
 
         `car_state` is the engine's state vector
-        [x, y, heading, speed, steering, v_lateral, yaw_rate]; the last two are
-        appended by RacingProblem so the observation can be built without
+        [x, y, heading, speed, steering, v_lateral, yaw_rate]; the engine's
+        get_state appends the last two, so the observation is built without
         reaching into the engine from here.
         """
         state = np.asarray(car_state, dtype=float).ravel()

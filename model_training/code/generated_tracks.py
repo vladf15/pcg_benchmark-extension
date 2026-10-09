@@ -4,12 +4,12 @@ The circuits and the generated tracks share a unit system (world units are
 metres in both), so a generated track needs no rescaling: take the smoothed
 centerline the benchmark already computes and hand it to TrackGeometry.
 
-    from generated_tracks import env_for_content
-    env = env_for_content(problem, content)
+    from generated_tracks import env_for_geometry, geometry_from_content
+    geometry, info = geometry_from_content(problem, content)
+    env = env_for_geometry(geometry)
 
-This is the piece Phase 5 needs: it lets the driver trained on real circuits
-be pointed at whatever the GA produced, scored by exactly the same code that
-scores the real circuits.
+This lets the driver trained on real circuits be pointed at whatever the GA
+produced, scored by the same code that scores the real circuits.
 
 Run as a script to score saved experiment output:
     python generated_tracks.py --problem racingtile-v0 --content out/best.json
@@ -94,12 +94,6 @@ def env_for_geometry(geometry, name="generated", **kwargs):
     kwargs.setdefault("randomize", False)
     kwargs.setdefault("seed", 0)
     return _PresetTrackEnv(geometry, name=name, **kwargs)
-
-
-def env_for_content(problem, content, map_size=None, **kwargs):
-    """Evaluation env for one piece of generated benchmark content."""
-    geom, _ = geometry_from_content(problem, content, map_size=map_size)
-    return env_for_geometry(geom, **kwargs)
 
 
 def _main():

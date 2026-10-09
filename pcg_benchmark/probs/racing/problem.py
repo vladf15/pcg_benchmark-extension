@@ -1,8 +1,10 @@
+import math
 import os
 
 from .engine import CarPhysicsEngine
 from .agent import SteeringAgent
 from .rl_agent import RLAgent, load_policy
+from . import torcs
 from pcg_benchmark.probs import Problem
 from pcg_benchmark.spaces import ArraySpace, FloatSpace, IntegerSpace, DictionarySpace
 import numpy as np
@@ -11,11 +13,12 @@ from pcg_benchmark.probs.racing.utils import (
     interpolate_curves,
     count_self_intersections,
     count_track_area_intersections,
-    lowest_turn_seam_index,
     compute_offset_edges,
+    turning_function,
+    turning_distance,
 )
 from pcg_benchmark.probs.utils import get_range_reward
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 PX_PER_M = 5.0
 
@@ -25,6 +28,10 @@ PX_PER_M = 5.0
 _RL_RUNS_DIR = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "..", "..", "model_training", "runs"))
+# The policy the quality simulation drives with (see the driver comment in
+# __init__).  view_track reads it too, so the viewer shows the driver that
+# produced the saved scores.
+DEFAULT_RL_POLICY = os.path.join(_RL_RUNS_DIR, "run20", "selected", "policy.zip")
 
 
 class _BoundedCache(OrderedDict):
@@ -65,34 +72,6 @@ class _BoundedCache(OrderedDict):
 
 
 
-def _conjunctive_mean(values, weights=None):
-    """Weighted geometric mean: the aggregation for criteria that must ALL hold.
-
-    An arithmetic mean lets a term satisfied everywhere pay for one that is
-    not.  Measured on 200 random genomes across the five representations, 12 of
-    the 14 terms scored above 0.95 more than half the time (oob 100%, braking
-    zone 94%, completion 94%, speed entropy 94%, extent 92%, time 92%), and the
-    arithmetic mean reported mean quality 0.69-0.84 for content no designer
-    would accept.  A geometric mean makes every term necessary, which is what a
-    conjunction of design criteria is.
-
-    Values are floored at 0.02 rather than allowed to reach zero.  A term a
-    representation cannot satisfy at all would otherwise flatten the whole
-    score and leave the search no gradient, which is the failure the additive
-    form was avoiding.
-
-    Why not simpler: a plain minimum is the strictest conjunction, but it
-    reports only the worst term and gives no credit for improving any other.
-    Why not more complex: a soft minimum with a temperature adds a constant
-    that would itself need calibrating.
-    """
-    vals = np.clip(np.asarray(values, dtype=float), 0.02, 1.0)
-    if weights is None:
-        return float(np.exp(np.mean(np.log(vals))))
-    w = np.asarray(weights, dtype=float)
-    return float(np.exp(np.sum(w * np.log(vals)) / np.sum(w)))
-
-
 def _rotated_rect(center_x, center_y, forward, right, half_len, half_wid):
     fx, fy = forward; rx, ry = right
     return [
@@ -108,40 +87,60 @@ class RacingProblem(Problem):
 
     _render_desc = 'Rendering racing frames'
 
-    # Cache bounds: info dicts hold dense curves (tens of KB each), summary
-    # tuples are tiny, trajectories are the largest (full state history) but
-    # only rendering and explicit evaluate() calls need them.
+    # Cache bounds.  Info dicts hold dense curves (tens of kB), summaries are
+    # tiny, trajectories are largest but only rendering and evaluate() use
+    # them.  The other three memo pure functions one evaluation calls several
+    # times: _make_curve, the spline repair in _normalize_track_points, and
+    # the terms dict quality() and controlability() share (which must hold
+    # more than a generation of 100).  512 curves of ~1000 samples are 8 MB.
     _INFO_CACHE_MAX = 1024
     _SIM_SUMMARY_CACHE_MAX = 8192
     _TRAJECTORY_CACHE_MAX = 32
+    _CURVE_CACHE_MAX = 512
+    _NORMALIZE_CACHE_MAX = 512
+    _TERMS_CACHE_MAX = 256
 
     def _get_info_cache_key(self, track_points):
-        """Dictionary key for a set of track points: a tuple of (x, y) tuples
-        (arrays cannot be dict keys, tuples can)."""
-        arr = np.asarray(track_points).reshape(-1, 2)
-        return tuple((row[0], row[1]) for row in arr)
+        """Dictionary key for a set of track points: a tuple of row tuples
+        (arrays cannot be dict keys, tuples can).  A row is (x, y), or
+        (x, y, straight share) for a free-spline genome, whose curve depends
+        on all three."""
+        arr = np.asarray(track_points)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 2)
+        return tuple(tuple(row) for row in arr)
 
     def _extract_content(self, content):
         if content is None:
             return self._default_track_points
         if isinstance(content, dict):
-            return content.get("track_points", self._default_track_points)
+            pts = content.get("track_points", self._default_track_points)
+            if "straight_frac" in content:
+                # One row per control point: x, y and the straight share of
+                # the edge leaving it.  The row keeps its gene through 2-opt
+                # and overlap repair, which reorder and drop points;
+                # _build_curve reads the third column.
+                return np.column_stack([np.asarray(pts, dtype=float).reshape(-1, 2),
+                                        np.asarray(content["straight_frac"], dtype=float).reshape(-1)])
+            return pts
         return content
 
-    # Free-form racing splines its control points in genome order, producing a
-    # self-crossing "ball of yarn"; reordering into a non-crossing tour first
-    # fixes that.  Only this class needs it.  Radial visits points in angle
-    # order and the constructive decoders return points already tracing a valid
-    # loop, so reordering would break the loop; those subclasses set it False.
+    # Splined in genome order, free-form control points cross themselves, so
+    # they are reordered into a non-crossing tour first.  Radial and the
+    # constructive decoders already return a valid loop and set this False.
     _untangle_control_points = True
 
     @staticmethod
     def _untangle_2opt(pts, max_passes=60):
-        """Reorder a closed polygon's vertices into a non-self-intersecting tour
-        via 2-opt: while any two edges cross, reverse the span between them.
-        Each reversal removes a crossing and strictly shortens the tour, so this
-        always terminates at a simple polygon (standard convex-hull-racetrack
-        method; see the procedural-racetrack literature)."""
+        """Reorder a closed polygon into a non-crossing tour by 2-opt: while
+        two edges cross, reverse the span between them.  Each reversal
+        shortens the tour, so it ends simple.  On 520 random genomes (seeds
+        1-13) the most passes needed was 4.
+
+        A simple polygon still need not give a simple road: the spline bows
+        outside it, centrelines closer than the road width overlap without
+        crossing, and a vertex that doubles back folds the inner edge.
+        _drop_overlap_points handles all three."""
         pts = np.asarray(pts, dtype=float).copy()
         n = len(pts)
         if n < 4:
@@ -166,6 +165,85 @@ class RacingProblem(Problem):
                 break
         return pts
 
+    def _drop_overlap_points(self, pts):
+        """Remove control points until the spline passes the self-overlap test.
+
+        A control point where the polygon doubles back forces the spline
+        through a turn of a few metres.  On 40 random genomes (seed 21) every
+        track failed the gate, the tightest spot a median 4.7 m from a
+        control point turning 171 degrees; 13% of control points turn more
+        than 150 degrees.  So the point nearest the failure is removed and
+        the polygon untangled again, down to six points.  On the same 40
+        genomes (16 points, fold test on, 12 m road) none fails afterwards,
+        a mean of 11.7 points remain, and the median lap is 4063 m.
+
+        Simpler options, measured with the edge crossing tests alone, left
+        tracks failing: dropping every point turning over 135 degrees 12 of
+        40; smoothing wherever tighter than 8 m 31 of 40 (moving the road
+        40 m); an approximating cubic B-spline 35 of 40, lap 4221 m.
+        """
+        # Tested as _normalize_track_points returns it, not reordered again:
+        # _straighten and the resampling start at vertex 0, and on 1 of 40
+        # genomes a curve that passed from one start vertex failed from another.
+        return self._repair_overlaps(pts, self._make_curve, self._untangle_2opt)
+
+    def _repair_overlaps(self, pts, build_curve, reorder=None):
+        """While the curve build_curve(pts) fails the shared self-overlap
+        test, remove the point nearest the failure (_overlap_spot), and apply
+        `reorder` to what is left, down to six points.  racing-v0 repairs its
+        control points with it (_drop_overlap_points, with 2-opt as the
+        reorder) and racingvoronoi its cell rim (_drop_tight_corners, no
+        reorder).  Six points is the floor: a curve that still fails there
+        keeps its overlap and scores 0."""
+        pts = np.asarray(pts, dtype=float)
+        width = float(self._track_width)
+        while len(pts) > 6:
+            curve = build_curve(pts)
+            if (count_self_intersections(curve)
+                    + count_track_area_intersections(curve, track_width=width) == 0):
+                break
+            k = int(np.argmin(np.linalg.norm(pts[:, :2] - self._overlap_spot(curve), axis=1)))
+            pts = np.delete(pts, k, axis=0)
+            if reorder is not None:
+                pts = reorder(pts)
+        return pts
+
+    def _overlap_spot(self, curve):
+        """Where a curve that fails the self-overlap test fails it: the
+        tightest sample when its radius is under half the track width (the
+        inner road edge folds there), otherwise the midpoint of the closest
+        pair of samples more than half a turn of that radius plus one track
+        width apart along the loop."""
+        c = np.asarray(curve, dtype=float)
+        if np.allclose(c[0], c[-1]):
+            c = c[:-1]
+        a, b = np.roll(c, 1, axis=0), np.roll(c, -1, axis=0)
+        cross = np.abs((c - a)[:, 0] * (b - a)[:, 1] - (c - a)[:, 1] * (b - a)[:, 0])
+        radius = (np.linalg.norm(c - a, axis=1) * np.linalg.norm(b - c, axis=1)
+                  * np.linalg.norm(b - a, axis=1) / np.maximum(2.0 * cross, 1e-12))
+        width = float(self._track_width)
+        if radius.min() < 0.5 * width:
+            return c[int(np.argmin(radius))]
+        # Closest pair more than min_sep samples apart along the loop, from
+        # each sample's k nearest neighbours; k doubles until every sample
+        # has one far enough along the loop, so memory is n x k rather than
+        # the n x n distance matrix (a 7000 m lap has n = 1400).
+        from scipy.spatial import cKDTree
+        n = len(c)
+        min_sep = (np.pi * 0.5 * width + width) / self._curve_step()
+        tree = cKDTree(c)
+        k = min(n, 32)
+        while True:
+            d, j = tree.query(c, k=k)
+            sep = np.abs(j - np.arange(n)[:, None])
+            far = np.minimum(sep, n - sep) > min_sep
+            if far.any(axis=1).all() or k >= n:
+                break
+            k = min(n, 2 * k)
+        d = np.where(far, d, np.inf)
+        i = int(np.argmin(d.min(axis=1)))
+        return 0.5 * (c[i] + c[j[i, int(np.argmin(d[i]))]])
+
     def _normalize_track_points(self, track_points):
         if track_points is None:
             track_points = self._default_track_points
@@ -174,24 +252,44 @@ class RacingProblem(Problem):
         track_points = np.asarray(track_points, dtype=float)
         if track_points.ndim == 1:
             track_points = track_points.reshape(-1, 2)
+        # A third column, when present, is the straight-share gene (see
+        # _extract_content); geometry tests read only x and y.
 
         if len(track_points) >= 4:
-            # Untangle first (free-form racing only), so the seam is chosen on
-            # the final non-crossing loop.
-            if self._untangle_control_points:
-                track_points = self._untangle_2opt(track_points)
-            # Rotate seam to the smoothest vertex (smallest local turn angle).
-            best_i = lowest_turn_seam_index(track_points)
-            if best_i != 0:
-                track_points = np.vstack([track_points[best_i:], track_points[:best_i]])
+            # Only a genome's own control points are reordered and repaired.
+            # A track handed in as geometry (a reference circuit, a saved
+            # decode) is already a road and both steps would damage it: 2-opt
+            # would reverse Suzuka's figure-of-eight crossover (a bridge), and
+            # the repair would delete points of any circuit failing the gate.
+            # Such a circuit stays a failure: the gate is the same for every track.
+            if self._untangle_control_points and len(track_points) == self.num_points:
+                # Memoised, since info, evaluate, reset and the simulation
+                # summary all run it; the output is stored under its own key
+                # too, so normalising a repaired genome again is a lookup.
+                key = (track_points.shape, track_points.tobytes())
+                fixed = self._normalize_cache.get(key)
+                if fixed is None:
+                    fixed = self._drop_overlap_points(self._untangle_2opt(track_points))
+                    fixed = np.asarray(fixed, dtype=float)
+                    self._normalize_cache[key] = fixed
+                    self._normalize_cache[(fixed.shape, fixed.tobytes())] = fixed
+                track_points = fixed.copy()
         return track_points
 
     @staticmethod
     def _curve_turn_profile(curve_points):
-        """(signed turn at each interior sample, arc weight of each sample)."""
+        """(signed turn at each interior sample, arc weight of each sample).
+
+        On a closed curve (last point repeating the first) the first segment
+        is appended once more, so ang[i] is the turn at vertex i + 1 and the
+        last entry the turn at vertex 0, the start line.  Without it that turn
+        is dropped, which is wrong when _place_start puts the line at a
+        corner exit (a longest straight under _START_TO_CORNER_M)."""
         cp = np.asarray(curve_points, dtype=float)
         if len(cp) < 3:
             return np.zeros(0), np.zeros(0)
+        if np.allclose(cp[0], cp[-1], atol=1e-9):
+            cp = np.vstack([cp, cp[1:2]])
         d = cp[1:] - cp[:-1]
         n = np.linalg.norm(d, axis=1, keepdims=True)
         ok = n[:, 0] > 1e-3
@@ -203,49 +301,48 @@ class RacingProblem(Problem):
         seg = n[:, 0]
         return np.arctan2(cross, dots), 0.5 * (seg[:-1] + seg[1:])
 
-    def _find_corners(self, signed_ang, balance_w):
+    def _find_corners(self, signed_ang, balance_w, curv_deg_per_m=None,
+                      min_turn_deg=None, spans=False):
         """Corners as a designer counts them: consecutive same-direction
         curved samples accumulated until a sustained straight or a change of
-        direction, keeping every run that swept at least corner_min_turn_deg.
-        Returns (turns_rad, arclens_m), one entry per corner.
+        direction, keeping every run that swept at least corner_min_turn_deg
+        (or min_turn_deg when given).  Returns (turns_rad, arclens_m), one
+        entry per corner, and with spans=True also each corner's (start, end)
+        in metres along the lap.
 
-        Thresholding on the ACCUMULATED turn rather than on one sample's angle
-        is what makes the count invariant to sampling density.  A per-vertex
-        count is not: at the 5.0 m curve step a vertex only passes a 20 degree
-        test when the corner radius is under 14.3 m, and the 24 reference
-        circuits sit at a 14.28 m 10th percentile, so a per-vertex count
-        reports 0 turns for Suzuka, Brands Hatch, Budapest, Oschersleben and
-        Sao Paulo.
+        Thresholding the ACCUMULATED turn keeps the count independent of the
+        sampling.  A per-vertex 20 degree test at the 5 m step needs a radius
+        under 14.3 m and reports 0 turns for Suzuka, Brands Hatch, Budapest,
+        Oschersleben and Sao Paulo.
 
-        A corner closes only after a straight run longer than
-        corner_gap_max_m, not on the first straight sample: the tile and hex
-        decoders sample an arc as large turn jumps separated by straight
-        densification samples, so resetting on a single straight sample would
-        split every arc into sub-threshold pieces and find no corners at all.
-        Splines are unaffected, their real straights far exceed the
-        tolerance."""
+        A corner closes only after a straight longer than corner_gap_max_m:
+        the tile decoders sample an arc as turn jumps between straight
+        samples, so closing on one straight sample would split every arc into
+        sub-threshold pieces."""
         P = self._QUALITY_PARAMS
-        min_turn = np.deg2rad(P["corner_min_turn_deg"])
-        # Per-sample turn angle below which a sample counts as straight.
-        # Derived from the same flat-out curvature threshold the
-        # straight-balance term uses, times the curve step, so it states one
-        # curvature rule rather than a second number that would have to be
-        # re-tuned whenever the step changes.  At 5.0 m that is 4.0 degrees.
-        thresh = np.deg2rad(
-            float(P["straight_curv_deg_per_m"]) * self._curve_step())
+        min_turn = np.deg2rad(P["corner_min_turn_deg"] if min_turn_deg is None else min_turn_deg)
+        # A sample counts as straight below a curvature line times the curve
+        # step, one rule that holds at any step (the corner-core line by
+        # default, 4.0 degrees at 5 m).
+        if curv_deg_per_m is None:
+            curv_deg_per_m = P["straight_curv_deg_per_m"]
+        thresh = np.deg2rad(float(curv_deg_per_m) * self._curve_step())
         gap_max = float(P["corner_gap_max_m"])
-        turns, arclens = [], []
+        turns, arclens, bounds = [], [], []
         acc, run_len, cur_sign, gap_len = 0.0, 0.0, 0, 0.0
+        s_pos, start = 0.0, 0.0
 
         def _close():
             nonlocal acc, run_len, cur_sign, gap_len
             if abs(acc) >= min_turn:
                 turns.append(abs(acc))
                 arclens.append(run_len)
+                bounds.append((start, start + run_len))
             acc, run_len, cur_sign, gap_len = 0.0, 0.0, 0, 0.0
 
         for i, a in enumerate(signed_ang):
             w = float(balance_w[i])
+            s_pos += w
             if abs(a) < thresh:
                 if cur_sign == 0:
                     continue  # not inside a corner yet: plain straight
@@ -258,49 +355,491 @@ class RacingProblem(Problem):
             sgn = 1 if a > 0 else -1
             if sgn != cur_sign and cur_sign != 0:
                 _close()
+            if cur_sign == 0:
+                start = s_pos - w
             acc += a
             run_len += w
             cur_sign = sgn
             gap_len = 0.0  # a curved sample resumes the corner
         _close()
+        if spans:
+            return turns, arclens, bounds
         return turns, arclens
 
+    def _fia_corners(self, signed_ang, balance_w):
+        """Corners as FIA Appendix O (2026) Art. 7.7 defines them for the start
+        rule, "a change of direction of at least 45 degrees, with a radius of
+        less than 300 m", and the longest stretch of lap between two of them.
+        Returns (count, longest_gap_m).
+
+        The walker runs on the FIA 300 m line with a 45 degree minimum and
+        drops corners with a mean radius of 300 m or more.  The gap is
+        measured on the centreline: Art. 7.2's racing line needs a driver."""
+        P = self._QUALITY_PARAMS
+        turns, arcs, bounds = self._find_corners(
+            signed_ang, balance_w, P["fia_corner_curv_deg_per_m"],
+            min_turn_deg=45.0, spans=True)
+        keep = [b for t, a, b in zip(turns, arcs, bounds) if a / max(t, 1e-9) < 300.0]
+        lap = float(np.sum(balance_w))
+        if not keep:
+            return 0, lap
+        # Corners come in lap order; the last gap wraps through the start.
+        gaps = [max(0.0, keep[k + 1][0] - keep[k][1]) for k in range(len(keep) - 1)]
+        gaps.append(max(0.0, keep[0][0] + lap - keep[-1][1]))
+        return len(keep), float(max(gaps))
+
+    # Corner classes of the census (24 circuits, 360 corners on the FIA 300 m
+    # line): hairpin (150 degrees or more), then by mean radius slow (< 44 m),
+    # medium (44-75), fast (75-150), sweeper (>= 150), shares 0.13 / 0.29 /
+    # 0.24 / 0.29 / 0.08.  Edges and the hairpin test are modelling choices;
+    # at the 1.11 g limit the edges are 79, 103 and 146 km/h.
+    _CORNER_CLASS_EDGES_M = (44.0, 75.0, 150.0)
+    _HAIRPIN_MIN_DEG = 150.0
+
+    def _corner_class_counts(self, turns, arcs):
+        """(slow, fast) corner counts: slow = hairpins + slow corners, fast =
+        fast corners + sweepers, from the corners turn_count counts (the
+        _find_corners output on the FIA line)."""
+        slow = fast = 0
+        r_slow, r_fast, _ = self._CORNER_CLASS_EDGES_M
+        for t, a in zip(turns, arcs):
+            if np.rad2deg(t) >= self._HAIRPIN_MIN_DEG:
+                slow += 1
+                continue
+            r = a / max(t, 1e-9)
+            if r < r_slow:
+                slow += 1
+            elif r >= r_fast:
+                fast += 1
+        return slow, fast
+
+    # Quasi-steady-state lap simulation (Siegler, Deakin & Crolla 2000): the
+    # cornering limit at each point, then a forward pass limited by power and
+    # grip and a backward pass limited by braking, in a friction ellipse.  No
+    # driver, so its shares do not move when the policy is retrained.  Car
+    # figures are engine.py's; the grip limits are physics_tests.py
+    # measurements of it (1.11 g cornering; 1.20 g braking, the 32.7 m stop
+    # from 100 km/h).  Why not the RL lap: the policy tops out at 47 of
+    # 85.5 m/s, so its throttle trace describes the policy.  Why not a
+    # transient simulation: that is the engine's own, and it needs a driver.
+    _QSS_LAT_G = 1.11
+    _QSS_BRAKE_G = 1.20
+    # Curvature averaged over 5 samples (25 m) before the limit is taken: a
+    # racing line cuts the centreline, and a GPS centreline is noisy at 5 m.
+    # A modelling choice.
+    _QSS_SMOOTH = 5
+
+    # A braking stop (stops_20) sheds at least 20 m/s, a modelling choice
+    # that leaves out lifts before fast corners.  On the 24 circuits it counts
+    # 5-11 stops (median 7), inside Brembo's 3 (Silverstone, 2026) to 15
+    # (Monaco, 2025) braking events per F1 lap.
+    _QSS_STOP_MPS = 20.0
+
+    def _lap_simulation(self, curve_points):
+        """Quasi-steady-state lap measures: the share of lap time at full
+        throttle (the samples where the car accelerates rather than brakes or
+        holds the cornering limit, full throttle at top speed included), the
+        share at the cornering limit, and the number of braking stops that
+        shed _QSS_STOP_MPS or more.  Returns a dict of the three."""
+        ang, w = self._curve_turn_profile(curve_points)
+        n = len(ang)
+        if n < 3:
+            return {"throttle_share": 0.0, "limit_share": 0.0, "stops_20": 0}
+        k = np.abs(ang) / np.maximum(w, 1e-9)
+        m = self._QSS_SMOOTH
+        k = np.convolve(np.r_[k[-m:], k, k[:m]], np.ones(m) / m, "same")[m:-m]
+        car = getattr(self, "_qss_car", None)
+        if car is None:   # read once: building an engine also builds its tyre tables
+            e = CarPhysicsEngine(start_position=np.zeros(2), start_angle=0.0)
+            car = self._qss_car = (e.mass, e.max_power, e.driveline_eff, e.rho_air,
+                                   e.cd_a, e.cl_a, e.c_rr, float(e.max_speed))
+        mass, power, eta, rho, cd_a, cl_a, c_rr, vmax = car
+        g = 9.81
+        drag = 0.5 * rho * cd_a
+        down = 0.5 * rho * cl_a / (mass * g)              # grip gain per (m/s)^2
+        roll = c_rr * g
+        ay0, ab0 = self._QSS_LAT_G * g, self._QSS_BRAKE_G * g
+        # cornering limit with downforce: v^2 k = ay0 (1 + down v^2)
+        vlim = np.full(n, vmax)
+        denom = k - ay0 * down
+        ok = denom > 1e-12
+        vlim[ok] = np.minimum(vmax, np.sqrt(ay0 / denom[ok]))
+        s0 = int(np.argmin(vlim))                  # start at the slowest point
+        order = np.r_[np.arange(s0, n), np.arange(0, s0)]
+        kk, ww, vl = k[order].tolist(), w[order].tolist(), vlim[order].tolist()
+        vf = [0.0] * n
+        vf[0] = vl[0]
+        for i in range(n - 1):
+            v = vf[i]
+            grip = 1.0 + down * v * v
+            rem = max(0.0, 1.0 - (v * v * kk[i] / (ay0 * grip)) ** 2) ** 0.5
+            a = (min(power * eta / max(v, 1.0), ay0 * grip * mass * rem) - drag * v * v) / mass - roll
+            vf[i + 1] = min(vl[i + 1], math.sqrt(max(v * v + 2.0 * a * ww[i], 0.0)))
+        vb = list(vf)
+        for i in range(n - 2, -1, -1):
+            v = vb[i + 1]
+            grip = 1.0 + down * v * v
+            rem = max(0.0, 1.0 - (v * v * kk[i + 1] / (ay0 * grip)) ** 2) ** 0.5
+            a = ab0 * grip * rem + drag * v * v / mass + roll
+            vb[i] = min(vb[i], math.sqrt(v * v + 2.0 * a * ww[i]))
+        t_all = t_thr = t_lim = 0.0
+        stops, run_from = 0, None
+        for i in range(n):
+            dt = ww[i] / max(vb[i], 0.5)
+            t_all += dt
+            braking = vb[i] < vf[i] - 1e-6
+            at_limit = vb[i] >= vl[i] - 1e-3 and vl[i] < vmax - 1e-3
+            if not braking and not at_limit:
+                t_thr += dt
+            if at_limit and not braking:
+                t_lim += dt
+            # The lap starts at its slowest point, which is not inside a
+            # braking run, so no run wraps past the end.
+            if braking and run_from is None:
+                run_from = vb[i - 1] if i > 0 else vb[i]
+            elif not braking and run_from is not None:
+                stops += (run_from - vb[i]) >= self._QSS_STOP_MPS
+                run_from = None
+        return {"throttle_share": t_thr / max(t_all, 1e-9),
+                "limit_share": t_lim / max(t_all, 1e-9), "stops_20": int(stops)}
+
+    # Typicality (Ritchie 2007, p. 73: "To what extent is the produced item
+    # an example of the artefact class in question?"), measured as the
+    # Mahalanobis (1936) distance of five features from the reference
+    # circuits, the 22 TUMFTM circuits that pass the validity gates and the
+    # length rule.  The features are fixed in advance, one for each of
+    # Togelius, De Nardi & Lucas's (2006) factors that a layout carries,
+    # plus the layout itself, and all are measured without the driver:
+    #   throttle_share      factor 1, sensation of speed: share of the
+    #                       quasi-steady-state lap at full throttle
+    #                       (_lap_simulation; 45-80% in published F1 figures)
+    #   limit_share         factor 2, challenge: share of that lap at the
+    #                       cornering limit
+    #   curvature_entropy   factor 4, variety: how spread the lap's curvature
+    #                       is (Loiacono et al. 2011)
+    #   fia_corners_per_km  how densely corners come, as FIA Appendix O Art.
+    #                       7.7 defines a corner
+    #   compactness         the layout: 4 pi area / perimeter^2 of the
+    #                       centreline; circuits fold onto compact plots
+    # Factor 3 (neither impossible nor trivial) is the driven-lap stage;
+    # factor 5 (drift) has no measure.  Features are standardised by the
+    # reference mean and sd; their covariance gets a 0.1 ridge.  Full marks
+    # up to the largest leave-one-out distance of a reference circuit (Monza
+    # 4.80; then Oschersleben 3.60, Melbourne 3.57), so every circuit passes
+    # when held out; zero at twice that.  calibrate_typicality.py prints it.
+    #
+    # Why fixed in advance: features picked for separating generated tracks
+    # from circuits would fit the yardstick to what it compares.  Why five:
+    # with 22 circuits a larger covariance is unstable, and five covers each
+    # factor once.  Why not a band per feature: each set from 22 samples,
+    # and tracks unlike any circuit in combination still pass.
+    #
+    # Validation (calibration/, run20 at 12 m).  specificity.py: implausible
+    # tracks built from the circuits (half or double size, stretched 2.5
+    # times, a polygon) and 40 smooth random loops all fail; 1 of 22 passes
+    # with a 6 m, 150 m-wavelength ripple and 7 of 22 rounded into
+    # 3-5-corner blobs.  robustness.py (20 random genomes per representation,
+    # seed 21; share at quality 1.0 spline 0.60, tile 0.20, tilediag 0.40,
+    # the other three 0): the ranking holds (Kendall tau 1.0) under ridge
+    # 0.05 or 0.5, the second-largest leave-one-out distance, Hotelling's
+    # (1931) T^2 region at 95% or 99%, dropping any feature but limit_share,
+    # a sixth feature (turning per km), and off-road limits of 0.005 or 0.02.
+    # Dropping limit_share lets hex and Voronoi tracks through (tau 0.48); a
+    # minimum of 8 FIA corners rejects most spline tracks (tau 0.83).  The 95%
+    # region passes 2 of the 44 rippled and blob tracks against 8 here, with
+    # all 22 circuits still passing.
+    _TYPICALITY_FEATURES = ("throttle_share", "limit_share", "curvature_entropy",
+                            "fia_corners_per_km", "compactness")
+    _TYPICALITY = {
+        "mean": (0.669349, 0.0490351, 0.307654, 2.56142, 0.251404),
+        "sd": (0.0255822, 0.00888109, 0.05335, 0.514379, 0.0833846),
+        "inv_cov": ((2.84972, 0.807717, 1.2595, 0.266129, -0.499595),
+                    (0.807717, 2.52656, -0.70023, -0.614452, 0.362862),
+                    (1.2595, -0.70023, 3.22285, -1.02197, 0.360158),
+                    (0.266129, -0.614452, -1.02197, 2.07803, -0.71669),
+                    (-0.499595, 0.362862, 0.360158, -0.71669, 1.37373)),
+        "threshold": 4.801,
+    }
+
+    def _typicality_distance(self, features):
+        """Mahalanobis distance of a feature vector (in _TYPICALITY_FEATURES
+        order) from the reference circuits, in their standardised units."""
+        T = self._TYPICALITY
+        z = (np.asarray(features, dtype=float) - np.asarray(T["mean"])) / np.asarray(T["sd"])
+        return float(np.sqrt(max(0.0, z @ np.asarray(T["inv_cov"]) @ z)))
+
+    def _straight_windows(self, signed_ang, balance_w):
+        """Straights: runs of the lap whose heading changes by no more than
+        straight_heading_tol_deg over their whole length.
+
+        Works on the loop walked twice, so a straight can run through the
+        seam.  Returns (lens, left): for each sample r of the doubled loop,
+        left[r] starts the longest straight ending at r and lens[r] is its
+        length in metres, capped at one lap.
+
+        The tolerance bounds the heading change over the whole run, so it
+        does not depend on the curve step.  A per-sample curvature test fails
+        both ways: no circuit sample has exactly zero curvature, and the
+        0.8 deg/m corner-core line passes a 300 m sweeper as straight.  Why
+        not compare only first and last heading: an S-bend would pass.  Why
+        not a sagitta test: a second tolerance, and the heading range already
+        bounds it (1 degree over 500 m allows 4.4 m of drift)."""
+        P = self._QUALITY_PARAMS
+        n = len(signed_ang)
+        # heading[j] is the direction of curve segment j relative to segment 0.
+        # Sample i turns between segments i and i + 1, so a run of samples
+        # l..r spans segment headings l..r + 1.
+        heading = np.concatenate([[0.0], np.rad2deg(np.cumsum(np.concatenate([signed_ang, signed_ang])))])
+        cum = np.concatenate([[0.0], np.cumsum(np.concatenate([balance_w, balance_w]))])
+        tol = float(P["straight_heading_tol_deg"])
+        left = np.zeros(2 * n, dtype=int)
+        hi, lo = deque([0]), deque([0])  # segment indices of the running max and min heading
+        start = 0
+        for r in range(2 * n):
+            j = r + 1
+            while hi and heading[hi[-1]] <= heading[j]:
+                hi.pop()
+            hi.append(j)
+            while lo and heading[lo[-1]] >= heading[j]:
+                lo.pop()
+            lo.append(j)
+            while heading[hi[0]] - heading[lo[0]] > tol or r - start + 1 > n:
+                start += 1
+                if hi[0] < start:
+                    hi.popleft()
+                if lo[0] < start:
+                    lo.popleft()
+            left[r] = start
+        # A sample that turns by more than the tolerance on its own leaves
+        # start at r + 1: an empty run of length 0.
+        lens = cum[np.arange(2 * n) + 1] - cum[np.minimum(left, np.arange(2 * n) + 1)]
+        return lens, left
+
+    def _straight_mask(self, straight_lens, straight_left):
+        """Which samples lie inside a straight at least corner_gap_max_m long.
+
+        That is the gap the corner walker bridges, so a shorter straight is
+        part of its corner; with no minimum every 5 m sample of a gentle curve
+        would be a straight.  Marked on the doubled loop and folded back, so a
+        straight through the seam counts once."""
+        n = len(straight_lens) // 2
+        keep = straight_lens >= float(self._QUALITY_PARAMS["corner_gap_max_m"])
+        marks = np.zeros(2 * n + 1)
+        np.add.at(marks, straight_left[keep], 1)
+        np.add.at(marks, np.flatnonzero(keep) + 1, -1)
+        covered = np.cumsum(marks)[:2 * n] > 0
+        return covered[:n] | covered[n:]
+
+    def _straight_fraction(self, balance_w, straight_lens, straight_left):
+        """Share of the lap's arc length inside straights (_straight_mask)."""
+        covered = self._straight_mask(straight_lens, straight_left)
+        return float(np.sum(balance_w[covered]) / max(float(np.sum(balance_w)), 1e-9))
+
+    def _between_fraction(self, local_curv, balance_w, straight_lens, straight_left):
+        """Share of the lap's arc length that is neither straight nor corner:
+        the gentle curve the supervisor's "clear corner/straight separation"
+        asks a track not to have much of.
+
+        Straight is _straight_mask; corner is curvature at or above the FIA
+        300 m line (Art. 7.7), averaged over corner_gap_max_m either side so a
+        flat sample inside a corner is not in-between.  On the 24 circuits:
+        p10 0.009, median 0.057, p90 0.096.  Why not the straight share alone:
+        it cannot tell corners from 2 degree bends.  Why not a per-corner
+        transition length: the FIA text does not say where a corner begins,
+        and Kmonicek et al. (2019) note concept design uses no transitions."""
+        P = self._QUALITY_PARAMS
+        straight = self._straight_mask(straight_lens, straight_left)
+        k = max(1, int(round(float(P["corner_gap_max_m"]) / self._curve_step())))
+        window = np.ones(2 * k + 1) / (2 * k + 1)
+        smooth = np.convolve(np.concatenate([local_curv[-k:], local_curv, local_curv[:k]]),
+                             window, "valid")
+        corner = (smooth >= float(P["fia_corner_curv_deg_per_m"])) & ~straight
+        between = ~straight & ~corner
+        return float(np.sum(balance_w[between]) / max(float(np.sum(balance_w)), 1e-9))
+
     def _make_curve(self, track_points):
-        """Dense polyline used for simulation, scoring, and rendering.
+        """The dense closed centreline simulation, scoring and rendering use:
+        _build_curve, started at the start line (_place_start).  Memoised on
+        the points (every _build_curve is a pure function); the cached array
+        is read-only, so an in-place change raises rather than leaks."""
+        pts = np.asarray(track_points, dtype=float)
+        key = (pts.shape, pts.tobytes())
+        curve = self._curve_cache.get(key)
+        if curve is None:
+            curve = np.asarray(self._place_start(self._build_curve(pts)), dtype=float)
+            curve.setflags(write=False)
+            self._curve_cache[key] = curve
+        return curve
 
-        Each representation builds its centreline the way its geometry
-        requires: the base problem interpolates a spline through control
-        points that are not themselves road geometry, while the decoders
-        whose waypoints already ARE the road (voronoi polygons, tile arcs)
-        override this and only re-space what they produced, because a spline
-        through them would add wobble the design does not have.
+    # Start line to the end of its straight.  FIA Appendix O (2026) Art. 7.7:
+    # "preferably at least 250 m between the start line and the first
+    # corner"; Kmonicek et al. (2019, Table 2): 111-1030 m, median 320 m.
+    # 250 m is a user decision, for the citable figure.
+    _START_TO_CORNER_M = 250.0
 
-        Whatever the shape, the result leaves here at one arc-length spacing,
-        so how finely a track is measured is not a property of which
-        representation produced it."""
-        pts = np.asarray(track_points, dtype=float).reshape(-1, 2)
-        return self._resample_uniform(
-            interpolate_curves(pts, samples_per_segment=self._spline_samples(pts)),
-            step=self._curve_step())
+    def _place_start(self, curve):
+        """Rotate a closed curve to start on its longest straight
+        (_straight_windows), _START_TO_CORNER_M before it ends, or at its
+        first sample when it is shorter; the rest lies behind the line, where
+        a grid stands, as real start lines are set.  It only re-indexes the
+        loop, by one rule for every representation.  Why not on the
+        representation's own polygon: that lands on a straight only by chance
+        and differs between them.  Why not interpolate to exactly 250 m: a
+        5 m sample is within one step."""
+        c = np.asarray(curve, dtype=float).reshape(-1, 2)
+        p = c[:-1] if len(c) > 1 and np.allclose(c[0], c[-1], atol=1e-9) else c
+        n = len(p)
+        if n < 4:
+            return c
+        # On the closed curve ang[i] is the turn at vertex i + 1 (see
+        # _curve_turn_profile), so a straight whose samples run l..r covers
+        # the segments from vertex l to vertex r + 2.
+        ang, w = self._curve_turn_profile(np.vstack([p, p[:1]]))
+        lens, left = self._straight_windows(ang, w)
+        r = int(np.argmax(lens))
+        seg = np.linalg.norm(np.roll(p, -1, axis=0) - p, axis=1)
+        v, ahead = r + 2, 0.0
+        while v > left[r] and ahead < self._START_TO_CORNER_M:
+            v -= 1
+            ahead += seg[v % n]
+        start = v % n
+        out = np.vstack([p[start:], p[:start]])
+        return np.vstack([out, out[:1]])
 
-    # Arc-length spacing of every representation's curve, in metres.
+    def _build_curve(self, track_points):
+        """The representation's closed centreline, before the start line.
+
+        Here a spline through control points that are not road geometry;
+        decoders whose waypoints are the road (Voronoi rims, tile arcs)
+        override it and only re-space, as a spline would add wobble.  Every
+        result leaves at one arc-length step, so measurement resolution does
+        not depend on the representation."""
+        pts = np.asarray(track_points, dtype=float)
+        if pts.ndim == 2 and pts.shape[1] == 3:
+            pts = self._edge_handles(pts)
+        pts = pts.reshape(-1, 2)
+        spline = interpolate_curves(pts, samples_per_segment=self._spline_samples(pts))
+        return self._resample_uniform(self._straighten(spline), step=self._curve_step())
+
+    # Upper end of the straight-share gene: a straight takes up to 80% of its
+    # edge, the corners at either end at least 10% each.  Median lap shares
+    # straight / corner / in-between on 20 random genomes (seed 21, before
+    # repair), against 0.63 / 0.34 / 0.06 on the circuits:
     #
-    # 5.0 m is the spacing of the 25 real circuits in
-    # model_training/racetrack-database-master, measured across the files:
-    # mean 5.00, median 5.00, min 4.58, max 5.25.  Every quality band in
-    # _QUALITY_PARAMS was calibrated by running those circuits through this
-    # same code, so generated content is measured at the resolution its
-    # reference values were measured at.
+    #   gene range   straight  corner  in-between
+    #   0 to 0.6         0.53    0.28        0.17
+    #   0 to 0.8         0.62    0.25        0.12
     #
-    # An absolute figure rather than a fraction of track width, because the
-    # anchor is the reference database and not the road.  Corner-cutting from
-    # the re-spacing stays small: at the 10 m minimum corner radius the
-    # quality function enforces, a 5.0 m chord cuts 0.31 m at mid-chord
-    # against a 16 m track width, and at the 38 m radius of the tightest hex
-    # tile it cuts 0.08 m.
+    # 0.8 is a user decision.  Through the full decode (40 genomes) the
+    # shares are 0.65 / 0.26 / 0.07 against 0.53 / 0.26 / 0.20 for a spline
+    # through the vertices; median longest straight 575 m against 395 m.
+    _STRAIGHT_FRAC_MAX = 0.8
+
+    def _edge_handles(self, rows):
+        """Catmull-Rom control points for a polygon whose rows are x, y and
+        the share s of the edge leaving that vertex that is straight.
+
+        A Catmull-Rom segment p1 -> p2 is straight only when p0..p3 are
+        collinear.  So an edge a -> b whose straight is at least
+        corner_gap_max_m gets four points: the straight runs from
+        a + u(b - a) to b - u(b - a), u = (1 - s) / 2, with one more point
+        halfway between each end and its vertex.  The middle is then exact
+        (2.6e-13 m off the chord, against 0.87 m with two points) and the
+        corner turns between edges; the vertices are not on the curve.  A
+        shorter straight gets points at 1/3 and 2/3 instead, so its corners
+        run together (the walker would read it as corner anyway).  The
+        halfway and 1/3 placements are modelling choices.
+
+        Why not four points at fixed shares of every edge: 0.70 / 0.23 /
+        0.06 on the same genomes, but every edge then has a straight, so no
+        two corners can follow each other.  Why not Voronoi-style arcs: no
+        longer a spline; clothoids would need a transition length of their
+        own (Kmonicek et al. 2019 use none)."""
+        rows = np.asarray(rows, dtype=float)
+        a = rows[:, :2]
+        edge = np.roll(a, -1, axis=0) - a
+        length = np.linalg.norm(edge, axis=1)
+        s = np.clip(rows[:, 2], 0.0, self._STRAIGHT_FRAC_MAX)
+        gap = float(self._QUALITY_PARAMS["corner_gap_max_m"])
+        out = []
+        for i in range(len(a)):
+            u = 0.5 * (1.0 - s[i])
+            if s[i] * length[i] >= gap:
+                out.extend(a[i] + f * edge[i] for f in (0.5 * u, u, 1.0 - u, 1.0 - 0.5 * u))
+            else:
+                out.extend(a[i] + f * edge[i] for f in (1.0 / 3.0, 2.0 / 3.0))
+        return np.asarray(out)
+
+    # A spline stretch whose heading stays within _STRAIGHTEN_TOL_DEG and
+    # whose mean radius (length over heading range) is at least
+    # _STRAIGHTEN_MIN_RADIUS_M becomes the chord between its ends: a
+    # Catmull-Rom curve is never exactly straight, so without this a spline
+    # track has no straight as the constructive ones do.  5 degrees and
+    # 750 m are a user decision.  Medians over 20 random genomes (16 points):
     #
-    # One number for all four: a difference between them would be a
-    # difference in how finely each representation is measured.
+    #   rule             longest straight  start straight  straight share  max move
+    #   off                        220 m            95 m            0.38     0.0 m
+    #   2 deg / 750 m              295 m           123 m            0.51     1.5 m
+    #   5 deg / 400 m              370 m           225 m            0.65     5.2 m
+    #   5 deg / 750 m              372 m           225 m            0.52     5.2 m
+    #   5 deg / 1200 m             370 m           225 m            0.42     5.2 m
+    #
+    # The tolerance finds the straights (at 2 degrees the longest is 77 m
+    # shorter); the radius floor sets how much counts as straight (0.65 at
+    # 400 m, 0.42 at 1200 m) without moving the road further.  On the 25
+    # circuits the median longest straight goes 650 to 710 m, the tightest
+    # corner 19.3 to 19.0 m, the road moving at most 4.7 m.
+    #
+    # The table predates the straight gene (_edge_handles).  With it, on 40
+    # random genomes (seed 21), the median longest straight is 580 m against
+    # 488 m without straightening, the share 0.65 against 0.59, at the same
+    # median lap.  It also runs on the circuits typicality is fitted on.
+    _STRAIGHTEN_TOL_DEG = 5.0
+    _STRAIGHTEN_MIN_RADIUS_M = 750.0
+
+    def _straighten(self, curve):
+        """Replace near-straight stretches of a closed dense curve with chords.
+
+        Walks the loop once from its sharpest vertex (so no stretch is cut
+        at the walk's start), growing each stretch while its heading range
+        stays within _STRAIGHTEN_TOL_DEG; one with a mean radius of at least
+        _STRAIGHTEN_MIN_RADIUS_M keeps only its end vertices.  The start of
+        the returned closed curve does not matter (_place_start sets it)."""
+        c = np.asarray(curve, dtype=float).reshape(-1, 2)
+        p = c[:-1] if len(c) > 1 and np.allclose(c[0], c[-1], atol=1e-9) else c
+        m = len(p)
+        if m < 4:
+            return c
+        seg = np.roll(p, -1, axis=0) - p                    # segment j runs p[j] -> p[j+1]
+        seg_len = np.linalg.norm(seg, axis=1)
+        direction = np.arctan2(seg[:, 1], seg[:, 0])
+        turn = np.angle(np.exp(1j * (np.roll(direction, -1) - direction)))  # at vertex j + 1
+        first = (int(np.argmax(np.abs(turn))) + 1) % m      # segment leaving the sharpest vertex
+        order = (first + np.arange(m)) % m
+        heading = np.rad2deg(np.concatenate([[0.0], np.cumsum(turn[order][:-1])]))
+        tol = float(self._STRAIGHTEN_TOL_DEG)
+        keep = np.ones(m, dtype=bool)
+        a = 0
+        while a < m:
+            b, top, bottom = a, heading[a], heading[a]
+            while (b + 1 < m and max(top, heading[b + 1]) - min(bottom, heading[b + 1]) <= tol):
+                b += 1
+                top, bottom = max(top, heading[b]), min(bottom, heading[b])
+            length = float(np.sum(seg_len[order[a:b + 1]]))
+            if b > a and length >= self._STRAIGHTEN_MIN_RADIUS_M * np.deg2rad(top - bottom):
+                keep[order[a + 1:b + 1]] = False            # vertices inside the stretch
+            a = b + 1
+        out = p[keep]
+        return np.vstack([out, out[:1]])
+
+    # Arc-length spacing of every representation's curve.  5.0 m is the
+    # spacing of the 24 reference circuits (per-file mean and median 5.00,
+    # segments 4.33-5.41), which every calibration runs through this code, so
+    # generated tracks are measured at their references' resolution.  An
+    # absolute figure, since the anchor is the database, not the road.  The
+    # chord cut stays small: 0.55 m at the 6 m fold radius of a 12 m road,
+    # 0.08 m at the 38 m tightest hex tile.  One number for all, or a
+    # difference would be one of measurement resolution.
     _CURVE_STEP_M = 5.0
 
     def _curve_step(self) -> float:
@@ -308,16 +847,14 @@ class RacingProblem(Problem):
         return float(self._CURVE_STEP_M)
 
     def _spline_samples(self, control_points: np.ndarray) -> int:
-        """Samples per spline segment, chosen so the spline's own chords are
-        already shorter than the resample step.  The uniform pass then only
-        re-spaces points; if the spline were sampled coarsely it would cut
-        corners first and no re-spacing could put them back.
-
-        Aims at half a step per chord: the control polygon underestimates the
-        spline's arc length, since the curve bows outside its own hull, so
-        targeting a full step would leave chords longer than one.  Clamped at
-        256 because a degenerate genome can put two control points 1000 m
-        apart, and at 8 so a tiny loop still gets a curve."""
+        """Samples per spline segment, so the spline's chords are already
+        shorter than the resample step (a coarse spline would cut corners no
+        re-spacing restores).  Aims at half a step, since the curve bows
+        outside its control polygon; clamped to 8-256 for degenerate genomes.
+        One count for every segment: the long chords are straights, and on 40
+        random genomes (seed 21) the curve lies at most 0.050 m from the same
+        spline at 256 per segment (longest raw chord 27.2 m), so a
+        per-segment count would change nothing measurable."""
         pts = np.asarray(control_points, dtype=float).reshape(-1, 2)
         n_seg = max(1, len(pts))
         if n_seg < 2:
@@ -327,14 +864,19 @@ class RacingProblem(Problem):
         target = 2.0 * perimeter / (n_seg * max(self._curve_step(), 1e-9))
         return int(np.clip(np.ceil(target), 8, 256))
 
+    def _arc_samples(self, arc_length: float) -> int:
+        """Points along one constructive corner arc (tiles), half a curve
+        step apart as in _spline_samples.  Longer chords would stay as
+        straight pieces with kinks inside every corner, read as varied
+        corners: on the 20 best tracks of a racingtile GA generation, 6
+        points per quarter arc (18 m chords) against 60 gave curvature
+        entropy 0.453 against 0.322 (racingtilehex 0.452 against 0.213)."""
+        return max(1, int(np.ceil(2.0 * float(arc_length) / self._curve_step())))
+
     @staticmethod
     def _resample_uniform(points: np.ndarray, *, step: float) -> np.ndarray:
-        """Resample a closed polyline to uniform arc-length spacing.
-
-        Points land on the polyline, so this re-spaces a shape without
-        changing it: a tile corner stays the six-chord approximation of its
-        arc that the decoder built, it just stops being measured at a
-        different density from every other representation."""
+        """Resample a closed polyline to uniform arc-length spacing.  Points
+        land on the polyline, so the shape is kept and only re-spaced."""
         pts = np.asarray(points, dtype=float).reshape(-1, 2)
         if len(pts) < 3:
             return pts
@@ -352,21 +894,15 @@ class RacingProblem(Problem):
         return np.vstack([out, out[:1]])
 
     def _set_track_cache(self, track_points):
-        track_points = self._normalize_track_points(track_points)
-        if len(track_points) == 0:
-            self._final_target = None
-        else:
-            # Tracks are closed loops: the lap finishes back at the start.
-            self._final_target = track_points[0]
-        return track_points
+        """Normalized track points.  The finish target is not set here:
+        _setup_car sets it to the curve's first sample, the start line, since
+        control point 0 is not on the curve (_edge_handles, _place_start)."""
+        return self._normalize_track_points(track_points)
 
     @staticmethod
     def _closed_curve_length(points) -> float:
-        """Arc length of a closed polyline, including the closing segment.
-
-        Some representations hand back a curve whose last point repeats the
-        first; that duplicate is dropped before closing so its edge is not
-        counted twice."""
+        """Arc length of a closed polyline, closing segment included (a
+        repeated first point is dropped so that edge is not counted twice)."""
         p = np.asarray(points, dtype=float).reshape(-1, 2)
         if len(p) < 2:
             return 0.0
@@ -376,32 +912,10 @@ class RacingProblem(Problem):
             return 0.0
         return float(np.sum(np.linalg.norm(np.diff(np.vstack([p, p[:1]]), axis=0), axis=1)))
 
-    @staticmethod
-    def _compute_turn_angles(points: np.ndarray) -> np.ndarray:
-        """Return valid interior turn angles (radians) for a polyline."""
-        diffs = points[1:] - points[:-1]
-        if len(diffs) < 2:
-            return np.array([], dtype=float)
-        v1 = diffs[:-1]
-        v2 = diffs[1:]
-        v1_norm = np.linalg.norm(v1, axis=1, keepdims=True)
-        v2_norm = np.linalg.norm(v2, axis=1, keepdims=True)
-        valid = (v1_norm[:, 0] > 1e-3) & (v2_norm[:, 0] > 1e-3)
-        v1_unit = np.zeros_like(v1)
-        v2_unit = np.zeros_like(v2)
-        v1_unit[valid] = v1[valid] / v1_norm[valid]
-        v2_unit[valid] = v2[valid] / v2_norm[valid]
-        # Dot product of consecutive unit directions (x1*x2 + y1*y2 per row),
-        # clipped into arccos's valid input range.
-        dots = v1_unit[:, 0] * v2_unit[:, 0] + v1_unit[:, 1] * v2_unit[:, 1]
-        dots = np.clip(dots, -1.0, 1.0)
-        return np.arccos(dots)[valid]
-
     def _get_cached_simulation_summary(self, track_points, max_steps=None, *, curve_points=None):
-        """Simulate a policy and cache summary stats.
-
-        If curve_points are provided they are used directly, skipping re-interpolation.
-        """
+        """Drive the track once and cache (steps, finished, end_xy,
+        speed_entropy, offroad_frac); curve_points, when given, skip the
+        curve build."""
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
@@ -415,6 +929,10 @@ class RacingProblem(Problem):
         cached = self._simulation_summary_cache.get(key)
         if cached is not None:
             return cached
+        if self._driver == "torcs":
+            summary = self._torcs_summary(track_points, curve_points)
+            self._simulation_summary_cache[key] = summary
+            return summary
 
         if curve_points is not None:
             if len(curve_points) < 2:
@@ -439,10 +957,8 @@ class RacingProblem(Problem):
         y_max = float(self._height) - margin
 
         speeds = []
-        # Steps where the car is off the road (more than half a track width
-        # from the centerline).  This is the on-road signal, distinct from the
-        # geometry staying inside the map, which is a hard validity requirement
-        # handled in info()/quality().
+        # Off-road: car centre more than half a track width from the
+        # centreline (the on-road signal; leaving the map is the oob gate).
         half_width = 0.5 * float(self._track_width)
         offroad_steps = 0
         while not done and steps < max_steps:
@@ -451,13 +967,10 @@ class RacingProblem(Problem):
             x, y = float(state[0]), float(state[1])
             if x < x_min or x > x_max or y < y_min or y > y_max:
                 break
-            # Two passes, not one.  TrackGeometry.project searches a
-            # 60-segment window around the hint, so the second call re-centres
-            # that window on the first pass's answer and can reach a nearer
-            # segment the first window's edge cut off.  Collapsing them to a
-            # single projection raises mean off-road fraction from 0.091 to
-            # 0.139 on racing and 0.086 to 0.137 on racingradial, measured over
-            # 12 genomes at seed 4242.
+            # Two projection passes: TrackGeometry.project searches 60
+            # segments around the hint, and the second pass re-centres that
+            # window.  One pass raises mean off-road from 0.091 to 0.139 on
+            # racing (12 genomes, seed 4242).
             seg_idx, _proj = self._agent._find_projection(state[:2], self._agent.current_idx)
             if abs(self._agent._signed_lateral_offset(state[:2], seg_idx)) > half_width:
                 offroad_steps += 1
@@ -478,15 +991,44 @@ class RacingProblem(Problem):
         self._simulation_summary_cache[key] = summary
         return summary
 
+    def _torcs_summary(self, track_points, curve_points=None):
+        """The simulation summary from a TORCS race (torcs.run: berniw, two
+        laps, race mode).  TORCS records laps, total and best lap time,
+        corner-cutting penalty and damage (raceresults.cpp), not the car's
+        position, so:
+          finished       both laps completed
+          end_xy         the start point (completion 1 if finished, else 0)
+          steps          the standing lap (total less best lap, penalty
+                         included) in 0.1 s steps, a lap time with either driver
+          speed_entropy  0.0 (no speed trace; reported, not scored)
+          offroad_frac   0.0 with no damage (never hit the wall past the
+                         10 m of grass), 1.0 otherwise
+        A corner cut does not fail the lap (user decision, 2026-10-09): TORCS
+        charges it in time (raceengine.cpp ReRaceRules: speed * dt * depth /
+        inner radius per step once 0.7 car widths inside the inner edge,
+        about the metres saved).  On 2700 saved tracks: 0.002-0.004 s on 3.
+        The no-damage rule is set as offroad_full_frac is, by the circuits:
+        berniw races all 22 without damage at 12 m (calibration/torcs_circuits.py).
+        Not graded: TORCS reports no off-road time."""
+        if curve_points is None:
+            curve_points = self._make_curve(track_points)
+        r = torcs.run(curve_points, width=self._track_width)
+        start = np.asarray(curve_points[0], dtype=float)
+        clean = r["damage"] == 0.0
+        if r["finished"]:
+            steps = int(round((r["time"] - r["best_lap"]) / 0.1))
+        else:
+            steps = int(self._default_max_steps)
+        return (steps, bool(r["finished"]), start, 0.0, 0.0 if clean else 1.0)
+
     def _trajectory_offroad_frac(self, trajectory):
-        """Fraction of a supplied trajectory's steps where the car is off the
-        road (> half a track width from the centerline).  Used when info() is
-        given an explicit trajectory instead of running the cached sim."""
+        """Off-road share of a trajectory given to info() (instead of the
+        cached simulation): steps more than half a width from the centreline."""
         if trajectory is None or len(trajectory) == 0 or len(self._curve_points) < 2:
             return 1.0
         agent = getattr(self, '_agent', None)
         if agent is None:
-            return 0.0
+            return 1.0     # nothing to measure with: the worst case, never full marks
         half_width = 0.5 * float(self._track_width)
         idx = 0
         offroad = 0
@@ -499,11 +1041,9 @@ class RacingProblem(Problem):
         return offroad / max(len(trajectory), 1)
 
     def _speed_profile_entropy(self, speeds):
-        """Normalized entropy of the driven speed profile (Loiacono,
-        Cardamone and Lanzi 2011): how evenly the lap's time is spread over
-        the speed range.  0 = the whole lap at one speed, 1 = equal time in
-        every speed band (fast straights AND slow corners both exist).
-        Each simulation step is one equal-time sample."""
+        """Normalised entropy of the driven speed profile (Loiacono, Cardamone
+        and Lanzi 2011): 0 for a lap at one speed, 1 for equal time in every
+        band.  Each step is one equal-time sample."""
         P = self._QUALITY_PARAMS
         n_bins = int(P["speed_bins"])
         if len(speeds) == 0 or n_bins < 2:
@@ -521,9 +1061,7 @@ class RacingProblem(Problem):
         if max_steps is None:
             max_steps = self._default_max_steps
         track_points = self._normalize_track_points(track_points)
-        # The driver is part of the key: the same track driven by a different
-        # agent is a different trajectory.
-        key = (self._get_info_cache_key(track_points), max_steps, self._driver)
+        key = (self._get_info_cache_key(track_points), max_steps, self._driver)   # a driver drives its own line
         if key in self._trajectory_cache:
             return self._trajectory_cache[key]
         traj = self.evaluate({"track_points": track_points}, max_steps=max_steps)
@@ -531,66 +1069,87 @@ class RacingProblem(Problem):
         return traj
 
     def clear_caches(self):
+        self._curve_cache = _BoundedCache(self._CURVE_CACHE_MAX)
+        self._normalize_cache = _BoundedCache(self._NORMALIZE_CACHE_MAX)
+        self._terms_cache = _BoundedCache(self._TERMS_CACHE_MAX)
         self._info_cache = _BoundedCache(self._INFO_CACHE_MAX)
         self._trajectory_cache = _BoundedCache(self._TRAJECTORY_CACHE_MAX)
         self._simulation_summary_cache = _BoundedCache(self._SIM_SUMMARY_CACHE_MAX)
 
     def __init__(self, num_points=None, **kwargs):
         Problem.__init__(self, **kwargs)
-        self._track_width = float(kwargs.get("track_width", 16.0))
-        # Sized from the 25 real circuits, whose bounding-box spans run
-        # 813-2171 m (median 1442): 1500 m clears the median real span and puts
-        # every representation inside the length band rather than below it.
-        # All geometry scales off _width (grid cell size, radial radii), so the
-        # five representations grow together.  16 m track width matches the
-        # 12-15 m of real circuits on multi-km layouts.
+        self._track_width = float(kwargs.get("track_width", 12.0))
+        # Map 1500 m: the 24 circuits' bounding boxes span 813-2171 m (median
+        # 1349), and at 1500 m every representation lands inside the length
+        # band.  All geometry scales off _width, so they grow together.
+        #
+        # Track width 12 m (user decision, 2026-10-09): FIA Appendix O (2026)
+        # Art. 7.3's minimum for a new permanent circuit, and the median of the
+        # TUMFTM circuits' mean widths (9.2-15.9 m, median 11.8).  Why not
+        # Art. 7.3's 15 m grid width: wider than every circuit, so off-road
+        # is more lenient and the fold gate stricter than on real roads
+        # (Shanghai's Turn 2 folds a 16 m road, not a 12 m one).  Why not each
+        # circuit's own width: one width keeps the task the same for every
+        # representation.  The driver is trained at it (track_loader.TRACK_WIDTH).
         self._width = float(kwargs.get("width", 1500.0))
         self._height = float(kwargs.get("height", 1500.0))
         self._diversity = float(kwargs.get("diversity", 0.4))
         self._default_max_steps = kwargs.get("max_steps", 7000)
         self._skip_render = kwargs.get("skip_render", False)
 
-        # Which driver the simulation stage scores with.  "rl" loads the PPO
-        # policy trained in model_training/ and is the default: the simulation
-        # terms are meant to measure whether a track is driveable by an agent
-        # that learned to drive, and a learned driver reports that directly.
-        # "steering" selects the analytical pure-pursuit follower, kept for
-        # comparison runs and as the fallback when the policy cannot load.
+        # The driver the simulation stage scores with.  "rl", the default:
+        # the PPO policy from model_training/, since the terms should report
+        # how a driver that picks its own line handles the track (a user
+        # decision).  "steering": the path follower in agent.py (pure
+        # pursuit, Coulter 1992, with a Stanley term, Hoffmann et al. 2007),
+        # for comparison and as the fallback.  "torcs": TORCS's berniw robot
+        # (torcs.py, _torcs_summary), chosen by the kwarg or the
+        # PCG_RACING_DRIVER variable, as run_batch.py does.
         #
-        # The policy defaults to run12_stuckfix, which trains on this same
-        # engine and measures best on generated tracks.  Over 12 genomes per
-        # representation at seed 4242, against run10 (trained on the legacy engine):
-        # racing 10/12 laps at 0.091 off-road against 9/12 at 0.372, radial
-        # 11/12 at 0.086 against 7/12 at 0.354, and 1.08 s/eval against 1.59.
-        # It also beats the analytical driver on both (9/12 at 0.226, 10/12 at
-        # 0.093).  final.zip rather than best/: best/ is the highest-eval
-        # snapshot on the held-out real circuits, final.zip is end-of-training,
-        # and the workload here is generated tracks.
-        self._driver = str(kwargs.get("driver", "rl"))
-        self._rl_policy_path = kwargs.get(
-            "rl_policy_path",
-            os.path.join(_RL_RUNS_DIR, "run12_stuckfix", "final.zip"))
-        # Observation scaling belongs to the checkpoint, not to the car: a
-        # policy reads a different divisor as a different speed or steering
-        # angle.  None keeps rl_agent's defaults, which match run10.
+        # The policy is run20 at 9.6M steps (runs/run20/selected): run16's
+        # policy fine-tuned for 10M steps on the 12 m road (train.py, 12
+        # environments, seed 20), keeping the checkpoint with the least
+        # off-road time on the 24 circuits (CircuitSelection, every 600k
+        # steps; the acceptance target, user: almost no off-road on the
+        # TUMFTM circuits).  The circuits include its 19 training tracks, so
+        # the generated tracks are the independent test.  20 random genomes
+        # per representation (seed 21), tracks with any step off the road:
+        #
+        #                       circuits                     generated tracks off-road
+        #   driver at 12 m   off-road  share mean/max  speed  spline tile hex voronoi  worst
+        #   run20 at 9.6M    11 of 24  0.0020 / 0.009  30.1     14    17   18    17   0.042
+        #   run16 at 6.0M    24 of 24  0.0146 / 0.047  32.2     20    20   20    20   0.098
+        #
+        # (speed in m/s; "worst" is the largest share of one generated lap;
+        # calibration/driver_table.py.)  Its checkpoints range from 11 to 21
+        # circuits off-road, as run16's did (4-12 at 16 m), so the pick is
+        # partly luck of the noise.  run16 at 16 m and its fine-tuning runs
+        # (run17-run19) are in thesis/CODE_EXPLAINED.md section 6.  Changing
+        # the driver changes every simulation term, so results scored with
+        # one driver are not comparable with another's.
+        self._driver = str(kwargs.get("driver", os.environ.get("PCG_RACING_DRIVER", "rl")))
+        if self._driver not in ("rl", "steering", "torcs"):
+            raise ValueError("racing: driver must be rl, steering or torcs, not %r" % self._driver)
+        if self._driver == "torcs" and not torcs.available():
+            raise FileNotFoundError("racing: driver torcs needs wtorcs.exe in %s (set TORCS_DIR)"
+                                    % torcs.TORCS_DIR)
+        self._rl_policy_path = kwargs.get("rl_policy_path", DEFAULT_RL_POLICY)
+        # Observation scaling belongs to the checkpoint: None keeps rl_agent's
+        # 85.5 m/s and 30 degrees (the engine's limits, run13 onwards); a
+        # legacy-engine checkpoint such as run10 needs 83.0 and 33.
         self._rl_obs_max_speed = kwargs.get("rl_obs_max_speed")
         self._rl_obs_max_steering = kwargs.get("rl_obs_max_steering")
-        # Loaded once on first use and reused: deserializing the checkpoint
-        # costs far more than a forward pass, and every genome in a run is
-        # driven by the same policy.
-        self._rl_policy = None
+        self._rl_policy = None     # loaded once on first use
 
+        # A lap counts only after 60 steps (6 s), so a car still on the line
+        # cannot finish; the fastest lap of the shortest band length (2000 m
+        # at 85.5 m/s) takes 234 steps, so it never binds.  A modelling choice.
         self._lap_finish_min_steps = int(kwargs.get("lap_finish_min_steps", 60))
-        # Mid-lap checkpoint, the way lap timing works on a real circuit: the
-        # lap only counts if the car was seen at the far side of the track.
-        # A single "progress past 25%" threshold cannot do this job, because
-        # the start line is also the finish line: a car sitting on it projects
-        # onto the LAST segment as readily as the first, reads a progress
-        # fraction near 1.0, and passes.  That is how a car which had driven
-        # 0.0 m of a 4283 m track was scored as having completed the lap.
-        # The tolerance only has to be wider than one step of travel: at the
-        # engine's 85.5 m/s top speed and 0.1 s control step that is 8.55 m,
-        # 0.2% of a 4283 m lap, so a 10% band cannot be jumped over.
+        # Mid-lap checkpoint, as in real lap timing: a car on the start line
+        # projects onto the last segment as readily as the first and reads
+        # progress near 1.0 (a car that had driven 0 m of a 4283 m lap once
+        # scored as finished).  The 10% band is far wider than one step of
+        # travel (8.55 m at top speed), so it cannot be jumped.
         self._lap_checkpoint_frac = float(kwargs.get("lap_checkpoint_frac", 0.5))
         self._lap_checkpoint_tol = float(kwargs.get("lap_checkpoint_tol", 0.1))
         self._lap_checkpoint_seen = False
@@ -601,11 +1160,18 @@ class RacingProblem(Problem):
         self._final_target = None
 
         if num_points is None:
-            # Resolution knob, and the only one that moves lap length without
-            # moving the build box: inside the shared box a tour of 10/14/20
-            # points runs 3695/4474/5780 m while the reach stays at 1070-1111.
-            # 14 sits nearest the 4650 m median of the 25 real circuits.
-            num_points = kwargs.get("num_points", 14)
+            # The one knob that moves lap length without moving the build
+            # box; 16 is a user decision.  20 random genomes (seed 21):
+            #
+            #   points  mean Q  median lap  laps < 3500 m  points kept  turns  off-road
+            #       14   0.850      3785 m        7             10        8     0.002
+            #       16   0.927      3960 m        5             11        9     0.010
+            #       18   0.897      4141 m        5             13       10     0.007
+            #       20   0.946      4189 m        5             14      9.5     0.007
+            #
+            # All four finish 20 of 20; above 14 the quality differences are
+            # within what 20 genomes resolve.
+            num_points = kwargs.get("num_points", 16)
         self.num_points = num_points
 
         if "track_points" in kwargs:
@@ -621,87 +1187,166 @@ class RacingProblem(Problem):
                 for i in range(self.num_points)
             ]
 
-        # Control points are sampled inside the shared build box, inset by the
-        # bow allowance so the CURVE fills the box rather than overflowing it.
+        # Control points cover the whole build box, no inset: the spline runs
+        # through points on the polygon's edges, inside its hull at the
+        # vertices.  40 random genomes (seed 21), road edge past the box:
+        #
+        #   inset (share of box side)  past the box  median lap  laps < 3500 m
+        #   0.032                          -34.9 m      3584 m          0.47
+        #   0                                6.6 m      3798 m          0.30
+        #
+        # 6.6 m past the box is still 93 m inside the map.
         x0, _y0, x1, _y1 = self._build_box()
-        bow = self._SPLINE_BOW_FRAC * (x1 - x0)
         self._content_space = DictionarySpace({
-            "track_points": ArraySpace((self.num_points, 2), FloatSpace(x0 + bow, x1 - bow)),
+            "track_points": ArraySpace((self.num_points, 2), FloatSpace(x0, x1)),
+            # Share of each control point's outgoing edge that is an exact
+            # straight; see _edge_handles.
+            "straight_frac": ArraySpace((self.num_points,), FloatSpace(0.0, self._STRAIGHT_FRAC_MAX)),
         })
         self._rebuild_control_space()
 
-    # A Catmull-Rom curve bows outside the hull of its control points, so
-    # sampling points right up to the build box would put the road past it.
-    # Measured over 40 random genomes: 3.2% of the box side makes the curve's
-    # reach 99.9% of the box.  The radial representation needs no such
-    # allowance, since its spokes are short enough that the curve barely bows.
-    _SPLINE_BOW_FRAC = 0.032
-
-    # Fraction of the map reserved as border on each side.  The square tile
-    # grid is the binding case: its road runs along interior cell centres, so
-    # it reaches 1.5 cells in from each edge out of GRID_W = 11 columns, and it
-    # cannot be given more room without changing the grid.
-    _BUILD_INSET_FRAC = 1.5 / 11.0
+    # Build box side, centred: 1300 m of the 1500 m map, a user decision.
+    # The square tile grid does not read it: its road runs on cell centres
+    # 1.5 cells in from each edge of 11, a 1091 m square.
+    _BUILD_BOX_FRAC = 1300.0 / 1500.0
 
     def _build_box(self):
-        """(x0, y0, x1, y1): the region every representation may place track in.
+        """(x0, y0, x1, y1): the region every representation places track in.
 
-        One rectangle shared by all five, so a comparison between them is a
-        comparison of representations rather than of how much map each was
-        handed.  Deriving each representation's own placement bound from this
-        keeps the build AREA equal; the lap LENGTH each produces inside it is
-        a property of the representation and is scored by the shared length
-        band, not equalised here.
-
-        Every representation reserves a border, and it has to: a control point
-        on the wall already puts half the track width outside, and the spline
-        bows outward between control points (median 24 m, worst 89 m past the
-        control hull).  Tile and hex force their outer ring to grass, voronoi
-        drops its boundary cells, and the spline representations inset their
-        sampling range.  This is the single number behind all of those.
-        """
-        inset = self._BUILD_INSET_FRAC * float(min(self._width, self._height))
+        One rectangle for all, so a comparison is of representations, not of
+        map handed out: the build AREA is equal, the lap LENGTH is the
+        representation's own and scored by the length rule.  A border is
+        needed (a point on the wall puts half the road outside): hex sizes
+        its grid to the box, Voronoi keeps only cells inside it, radial caps
+        its spokes at half of it, the spline samples inside it, and the
+        square grid makes its outer ring grass."""
+        inset = 0.5 * (1.0 - self._BUILD_BOX_FRAC) * float(min(self._width, self._height))
         return inset, inset, float(self._width) - inset, float(self._height) - inset
 
+    # Control targets: each quantity's mean over the 19 reference circuits
+    # that hosted an F1 World Championship race in 2019-2025 (Austin,
+    # Budapest, Catalunya, Hockenheim, Melbourne, Mexico City, Montreal,
+    # Monza, Nuerburgring, Sakhir, Sao Paulo, Shanghai, Silverstone, Sochi,
+    # Spa, Spielberg, Suzuka, Yas Marina, Zandvoort), measured by
+    # _quality_terms, to two significant figures.  A user decision: a
+    # controlled track is close to an average current F1 circuit.
+    #
+    #   control             mean     sd    min    max   target  full marks
+    #   length (m)          5149    759   4295   6998    5100   5050-5150
+    #   longest straight     803    238    460   1255     800   795-805
+    #   FIA corners         12.8    2.4      8     17      13   13 exactly
+    #   slow corners         6.5    2.9      2     13       7   7 exactly
+    #   fast corners         5.6    3.1      1     13       6   6 exactly
+    #   start straight (m)  1074    216    705   1480    1100   1050-1150
+    #   tightest radius     19.9    5.6    9.8   31.7      20   19.5-20.5
+    #   curvature entropy  0.299  0.048  0.187  0.381    0.30   0.295-0.305
+    #   full-throttle     0.673  0.025  0.637  0.752    0.67   0.665-0.675
+    #   in-between share   0.057  0.032  0.003  0.111   0.057   0.0565-0.0575
+    #
+    # FIA corners and the start straight (the longest stretch between two)
+    # use Art. 7.7's corner (_fia_corners).  Slow = hairpins and corners
+    # under 44 m, fast = 75 m or wider (_corner_class_counts): the mix of
+    # corner speeds, as smb asks for a mix of enemies, jumps and coins.
+    # Full-throttle share (_lap_simulation) separates power circuits such as
+    # Monza (0.75 here; 76% in Kmonicek et al. 2019, 80% in Pirelli 2025)
+    # from twisty ones.  All are measured without the driver.
+    #
+    # Random genomes hitting each target (80 per representation, seeds 21
+    # and 22; spline / tile / hex / tilediag / hexdiag / voronoi): slow
+    # corners 3 / 3 / 0 / 2 / 7 / 11, fast 4 / 8 / 7 / 8 / 8 / 2, FIA corners
+    # 0 / 0 / 0 / 4 / 7 / 5, start straight 11 / 0 / 0 / 10 / 1 / 0,
+    # full-throttle 5 / 0 / 0 / 3 / 5 / 0; mean control score 0.68 / 0.48 /
+    # 0.40 / 0.63 / 0.61 / 0.50 against the circuits' 0.82; nothing meets all
+    # ten (calibration/control_targets.py).  Kept out (calibration/
+    # qctl_cand.py): hairpins and medium corners, which random tracks hit
+    # often (8-21 and 5-20 of 80); direction, which Voronoi never varies;
+    # footprint, which depends on the map size.
+    #
+    # Full marks only when the value rounds to the target at its precision
+    # (user decision), so the tolerance is half the last significant digit
+    # (_CONTROL_STEPS / 2).  Why not 0: continuous values never hit it.  Why
+    # not smb's 10% plateau: for length that is 4400-5800 m, 11 of 24
+    # circuits.  Why not published figures: only length and straight have
+    # them.  Why not targets drawn from a range, as upstream does: that asks
+    # for every track a range allows; one target measures closeness to an
+    # average F1 circuit.
+    _CONTROL_TARGETS = {
+        "length":            5100.0,
+        "longest_straight":   800.0,
+        "fia_corners":         13,
+        "slow_corners":         7,
+        "fast_corners":         6,
+        "start_straight":    1100.0,
+        "tightest_radius":     20.0,
+        "curvature_entropy":    0.30,
+        "throttle_share":       0.67,
+        "between":              0.057,
+    }
+    # The last significant digit of each target in _CONTROL_TARGETS.
+    _CONTROL_STEPS = {
+        "length":            100.0,
+        "longest_straight":   10.0,
+        "fia_corners":         1,
+        "slow_corners":        1,
+        "fast_corners":        1,
+        "start_straight":    100.0,
+        "tightest_radius":     1.0,
+        "curvature_entropy":    0.01,
+        "throttle_share":       0.01,
+        "between":              0.001,
+    }
+    _INTEGER_CONTROLS = ("fia_corners", "slow_corners", "fast_corners")
+
     def _rebuild_control_space(self):
-        """Build the control space from this representation's quality band.
+        """Build the control space: one fixed target per control quantity.
 
-        Controlability only measures something when the target is reachable, so
-        the length request is drawn from min_length..max_length: control and
-        quality then ask for the same thing.
+        FloatSpace needs min < max, so a target v is [v, nextafter(v)), which
+        samples v; IntegerSpace(v, v + 1) for the corner counts.  No control
+        is a validity condition (Khalifa et al. 2025: controls "are designer
+        choices ... rather than a playability constraint").
+        self._control_bands: per control, its terms key, the domain ends where
+        its score reaches 0, and the tolerance.
 
-        This covers the range targets are drawn FROM, not the range
-        controlability() scores against, which still uses width*16 for length
-        (see there).
-
-        Subclasses that adjust _QUALITY_PARAMS after super().__init__() must
-        call this again.
-        """
+        Domain ends: a quality rule's zero point where one bounds the
+        quantity, so a value quality rejects earns no control credit (length
+        2000 / 14000 m, longest straight to 4000 m); otherwise the outer Tukey
+        fence (quartile -/+ 3 IQR) of the 19 F1 circuits, out to their
+        extreme if beyond, clipped and rounded outward: FIA corners 0 / 25,
+        slow 0 / 19, fast 0 / 18, start straight 0 / 2400 m, curvature
+        entropy 0.07 / 0.53, full-throttle 0.58 / 0.76, in-between 0 / 0.18.
+        Subclasses changing _QUALITY_PARAMS after __init__ must call it again."""
         P = self._QUALITY_PARAMS
-        self._control_space = DictionarySpace({
-            "length":    FloatSpace(float(P["min_length"]), float(P["max_length"])),
-            "num_turns": IntegerSpace(1, self._MAX_TURNS),
-        })
-
-    # Upper end of the turn-count target, shared by all five representations.
-    # It has to be a property of racetracks rather than of a genome: num_points
-    # is a per-representation resolution knob (14 for the free spline, 20 for
-    # the radial star, 15 for the constructive decoders), so deriving the
-    # ceiling from num_points asked each representation for a different thing
-    # and made controlability scores incomparable.  Measured by _find_corners,
-    # the quantity num_turns actually reports, the 24 reference circuits run
-    # 4 to 17 with a median of 10, so 24 spans the real range with headroom.
-    _MAX_TURNS = 24
+        bands = {
+            #  control key         terms key                   domain ends (score 0)
+            "length":            ("length_m",                 (P["length_zero_lo"], P["length_zero_hi"])),
+            "longest_straight":  ("longest_straight_m",       (0.0, P["straight_max_zero_m"])),
+            "fia_corners":       ("fia_corner_count",         (0.0, 25.0)),
+            "slow_corners":      ("slow_corners",             (0.0, 19.0)),
+            "fast_corners":      ("fast_corners",             (0.0, 18.0)),
+            "start_straight":    ("fia_start_straight_m",     (0.0, 2400.0)),
+            "tightest_radius":   ("tightest_corner_radius_m", (0.0, P["control_radius_zero_hi_m"])),
+            "curvature_entropy": ("curvature_entropy",        (0.07, 0.53)),
+            "throttle_share":    ("throttle_share",           (0.58, 0.76)),
+            "between":           ("between_frac",             (0.0, 0.18)),
+        }
+        self._control_bands = {k: (key, dom, 0.5 * float(self._CONTROL_STEPS[k]))
+                               for k, (key, dom) in bands.items()}
+        T = self._CONTROL_TARGETS
+        space = {}
+        for k in self._control_bands:
+            if k in self._INTEGER_CONTROLS:
+                # Upper bound excluded by IntegerSpace, so target + 1.
+                space[k] = IntegerSpace(int(T[k]), int(T[k]) + 1)
+            else:
+                space[k] = FloatSpace(float(T[k]), float(np.nextafter(float(T[k]), np.inf)))
+        self._control_space = DictionarySpace(space)
 
     def _make_agent(self, curve_points):
-        """Build the driver named by the `driver` setting.
-
-        A failed policy load falls back to SteeringAgent and says so, rather
-        than raising: a missing checkpoint should not make the whole benchmark
-        unimportable, and a silent fallback would report simulation scores from
-        a different driver than the caller asked for.
-        """
-        if self._driver == "rl":
+        """Build the driver named by `driver`.  A failed policy load falls back
+        to SteeringAgent and says so (not silently, not by raising).  With
+        "torcs" the scores come from TORCS and this policy only drives the
+        trajectories evaluate() returns for renders."""
+        if self._driver in ("rl", "torcs"):
             try:
                 if self._rl_policy is None:
                     self._rl_policy = load_policy(self._rl_policy_path)
@@ -713,9 +1358,9 @@ class RacingProblem(Problem):
                 print("racing: could not load policy %s (%s); "
                       "falling back to SteeringAgent"
                       % (self._rl_policy_path, e))
-                self._driver = "steering"
-        # The agent reads the car's mass, grip and drivetrain limits off the
-        # engine, so its speed profile plans for the car that will drive it.
+                if self._driver == "rl":
+                    self._driver = "steering"
+        # It plans its speed profile from the engine's own limits.
         return SteeringAgent(curve_points, track_width=self._track_width,
                              engine=self._engine)
 
@@ -752,17 +1397,11 @@ class RacingProblem(Problem):
         return self._setup_car(self._curve_points, start_angle)
 
     def _get_progress_fraction(self) -> float:
-        """Fraction of the lap the agent has reached, in [0, 1].
-
-        Not a segment index.  The two drivers index different polylines:
-        SteeringAgent walks the benchmark's own curve, RLAgent walks a ring
-        TrackGeometry resamples at 3 m, about 10x as many points on a typical
-        track.  Comparing RLAgent's index against the benchmark's segment count
-        made the lap-progress requirement pass on every step, so a car that had
-        driven 0.0 m of a 4283 m track was scored as having completed the lap:
-        it sits on the start line, so the distance-to-finish test passes, and
-        the progress test was the only thing standing against it.
-        """
+        """Fraction of the lap the agent has reached, in [0, 1].  Not a
+        segment index: the two drivers index different polylines (RLAgent's
+        TrackGeometry ring at 3 m has ~10x the points), and an index compared
+        against the benchmark's segment count passes the progress test on
+        every step."""
         agent = getattr(self, '_agent', None)
         if agent is None:
             return 0.0
@@ -830,60 +1469,26 @@ class RacingProblem(Problem):
             return {
                 'num_points': self.num_points,
                 'total_length': 0.0,
-                'avg_length': 0.0,
-                'max_length': 0.0,
-                'min_length': 0.0,
-                'avg_turn': 0.0,
-                'max_turn': 0.0,
-                'min_turn': 0.0,
-                'num_turns': 0,
                 'steps': 0,
                 'finished': False,
                 'speed_entropy': 0.0,
                 'offroad_frac': 1.0,
                 'track_points': track_points,
-                'trajectory_end': track_points[0] if len(track_points) > 0 else None,
-                'curve_points': track_points,
+                'trajectory_end': track_points[0, :2] if len(track_points) > 0 else None,
+                'curve_points': track_points[:, :2],
             }
 
-        # The driver is part of the key: this dict carries the simulation
-        # results, so the same track scored with a different agent is a
-        # different entry rather than a stale hit.
+        # The driver is part of the key: the dict carries simulation results.
         cache_key = (self._get_info_cache_key(track_points), self._driver)
         if use_cache and cache_key in self._info_cache and trajectory is None:
             return self._info_cache[cache_key]
 
-        # Control-point spacing statistics.  These describe the genome's own
-        # polyline, not the track, so they stay on track_points.
-        diffs = track_points[1:] - track_points[:-1]
-        segment_lengths = np.linalg.norm(diffs, axis=1)
-        avg_length = float(np.mean(segment_lengths))
-        max_length = float(np.max(segment_lengths))
-        min_length = float(np.min(segment_lengths))
-
-        turn_angles = self._compute_turn_angles(track_points)
-        avg_turn = float(np.mean(turn_angles)) if turn_angles.size > 0 else 0.0
-        max_turn = float(np.max(turn_angles)) if turn_angles.size > 0 else 0.0
-        min_turn = float(np.min(turn_angles)) if turn_angles.size > 0 else 0.0
-
         curve_points = self._make_curve(track_points)
-
-        # Turns as a designer counts them, from the same walker the corner
-        # terms use, so every representation reports the same quantity.
-        # Counting control-point vertices instead made the number a property
-        # of the genome's resolution rather than of the track: the free spline
-        # carries 14 control points and so could never report more than 14
-        # turns, while the voronoi polygon routinely reported over 30, against
-        # a control range of 1..24 shared by both.
-        num_turns = len(self._find_corners(
-            *self._curve_turn_profile(curve_points))[0])
-
-        # Lap length is measured on the DRIVEN curve, closed, so it means the
-        # same thing for every representation and the same thing a real
-        # circuit's quoted length means.  Measuring the control polyline
-        # instead would under-report the spline representations by ~9%, since
-        # their curve bows away from its control points, while the constructive
-        # decoders would be unaffected because their curve IS their polyline.
+        # Once here (0.2 ms) rather than per pair in diversity() (10,000 pairs
+        # per generation of 100).
+        tf = turning_function(curve_points)
+        # Measured on the driven curve, as a circuit's quoted length is; the
+        # control polyline would under-report the spline by ~9%.
         total_length = self._closed_curve_length(curve_points)
         if trajectory is None:
             steps, finished, end_xy, speed_entropy, offroad_frac = self._get_cached_simulation_summary(track_points, curve_points=curve_points)
@@ -900,13 +1505,7 @@ class RacingProblem(Problem):
         info_dict = {
             "num_points": self.num_points,
             "total_length": total_length,
-            "avg_length": avg_length,
-            "max_length": max_length,
-            "min_length": min_length,
-            "avg_turn": avg_turn,
-            "max_turn": max_turn,
-            "min_turn": min_turn,
-            "num_turns": num_turns,
+            "turning_function": tf,
             "steps": steps,
             "finished": finished,
             "speed_entropy": speed_entropy,
@@ -920,243 +1519,167 @@ class RacingProblem(Problem):
         return info_dict
 
     # ── Quality ──────────────────────────────────────────────────────────
-    # Three stages, each scoring only once the previous is satisfied (benchmark
-    # house style; cf. zelda, sokoban, loderunnertile):
-    #   1. soundness  - usable geometry: in bounds, no self-intersection, length
-    #   2. shape      - the layout reads like a designed circuit
-    #   3. simulation - the driving agent completes a lap at a decent pace
+    # Could this be a real circuit.  Quality 1 is "feasible content"
+    # (Khalifa et al. 2025); closeness to a requested value is
+    # controlability's.  Two hard gates (off the map, road overlapping
+    # itself), then three stages, each counting once the ones before are 1.0
+    # (quality()), each with one source for full marks:
     #
-    # Inside a stage the terms are grouped by what they measure, using the five
-    # factors Togelius, De Nardi & Lucas (2006) give as the sources of fun in a
-    # racing game.  Factor to term:
+    #   1. rules       FIA Appendix O (2026) Supplement 2, Arts. 7.2 and 7.7
+    #   2. driven lap  the driver finishes, on the road as much as on the
+    #                  reference circuits
+    #   3. typicality  as close to the circuits, on five features fixed in
+    #                  advance, as each circuit is to the others
     #
-    #   1. feeling of speed         straight_balance, start_straight,
-    #                               braking_zone   (geometry)
-    #                               time_score     (driven lap)
-    #   2. challenge                min_radius, hairpin
-    #   3. challenge adjusted to    no term of its own.  The two challenge
-    #      the driver               thresholds are set from this car: 1.2 deg/m
-    #                               is the radius its grip runs out at at its
-    #                               25 m/s top speed, 10 m the radius it can
-    #                               still turn.  Change the car and they move.
-    #   4. variation of challenge   curvature_entropy (geometry)
-    #                               speed_entropy     (driven lap)
-    #                               Loiacono, Cardamone & Lanzi (2011) score
-    #                               both halves of that pair for the same
-    #                               reason.
-    #   5. drift and slip in        NOT SCORED.  The engine runs a combined-slip
-    #      corners                  tyre model but exposes slip only inside
-    #                               _integrate, so no term reads it.  This is
-    #                               the factor the quality function misses.
+    # Zero points below full marks only shape the gradient: where a
+    # regulation gives none, a lower limit ramps from 0 and an upper one to
+    # twice the limit.  Why not a band per term (turn count, entropy, shares,
+    # each from Tukey fences on 22 circuits): each a separate choice of where
+    # circuits end, and a track can pass every band yet be unlike any
+    # circuit in combination; typicality judges them jointly.  Why no more
+    # rules: Art. 7.1, "the shape of the course in plan is not subject to
+    # restrictions"; Art. 7.3's 12 m width the road meets by construction.
+    # Not a rule: the FIM (2024) Art. 4.2 minimum of 10 turns, which
+    # Spielberg, Brands Hatch and Norisring fail; corner density is a
+    # typicality feature instead (user decision, 2026-10-08).
     #
     # Validity is Prasetya and Maulidevi's (2016) closed, continuous,
-    # non-intersecting.  Closure and continuity hold by construction in all five
-    # representations, so only non-intersection can be violated and only it is
-    # scored (geom_score).  It is graded rather than binary, which departs from
-    # that paper: the free-form spline's random content self-intersects about 38
-    # times, and a binary gate would floor it with no gradient to climb.
-    #
-    # extent_score sits under no factor.  It is a plausibility floor: without it
-    # two parallel straights one tile apart max out the speed group.
-    #
-    # Subclasses tune thresholds by overriding _QUALITY_PARAMS.
-    #
-    # Reference values cited below are measured from the 25 real circuits in
-    # model_training/racetrack-database-master (Indianapolis excluded: it is an
-    # oval and registers as all-straight with no corners).
+    # non-intersecting; the first two hold by construction, so only
+    # non-intersection is checked, as a hard gate.  Circuits are scored
+    # through info() and _quality_terms on a 2600 m map so Spa fits (map
+    # size feeds only the oob check).
 
     _QUALITY_PARAMS = {
-        # ── Stage 1: soundness ────────────────────────────────────────────
-        # Lap length (m), measured on the driven curve.  The band is the middle
-        # 80% of the 25 real circuits, which run 2296-7000 with a 4650 median;
-        # the tails are one oval-ish sprint (Norisring, 2296) and one outlier
-        # (Spa, 7000), so scoring against the full range would make the term
-        # pass everything.  Every representation is tuned to generate into this
-        # band, with medians of 3861-5015, so the term discriminates on design
-        # rather than on which representation produced the track.
-        # FIA Appendix O (2026) Supplement 2 sets 3.5 km as the minimum for F1,
-        # sports and GT circuits and Art. 7.2 recommends no more than 7 km, so
-        # the band also sits inside the sanctioned range.
-        "min_length":        3900.0,
-        "max_length":        5900.0,
-        # Self-intersection, the one validity condition that can be violated.
+        # ── Stage 1: rules ────────────────────────────────────────────────
+        # Lap length (m) on the driven curve.  Full marks from Supplement 2's
+        # 3.5 km minimum for F1, sports car and GT races to Art. 7.2's 7 km
+        # recommended maximum.  Zero at Supplement 2's 2 km "minimum length
+        # for ... any international competition" and at 14 km (twice the
+        # limit).  Circuits: min 2294 (Norisring), p50 4608, max 6998 m.
+        "length_zero_lo":    2000.0,
+        "min_length":        3500.0,
+        "max_length":        7000.0,
+        "length_zero_hi":   14000.0,
+        # Art. 7.2: "The maximum permitted length for straight sections of
+        # track is 2km" (the longest straight); zero at 4 km.  Circuits: max 1255 m.
+        "straight_max_m":       2000.0,
+        "straight_max_zero_m":  4000.0,
+        # Art. 7.7: "preferably at least 250m between the start line and the
+        # first corner" (a corner: at least 45 degrees, radius under 300 m).
+        # Met when some stretch between two such corners is 250 m long
+        # (fia_start_straight_m); zero at 0.  Circuits: min 705 m.
+        "start_to_corner_m":     250.0,
+        # Self-overlap gate: any centreline crossing, road overlap or fold
+        # sets quality to 0.
         "angles_on_curve":     True,   # geometry checks on dense curve vs control points
         "geom_area_check":     True,   # also count track-area overlap intersections
-        "geom_max_violations":   20,   # geometry score reaches 0 at this many intersections
 
         # ── Geometry primitives shared by several shape terms ─────────────
-        # Curvature below this counts as straight.  0.8 deg/m is a 72 m radius,
-        # which at the 1.3 tyre friction coefficient the engine uses is the
-        # radius the car can hold at 30 m/s, above its 25 m/s top speed.  So
-        # "straight" here means FLAT OUT, not geometrically straight.  FIA
-        # Appendix O (2026) Art. 7.7 calls a change of direction a corner below
-        # a 300 m radius, an 18x stricter line; the two must not be mixed, and
-        # the start_straight and braking_zone targets below are set against this
-        # flat-out definition rather than the FIA one.
+        # The corner-core line: above it a sample is in the tight part of a
+        # corner, so the tightest radius (a control) averages the part that
+        # sets the corner's speed.  0.8 deg/m is a 72 m radius, held at
+        # sqrt(1.3 * 9.81 * 72) = 30.3 m/s, two thirds of the driver's 44-47 m/s top
+        # speed on the circuits.  Why not the FIA 300 m line: its average
+        # takes in entry and exit and reads the corner wider than its apex.
+        # A modelling choice.
         "straight_curv_deg_per_m": 0.8,
-        # Corners: accumulated same-direction turns >= corner_min_turn_deg count
-        # as one corner.
-        "corner_min_turn_deg":   30.0,
-        # Straight gap bridged inside one corner.  It sits just above the
-        # coarsest arc-sampling step (tile 18 m, hex 13 m on a 120 deg corner
-        # and 20 m on a 60 deg one) and far below any real straight, so
-        # arc-sampled corners stitch together without merging two corners
-        # across a genuine straight.
+        # A straight changes heading by no more than this over its length
+        # (_straight_windows); 1 degree is a user decision.  Median longest
+        # straight, 24 circuits and 12 random genomes per representation
+        # (first three rows on the spline before _straighten):
+        #
+        #   definition                  circuits  racing  tile  hex  voronoi
+        #   curvature < 0.8 deg/m         1067     1142    420   645    405
+        #   curvature exactly 0              0        0    400   243    197
+        #   heading within 1 degree        652      275    410   255    210
+        #   same, after _straighten        702      445    405   250    270
+        #
+        # 0.8 deg/m counts sweepers as straight; an exact test finds nothing on
+        # the raw spline or the noisy circuits.  The heading tolerance keeps
+        # constructive straights and finds the circuits' (0.5 and 2 degrees
+        # give a raw median of 582 and 679 m).  Circuits are straightened too.
+        "straight_heading_tol_deg": 1.0,
+        # A corner: accumulated same-direction turn of at least this.  Turn
+        # count on the FIA line against Kmonicek et al.'s (2019, Table 2)
+        # official counts for 8 database circuits (Yas Marina, Sakhir,
+        # Catalunya, Monza, Sao Paulo, Sochi, Spa, Suzuka), error in turns:
+        #
+        #   minimum turn     10     15     20     25     30     45
+        #   mean error     +2.2   +0.6   -0.1   -0.9   -1.4   -3.5
+        #   MAE             2.5    1.1    1.1    1.1    1.6    3.5
+        #
+        # 20 degrees is the sweep's centre.  At Art. 7.7's 45 degrees (a
+        # definition for the start rule) the count misses 3.5 turns; on the
+        # 0.8 deg/m core line it misses 5.4-7.0 at every minimum, as a 120 m
+        # sweeper never reaches it.
+        "corner_min_turn_deg":   20.0,
+        # Straight gap bridged inside one corner, so short near-straight
+        # pieces do not split it.  Against 5 m: tiles count the same corners,
+        # 6 circuits gain 0-2 corners each at 5 m, Voronoi 0-2 on 8 genomes.
+        # 20 m is far below any real straight, so corners are not merged
+        # across one.
         "corner_gap_max_m":      20.0,
+        # Art. 7.7's 300 m radius, 0.191 deg/m (turn count, in-between share).
+        "fia_corner_curv_deg_per_m": 0.191,
 
-        # ── Stage 2, speed group (Togelius factor 1) ──────────────────────
-        # Straight balance: fraction of lap arc length that is straight.
-        # Scale-free, so no representation is locked out by its edge scale.
-        # Real circuits measure 0.20-0.40 (median 0.31), i.e. below this band.
-        "straight_frac_min":    0.10,
-        "straight_frac_lo":     0.30,
-        "straight_frac_hi":     0.75,
-        "straight_frac_max":    0.95,
-        # Start straight: arc length of the straight run containing curve index
-        # 0 (the seam is pre-rotated to the flattest vertex).  Shared by every
-        # representation, per the one-quality-function-for-all rule.  FIA
-        # Appendix O (2026) Art. 7.7 requires at least 250 m between the start
-        # line and the first corner, but measures it against its own R < 300 m
-        # corner definition, not the flat-out one used here.
-        # Both bands come from the 25 real circuits measured through this same
-        # code, as Tukey fences: full marks across the interquartile range,
-        # falling to zero at 1.5 IQR beyond each quartile.  A one-sided
-        # "longer is always better" band is what made these free.  Under it a
-        # start straight of 50 m scored the same as a real circuit's 552 m
-        # median, and a track that was one enormous straight scored 1.0 on the
-        # braking zone; 94% of random genomes scored above 0.95 on it.
-        # Zero below 50 m, rising linearly to full marks at 200 m and holding
-        # there.  A DESIGN CHOICE, not a measurement: the 25 real circuits run
-        # p25 349 m, p50 552 m, p75 897 m through this same code, so 200 m is
-        # deliberately below what a real circuit has.  The target is "there is
-        # a real straight off the line", not "the straight is as long as
-        # Monza's".  The band is open above 200 m because a longer start
-        # straight is not a defect; a track that is ONE enormous straight is
-        # caught by braking_zone, which is two-sided.
-        "start_straight_zero_m":   50.0,
-        "start_straight_lo_m":    200.0,
-        # Braking zone: longest straight anywhere on the lap, the overtaking
-        # spot a designed circuit has and a random loop lacks.
-        # Real longest straight: p25 744, p50 838, p75 1028.
-        "braking_zone_zero_m":    319.0,
-        "braking_zone_lo_m":      744.0,
-        "braking_zone_hi_m":     1028.0,
-        "braking_zone_max_m":    1453.0,
+        # Tightest corner radius is not a quality term: no published minimum
+        # (FIA Appendix O, Kmonicek et al. 2019), the fold gate already
+        # rejects radii under half the road (6 m), and at the 5 m step the
+        # walker cannot resolve less than about 9.4 m (90 degree corners of 5,
+        # 8, 12, 20, 30 m measure 9.4, 12.6, 15.8, 22.4, 30.4 m), so a term
+        # would act only in that gap, on a number with no source.  The car's
+        # own limit, its 11.2 m turning circle (engine.py), is 5.6 m.  It is
+        # a control; its upper domain end is the circuits' outer Tukey fence
+        # (tightest corners 13.9 / 16.9 / 24.0 / 36.5 m min / p25 / p75 / max,
+        # fence 45.4, rounded up to 46 m).
+        "control_radius_zero_hi_m":   46.0,
 
-        # ── Stage 2, challenge group (Togelius factors 2 and 3) ───────────
-        # Hairpin: one accumulated same-direction turn of hairpin_lo_deg or
-        # more that is genuinely tight (1.2 deg/m = radius <= 48 m, the radius
-        # at which the car's grip runs out at its 25 m/s top speed), not a wide
-        # sweep.  Nothing rewards having a hairpin: the count feeds only the
-        # excess penalty below and the hairpin_count diagnostic.
-        "hairpin_lo_deg":            150.0,
-        "hairpin_min_curv_deg_per_m":  1.2,
-        # A hairpin is a signature corner some circuits have and some do not:
-        # measured on the 24 reference circuits the count runs 0-3 with a
-        # median of 0, never a string of them.
-        "hairpin_max_count":         2.0,
-        "hairpin_count_zero":        5.0,
-        # Minimum corner radius: 10 m is the F1 floor (Monaco hairpin; the car
-        # is 5 m long), below ~6 m a corner is undrivable.  Real circuits sit at
-        # 11-37 m.  Only free-form spline hairpins come near it; the
-        # constructive decoders are far wider.
-        "min_corner_radius_zero_m":    6.0,
-        "min_corner_radius_lo_m":     10.0,
-
-        # ── Stage 2, variation group (Togelius factor 4) ──────────────────
-        # Curvature entropy: how varied the corners are, measured on the
-        # geometry alone.  Loiacono, Cardamone & Lanzi (2011) score a track on
-        # the entropy of TWO profiles, curvature and speed, and argue that this
-        # variety is what makes a track interesting.  Only the speed half was
-        # scored here before, so this restores the pair the paper proposes.
-        #
-        # It also does not saturate the way a threshold term does.  Asking "is
-        # there a 200 m straight" is a yes/no question every representation
-        # eventually answers yes to; asking "how spread out are the corner
-        # radii" has no ceiling that good content bumps into.
-        #
-        # 8 bins matches the speed entropy term.  The 5.0 deg/m top of the
-        # range is an 11.5 m radius, the tightest corner the 25 real circuits
-        # contain and just inside the 10 m floor min_radius_score enforces, so
-        # the last bin means "as tight as a real circuit ever gets".
+        # ── Curvature entropy (a typicality feature) ──────────────────────
+        # How spread the lap's curvature is (Loiacono, Cardamone & Lanzi 2011).
+        # 8 bins over 0-5.0 deg/m: the top is an 11.5 m radius, below every
+        # circuit's tightest (13.9 m), so the top bin holds corners tighter
+        # than any.  Modelling choices.  They (Sec. VI, preprint) use 16 bins
+        # over all TORCS tracks' range and maximise the raw entropy; here a
+        # fixed range, unsigned curvature, entropy over log(bins), judged by
+        # typicality.
         "curvature_bins":             8,
         "curvature_max_deg_per_m":  5.0,
-        # Full marks at the variety of the most varied real circuits.  Measured
-        # on those 25 circuits through this same code: median 0.336, p90 0.402,
-        # max 0.422.  Generated content currently runs 0.175-0.433, so the
-        # target is reachable without being free.
-        "curvature_entropy_lo":     0.40,
 
-        # ── Stage 2, layout group (no Togelius factor) ────────────────────
-        # Footprint: bounding-box aspect ratio and span relative to the map.
-        "extent_aspect_zero":   0.15,
-        "extent_aspect_lo":     0.55,
-        "extent_span_zero":     0.10,
-        "extent_span_lo":       0.45,
-
-        # ── Stage 3: simulation ───────────────────────────────────────────
-        # Lap time as average lap speed (m/s): Togelius factor 1 measured from
-        # the driven lap.  The agent tops out near 25, so vmax 30 keeps the
-        # "too fast" branch off corner-cutting laps.  A modelling choice, not a
-        # published figure.
-        "time_vmax":           30.0,
-        "time_vmin":            8.0,
-        # Speed profile entropy (Loiacono, Cardamone & Lanzi 2011): the driven
-        # half of the entropy pair, Togelius factor 4 from the driver's side.
+        # ── Speed entropy (info only, not scored) ─────────────────────────
+        # Loiacono et al.'s speed half, in info() for analysis.  Not scored:
+        # it describes the driver as much as the track.  8 bins over 0-55 m/s,
+        # which clips no sample on the circuits.
         "speed_bins":              8,
-        "speed_max":            25.0,  # agent's target top speed (m/s)
-        # Two-sided, same Tukey fences on the 25 real circuits: their driven
-        # speed entropy runs p25 0.574, p50 0.606, p75 0.658.  The old
-        # one-sided 0.55 floor put 94% of random genomes above 0.95.
-        "speed_entropy_zero":   0.448,
-        "speed_entropy_lo":     0.574,
-        "speed_entropy_hi":     0.658,
-        "speed_entropy_max":    0.784,
-        # Fraction of driven steps the car may spend off the road before this
-        # term hits zero.  A designed track can be driven while staying on it.
+        "speed_max":            55.0,
+
+        # ── Stage 2: the driven lap ───────────────────────────────────────
+        # Share of driven steps off the road (car centre past the road edge).
+        # Full marks up to 0.01: the default driver's worst lap on the 24
+        # circuits (0.0095, Melbourne; run20 at 12 m), rounded up to the next
+        # 0.01, so a track it leaves no more than a real circuit counts as
+        # drivable.  Measured again whenever the policy changes.  Zero at
+        # 0.20, for the gradient only.
+        "offroad_full_frac":         0.01,
         "onroad_max_frac":           0.20,
     }
 
-    # Shape terms, grouped by the factor each one measures.  All are computed on
-    # the dense curve, so no term depends on how many vertices a representation
-    # happens to use.
-    #
-    # The per-term weights are the flat weights this grouping replaces, and each
-    # group's weight is the sum of its members', so the grouping moves no score.
-    # The weights came from measured discrimination in a GA run: start_straight
-    # and braking_zone separated designed content from random content, so they
-    # carry 2.0; straight_balance and extent are a floor rather than an
-    # objective, so they carry 0.5.  No paper sets them.
-    _SHAPE_GROUPS = {
-        # Factor 1: how much of the lap is taken flat out, and whether there is
-        # one straight long enough to brake hard for.
-        "speed": {
-            "start_straight_score":    2.0,   # straight at the start line
-            "braking_zone_score":      2.0,   # longest straight on the lap
-            "straight_balance_score":  0.5,   # straight share of the lap (scale-free)
-        },
-        # Factors 2 and 3: corners tight enough to matter, with both thresholds
-        # set from what this car can drive.
-        "challenge": {
-            "min_radius_score":        1.0,   # no corner tighter than the car can turn
-            "hairpin_score":    1.0,   # not more than 2 hairpins
-        },
-        # Factor 4, geometry half.  Held at 1.0 rather than the 2.0 of
-        # start_straight and braking_zone, which earned that weight from a GA
-        # run; this term has not been through one.
-        "variation": {
-            "curvature_entropy_score": 1.0,   # spread of corner radii (Loiacono et al. 2011)
-        },
-        # No factor: a plausibility floor on the footprint.
-        "layout": {
-            "extent_score":            0.5,   # compact footprint spread over the map
-        },
-    }
+    # Stage 1 terms, one per regulation, scored as their mean.
+    _RULE_TERMS = ("length_score", "straight_max_score", "start_to_corner_score")
 
     def _quality_terms(self, info):
-        """Compute the quality terms shared by all racing variants.
-        Returns a dict of terms, each in [0, 1], or None when the info does
-        not describe a usable track."""
+        """The quality terms (each in [0, 1]) and the raw values behind them,
+        or None for an unusable track.  Memoised on the info object (the memo
+        holds a reference, so the id stays unique) for quality() and
+        controlability(); not stored in the saved info, so rescoring a saved
+        info gives today's terms."""
+        memo = self._terms_cache.get(id(info))
+        if memo is not None and memo[0] is info:
+            return memo[1]
+        terms = self._compute_quality_terms(info)
+        self._terms_cache[id(info)] = (info, terms)
+        return terms
+
+    def _compute_quality_terms(self, info):
         P = self._QUALITY_PARAMS
         track_points = info.get('track_points', None)
         if track_points is None:
@@ -1170,10 +1693,8 @@ class RacingProblem(Problem):
             curve_points = self._make_curve(points)
         curve_points = np.asarray(curve_points, dtype=float)
 
-        # Out-of-bounds: 1.0 only when the whole curve stays inside the map
-        # margin, fading linearly to 0 as the worst violation approaches four
-        # track widths (trapezoid with the plateau pinned at zero violation,
-        # like sokoban's heuristic term).
+        # Out-of-bounds: 1.0 inside the map margin, falling to 0 at four track
+        # widths of violation (as sokoban's heuristic term).
         margin = float(self._track_width) * 0.5 + 2.0
         oob_violation = 0.0
         if len(curve_points) > 0:
@@ -1187,14 +1708,12 @@ class RacingProblem(Problem):
         oob_score = float(get_range_reward(
             oob_violation, 0.0, 0.0, 0.0, 4.0 * float(self._track_width)))
 
-        # Completion: how far around the track the agent got.
-        # For closed loops distance-to-goal is degenerate (start == goal, so a
-        # car that crashes at the spawn point would score 1.0); use the
-        # arc-position of the trajectory end along the curve instead.
+        # Completion: the arc position the car reached (distance to the goal
+        # is useless on a loop, where start == goal).
         finished = info.get('finished', False)
         trajectory_end = info.get('trajectory_end', None)
         if trajectory_end is None:
-            trajectory_end = points[-1]
+            trajectory_end = points[-1, :2]
         trajectory_end = np.asarray(trajectory_end, dtype=float)
         if finished:
             completion = 1.0
@@ -1202,22 +1721,19 @@ class RacingProblem(Problem):
             nearest = int(np.argmin(np.linalg.norm(curve_points - trajectory_end, axis=1)))
             completion = nearest / len(curve_points)
         else:
-            dist_to_goal = float(np.linalg.norm(points[-1] - trajectory_end))
-            curve_total_length = float(np.sum(np.linalg.norm(curve_points[1:] - curve_points[:-1], axis=1))) if len(curve_points) > 1 else 1.0
-            completion = 1.0 - min(dist_to_goal / (curve_total_length + 1e-6), 1.0)
+            completion = 0.0
 
-        # Lap length in the preferred range, measured on the driven curve so
-        # every representation is scored on the same quantity (see info()).
         if len(curve_points) > 1:
             total_length = self._closed_curve_length(curve_points)
             length_score = float(get_range_reward(
-                total_length, 0.0, P["min_length"], P["max_length"], 4.0 * P["max_length"]))
+                total_length, P["length_zero_lo"], P["min_length"],
+                P["max_length"], P["length_zero_hi"]))
         else:
             length_score = 0.0
 
-        # Self-intersection: 1.0 only at zero violations, fading linearly to 0
-        # at geom_max_violations (trapezoid with the plateau pinned at zero).
-        geom_pts = curve_points if P["angles_on_curve"] else points
+        # Self-overlap: centreline crossings, plus road overlaps and folds
+        # with geom_area_check.
+        geom_pts = curve_points if P["angles_on_curve"] else points[:, :2]
         geom_violations = int(count_self_intersections(geom_pts))
         if P["geom_area_check"]:
             geom_violations += int(count_track_area_intersections(
@@ -1225,46 +1741,26 @@ class RacingProblem(Problem):
                 track_width=float(self._track_width),
                 min_cross_index_gap=2,
             ))
-        geom_score = float(get_range_reward(
-            geom_violations, 0, 0, 0, P["geom_max_violations"]))
 
-        # Straight balance, curvature profile, and corner structure — all measured on the
-        # dense curve so every representation is judged by the same yardstick.
+        # Straights, curvature and corners, all on the dense curve.
         cp_d     = curve_points[1:] - curve_points[:-1]
         cp_len   = np.linalg.norm(cp_d, axis=1)
         cp_total = float(np.sum(cp_len))
         if cp_total > 1e-6 and len(curve_points) >= 3:
-            cn = np.linalg.norm(cp_d, axis=1, keepdims=True)
-            ok = cn[:, 0] > 1e-3
-            cu = np.zeros_like(cp_d)
-            cu[ok] = cp_d[ok] / cn[ok]
-            cv1, cv2 = cu[:-1], cu[1:]
-            cross = cv1[:, 0] * cv2[:, 1] - cv1[:, 1] * cv2[:, 0]
-            dots  = cv1[:, 0] * cv2[:, 0] + cv1[:, 1] * cv2[:, 1]
-            dots  = np.clip(dots, -1.0, 1.0)
-            signed_ang = np.arctan2(cross, dots)  # signed turn at each interior point
-            cp_ang = np.abs(signed_ang)
+            signed_ang, balance_w = self._curve_turn_profile(curve_points)
+            local_curv = np.rad2deg(np.abs(signed_ang)) / np.maximum(balance_w, 1e-9)
 
-            # Straight balance: how much of the lap is straight, by arc
-            # length.  Local curvature (turn angle per metre) below the
-            # threshold counts as straight, so the measure is independent of
-            # sampling density and of the representation's absolute scale.
-            balance_w = 0.5 * (cp_len[:-1] + cp_len[1:])
-            local_curv = np.rad2deg(cp_ang) / np.maximum(balance_w, 1e-9)
-            straight_frac = float(
-                np.sum(balance_w[local_curv < P["straight_curv_deg_per_m"]])
-                / max(float(np.sum(balance_w)), 1e-9))
-            straight_balance_score = float(get_range_reward(
-                straight_frac, P["straight_frac_min"],
-                P["straight_frac_lo"], P["straight_frac_hi"],
-                P["straight_frac_max"],
-            ))
+            straight_lens, straight_left = self._straight_windows(signed_ang, balance_w)
+            straight_frac = self._straight_fraction(balance_w, straight_lens, straight_left)
+            between_frac = self._between_fraction(
+                local_curv, balance_w, straight_lens, straight_left)
 
-            # Curvature entropy: bin the same local curvature by ARC LENGTH,
-            # not by sample count, so a representation that samples its curve
-            # densely does not score differently from one that samples it
-            # coarsely.  This is the curvature half of Loiacono et al.'s pair;
-            # speed_entropy_score below is the other half.
+            longest_straight_len = float(np.max(straight_lens))
+            straight_max_score = float(get_range_reward(
+                longest_straight_len, -1.0, 0.0, P["straight_max_m"], P["straight_max_zero_m"]))
+
+            # Curvature entropy, binned by ARC LENGTH so sampling density
+            # does not change it.
             n_cbins = int(P["curvature_bins"])
             c_max = float(P["curvature_max_deg_per_m"])
             c_clipped = np.clip(local_curv, 0.0, c_max - 1e-9)
@@ -1276,205 +1772,96 @@ class RacingProblem(Problem):
                 curvature_entropy = float(-np.sum(c_p * np.log(c_p)) / np.log(n_cbins))
             else:
                 curvature_entropy = 0.0
-            curvature_entropy_score = float(get_range_reward(
-                curvature_entropy, 0.0, P["curvature_entropy_lo"], 1.0, 1.0))
+            fia_turns, fia_arcs = self._find_corners(
+                signed_ang, balance_w, P["fia_corner_curv_deg_per_m"])
+            turn_count = len(fia_turns)
 
-            corner_turns, corner_arclens = self._find_corners(
-                signed_ang, balance_w)
+            fia_corner_count, fia_start_straight = self._fia_corners(signed_ang, balance_w)
+            start_to_corner_score = float(get_range_reward(
+                fia_start_straight, 0.0, P["start_to_corner_m"], 1e12, 1e12 + 1.0))
+            # Control quantities, not quality terms (_CONTROL_TARGETS).
+            slow_corners, fast_corners = self._corner_class_counts(fia_turns, fia_arcs)
+            lap_sim = self._lap_simulation(curve_points)
+            throttle_share = lap_sim["throttle_share"]
+            # Typicality features (_TYPICALITY).
+            poly = curve_points[:-1] if np.allclose(curve_points[0], curve_points[-1]) else curve_points
+            area = 0.5 * abs(float(np.sum(poly[:, 0] * np.roll(poly[:, 1], -1)
+                                           - np.roll(poly[:, 0], -1) * poly[:, 1])))
+            compactness = 4.0 * np.pi * area / max(cp_total, 1e-9) ** 2
+            turning_per_km = float(np.sum(np.abs(signed_ang))) / (2.0 * np.pi) / max(cp_total / 1000.0, 1e-9)
+            fia_corners_per_km = fia_corner_count / max(cp_total / 1000.0, 1e-9)
+            typicality_distance = self._typicality_distance(
+                (throttle_share, lap_sim["limit_share"], curvature_entropy,
+                 fia_corners_per_km, compactness))
+            thr = self._TYPICALITY["threshold"]
+            typicality_score = float(get_range_reward(
+                typicality_distance, -1.0, 0.0, thr, 2.0 * thr))
 
-            # Start straight: the contiguous straight run containing curve
-            # index 0, where the car spawns.  Walking forward from the start and
-            # backward from the end lets the run extend through the seam.  A lap
-            # with no corner counts as one full-length straight; other terms
-            # reject such loops.
-            straight_mask = local_curv < P["straight_curv_deg_per_m"]
-            n_ang = len(signed_ang)
-            start_straight_len = 0.0
-            k = 0
-            while k < n_ang and straight_mask[k]:
-                start_straight_len += float(balance_w[k])
-                k += 1
-            if k < n_ang:
-                j = n_ang - 1
-                while j > k and straight_mask[j]:
-                    start_straight_len += float(balance_w[j])
-                    j -= 1
-            start_straight_score = float(get_range_reward(
-                start_straight_len, P["start_straight_zero_m"],
-                P["start_straight_lo_m"], 1e12, 1e12))
-
-            # Braking zone: the longest contiguous straight anywhere on the lap,
-            # where a car builds speed and brakes hard for a corner.  Graded
-            # rather than gated, so voronoi (straights pinned to its diagram
-            # edge scale) earns partial credit instead of being locked out.
-            longest_straight_len = 0.0
-            run = 0.0
-            for i in range(n_ang):
-                if straight_mask[i]:
-                    run += float(balance_w[i])
-                    if run > longest_straight_len:
-                        longest_straight_len = run
-                else:
-                    run = 0.0
-            braking_zone_score = float(get_range_reward(
-                longest_straight_len, P["braking_zone_zero_m"],
-                P["braking_zone_lo_m"], P["braking_zone_hi_m"],
-                P["braking_zone_max_m"]))
-
-            # Hairpins: corner runs that are both large and genuinely tight.  A
-            # hairpin is a signature corner, and real circuits have 0-3 (median
-            # 1), never a string of them, so only the count is scored.
-            hairpin_count = 0
-            for turn, alen in zip(corner_turns, corner_arclens):
-                turn_deg = float(np.rad2deg(turn))
-                if alen > 1e-6 and turn_deg / alen >= P["hairpin_min_curv_deg_per_m"]:
-                    if turn_deg >= P["hairpin_lo_deg"]:
-                        hairpin_count += 1
-            # Having no hairpin is not a fault.  Measured through this same
-            # code on the 24 reference circuits (Indianapolis excluded),
-            # hairpin_count is 0 at the 10th percentile, 0 at the 50th and 2 at
-            # the 90th, and 12 of the 24 have none at all: Monza, Spa,
-            # Silverstone, Catalunya, Melbourne, Mexico City, Austin, Sakhir,
-            # Sao Paulo, Sochi, Spielberg and Moscow Raceway.  150 degrees
-            # accumulated at 1.2 deg/m is a genuine hairpin and most circuits
-            # do not have one.
-            #
-            # So the band plateaus over 0..hairpin_max_count and only falls
-            # away above it: a string of hairpins is not a circuit, but their
-            # absence is ordinary.  Requiring one instead scored those twelve
-            # circuits 0.000 here, which through the conjunctive mean of the
-            # challenge group put Monza and Spa among the worst tracks the
-            # function can see.
-            hairpin_score = float(get_range_reward(
-                hairpin_count, 0.0, 0.0,
-                float(P["hairpin_max_count"]), float(P["hairpin_count_zero"])))
-
-            # Minimum corner radius: the spline representations can place two
-            # control points close together and produce a 1-3 m corner no car
-            # can drive.  Scoring the tightest SUSTAINED corner (each run's
-            # average curvature to radius) rather than a single-sample spike
-            # keeps this invariant to sampling density, so it does not fire on
-            # coarse tile/hex arc sampling.  One scale-free rule for all
-            # representations; the plateau sits below every constructive
-            # decoder's fixed radius, so only impossible spline hairpins lose.
-            tightest_radius_m = 1e12  # no corner -> unbounded radius -> full score
-            for turn, alen in zip(corner_turns, corner_arclens):
-                turn_deg = float(np.rad2deg(turn))
-                if turn_deg > 1e-6:
-                    # radius = arc_length / angle(radians); alen and turn are the
-                    # corner's total arc length and total swept angle.
-                    r = alen / float(turn)
-                    tightest_radius_m = min(tightest_radius_m, r)
-            min_radius_score = float(get_range_reward(
-                tightest_radius_m,
-                P["min_corner_radius_zero_m"],
-                P["min_corner_radius_lo_m"], 1e12, 1e12))
+            # Tightest corner radius (a control): the tightest SUSTAINED corner
+            # on the corner-core line (arc over swept angle), not a
+            # one-sample spike, so sampling density does not change it.
+            tightest_radius_m = 1e12  # no corner: unbounded radius
+            for turn, alen in zip(*self._find_corners(signed_ang, balance_w)):
+                if float(turn) > 1e-6:
+                    tightest_radius_m = min(tightest_radius_m, alen / float(turn))
         else:
-            straight_balance_score = 0.0
+            straight_frac = 0.0
+            between_frac = 1.0
+            longest_straight_len = 0.0
+            straight_max_score = 0.0
             curvature_entropy = 0.0
-            curvature_entropy_score = 0.0
-            start_straight_score = 0.0
-            braking_zone_score = 0.0
-            hairpin_score = 0.0
-            hairpin_count = 0
-            start_straight_len = 0.0
-            longest_straight_len = 0.0
+            turn_count = 0
             tightest_radius_m = 0.0
-            min_radius_score = 0.0
+            fia_corner_count, fia_start_straight = 0, 0.0
+            start_to_corner_score = 0.0
+            fia_corners_per_km = 0.0
+            slow_corners, fast_corners = 0, 0
+            throttle_share = 0.0
+            lap_sim = {"throttle_share": 0.0, "limit_share": 0.0, "stops_20": 0}
+            compactness = turning_per_km = 0.0
+            typicality_distance, typicality_score = float("inf"), 0.0
 
-        # Footprint: a designed circuit occupies a compact region of the map
-        # rather than a thin ribbon (two parallel straights one tile apart can
-        # otherwise max out the straight-balance term).
-        if len(curve_points) > 1:
-            bbox_w = float(np.max(curve_points[:, 0]) - np.min(curve_points[:, 0]))
-            bbox_h = float(np.max(curve_points[:, 1]) - np.min(curve_points[:, 1]))
-            longer = max(bbox_w, bbox_h, 1e-6)
-            aspect = min(bbox_w, bbox_h) / longer
-            span = longer / max(float(min(self._width, self._height)), 1e-6)
-            aspect_band = float(get_range_reward(aspect, P["extent_aspect_zero"], P["extent_aspect_lo"], 1.0, 1.0))
-            span_band   = float(get_range_reward(span,   P["extent_span_zero"],   P["extent_span_lo"],   1.0, 1.0))
-            extent_score = aspect_band * span_band
-        else:
-            extent_score = 0.0
+        speed_entropy = float(info.get('speed_entropy', 0.0))
 
-        # Lap time — expressed as an average-speed band over the actual track
-        # length so it is representation-independent (a step-per-control-point
-        # budget punishes representations that happen to use many vertices).
-        steps = info.get('steps', 0)
-        dt = float(getattr(getattr(self, '_engine', None), 'time_step', 0.1) or 0.1)
-        track_len = max(float(cp_total), 1.0)
-        min_steps = track_len / (P["time_vmax"] * dt)
-        max_steps_for_scoring = track_len / (P["time_vmin"] * dt)
-        if not finished:
-            time_score = 0.0
-        elif steps < min_steps:
-            time_score = max(0.0, 1.0 - (min_steps - steps) / min_steps)
-        elif steps > max_steps_for_scoring:
-            time_score = max(0.0, 1.0 - (steps - max_steps_for_scoring) / max_steps_for_scoring)
-        else:
-            time_score = 1.0
-
-        # Speed profile entropy (Loiacono, Cardamone & Lanzi 2011): rewards a
-        # lap whose driving alternates fast and slow phases.  Like time_score
-        # it only counts once the agent actually finishes the lap.
-        if finished:
-            speed_entropy_score = float(get_range_reward(
-                float(info.get('speed_entropy', 0.0)),
-                P["speed_entropy_zero"], P["speed_entropy_lo"],
-                P["speed_entropy_hi"], P["speed_entropy_max"]))
-        else:
-            speed_entropy_score = 0.0
-
-        # On-road: penalise time the CAR spends off the road (on the grass).
-        # Full marks when the car is on the road the whole lap, a mild penalty
-        # for a small excursion, and zero once it is off-road for more than
-        # onroad_max_frac of the lap.  A designed track can be driven while
-        # staying on the road; a bad one forces the car wide.
         offroad_frac = float(info.get('offroad_frac', 1.0))
-        # Plateau at offroad_frac 0 (fully on-road -> 1.0), ramping DOWN the
-        # right slope to 0 at onroad_max_frac (0.20).  get_range_reward with
-        # plat_low = plat_high = 0 makes [min, 0] the full plateau, then the
-        # down slope reaches 0 at max_value.
         on_road_score = float(get_range_reward(
-            offroad_frac, -1.0, 0.0, 0.0, P["onroad_max_frac"]))
+            offroad_frac, -1.0, 0.0, P["offroad_full_frac"], P["onroad_max_frac"]))
 
         terms = {
-            # Stage 1: soundness
             "oob_score":                 oob_score,
-            "geom_score":                geom_score,   # validity (Prasetya 2016)
+            # Stage 1: rules (_RULE_TERMS)
             "length_score":              length_score,
-            # Stage 2: shape, in _SHAPE_GROUPS order
-            "start_straight_score":      start_straight_score,     # speed
-            "braking_zone_score":        braking_zone_score,       # speed
-            "straight_balance_score":    straight_balance_score,   # speed
-            "min_radius_score":          min_radius_score,         # challenge
-            "hairpin_score":      hairpin_score,     # challenge
-            "curvature_entropy_score":   curvature_entropy_score,  # variation
-            "extent_score":              extent_score,             # layout
-            # Stage 3: simulation, the same qualities read off the driven lap
-            "completion":                completion,           # validity
-            "on_road_score":             on_road_score,        # validity
-            "time_score":                time_score,           # factor 1
-            "speed_entropy_score":       speed_entropy_score,  # factor 4
-            # Raw values behind the structural terms.  Not scored, and free:
-            # every one is already computed for the term above it.  Calibration
-            # scripts and threshold audits read them.
-            "start_straight_len_m":      float(start_straight_len),
+            "straight_max_score":        straight_max_score,
+            "start_to_corner_score":     start_to_corner_score,
+            # Stage 2: the driven lap
+            "completion":                completion,
+            "on_road_score":             on_road_score,
+            # Stage 3: typicality
+            "typicality_score":          typicality_score,
+            # Raw values (not scored; read by controlability and calibration).
+            "length_m":                  float(self._closed_curve_length(curve_points))
+                                         if len(curve_points) > 1 else 0.0,
             "longest_straight_m":        float(longest_straight_len),
+            "straight_frac":             float(straight_frac),
+            "between_frac":              float(between_frac),
             "curvature_entropy":         float(curvature_entropy),
-            "hairpin_count":             int(hairpin_count),
+            "turn_count":                int(turn_count),
             "tightest_corner_radius_m":  float(tightest_radius_m),
+            "fia_corner_count":          int(fia_corner_count),
+            "fia_start_straight_m":      float(fia_start_straight),
+            "fia_corners_per_km":        float(fia_corners_per_km),
+            "slow_corners":              int(slow_corners),
+            "fast_corners":              int(fast_corners),
+            "throttle_share":            float(throttle_share),
+            "limit_share":               float(lap_sim["limit_share"]),
+            "stops_20":                  int(lap_sim["stops_20"]),
+            "compactness":               float(compactness),
+            "turning_per_km":            float(turning_per_km),
+            "typicality_distance":       float(typicality_distance),
+            "speed_entropy":             speed_entropy,
             "offroad_frac":              offroad_frac,
+            "self_overlaps":             int(geom_violations),
         }
-
-        # One score per shape group: the weighted mean of that group's terms.
-        # quality() weights the groups by the sum of their members' weights, so
-        # this reproduces the flat weighted mean over all seven terms.  Exposed
-        # because a per-factor axis is what the expressive-range plots need.
-        for group, weights in self._SHAPE_GROUPS.items():
-            keys = sorted(weights)
-            terms["shape_%s_score" % group] = _conjunctive_mean(
-                [terms[k] for k in keys], [weights[k] for k in keys])
         return terms
 
     def quality(self, info):
@@ -1482,113 +1869,83 @@ class RacingProblem(Problem):
         if terms is None:
             return 0.0
 
-        # Hard requirement: a track whose geometry leaves the map is not a
-        # racetrack.  Quality collapses, scaled by how far in-bounds it is so
-        # the search keeps a gradient back toward validity.
-        #
-        # Self-intersection is deliberately NOT hard, only graded in soundness
-        # below.  Gating on it would floor the free-form spline at ~0.075 with
-        # no gradient, since its random content self-intersects ~38 times, and
-        # the GA would have no way to evolve out of crossings.
+        # Off the map: quality 0.  Why not graded: any value above 0 ranks an
+        # infeasible track above a feasible one that scores less, against
+        # Deb's (2000) rule (as stated by Hellwig and Beyer 2018, Sec. 2;
+        # Deb's paper not opened).  No gradient is needed: every
+        # representation builds inside _build_box, and no random genome
+        # (20 each, seed 21) leaves the map.
         if terms["oob_score"] < 0.999:
-            return 0.15 * terms["oob_score"]
+            return 0.0
 
-        # Stage 1: soundness — self-intersection (graded) and sensible length.
-        soundness = _conjunctive_mean(
-            (terms["geom_score"], terms["length_score"]))
+        # Road overlapping itself: quality 0 (a user decision; the search
+        # gets no gradient out of an overlap).  Random genomes still
+        # overlapping here: racing 0 of 520 (after repair), radial 30 of 30
+        # (no repair step), tile, hex and Voronoi 0 of 40.
+        if terms["self_overlaps"] > 0:
+            return 0.0
 
-        # Stage 2: shape — the weighted mean of the four factor groups (see
-        # _SHAPE_GROUPS).  A group's weight is the sum of its terms' weights, so
-        # speed carries 4.5 of the 8.0: start_straight and braking_zone reward
-        # features a designed circuit has and a random loop lacks.
-        gw = {g: sum(w.values()) for g, w in self._SHAPE_GROUPS.items()}
-        groups = sorted(gw)
-        shape = _conjunctive_mean([terms["shape_%s_score" % g] for g in groups],
-                                  [gw[g] for g in groups])
-
-        # Stage 3: simulation — the same qualities measured from the driven lap
-        # instead of the geometry.  completion and on_road are validity (can the
-        # track be driven, and driven on the road; a random loop that forces the
-        # car wide scores low here), time_score is Togelius factor 1 from the
-        # driver's side, speed_entropy factor 4 and the speed half of Loiacono
-        # et al.'s pair.  Equal-weighted: none of the four has been through a
-        # discrimination sweep of the kind that set the shape weights.
-        sim = _conjunctive_mean(
-            (terms["completion"], terms["time_score"],
-             terms["speed_entropy_score"], terms["on_road_score"]))
-
-        # The three stages multiply.  The previous form banked
-        # 0.25 * soundness additively, and soundness averages 0.91-0.95 on
-        # random content, so a merely valid loop collected about a quarter of
-        # the score before any design merit.  Quality 1.0 now requires every
-        # term at 1.0: reachable in principle, hard in practice.  Each stage
-        # still scales the next, so the gradient stays continuous.
-        return soundness * shape * sim
-
-    def _track_to_grid(self, curve_points: np.ndarray, grid_size: int = 20) -> np.ndarray:
-        pts = np.asarray(curve_points, dtype=float)
-        if len(pts) == 0:
-            return np.zeros(grid_size * grid_size, dtype=float)
-        xi = np.clip((pts[:, 0] / self._width  * grid_size).astype(int), 0, grid_size - 1)
-        yi = np.clip((pts[:, 1] / self._height * grid_size).astype(int), 0, grid_size - 1)
-        grid = np.zeros((grid_size, grid_size), dtype=float)
-        grid[yi, xi] = 1.0
-        return grid.ravel()
+        # Staged, as the benchmark's zelda, isaac and mdungeons: the mean of
+        # the stage scores, a stage counting only once those before it are
+        # 1.0.  Why not the product: it scores a track breaking a rule the
+        # same as one also failing everything after; the staged mean ranks
+        # the partly good track higher.  Rules first: they need only the
+        # geometry, and a track breaking one is no circuit however it drives.
+        stages = (
+            float(np.mean([terms[k] for k in self._RULE_TERMS])),                # 1. FIA rules
+            float(np.mean((terms["completion"], terms["on_road_score"]))),        # 2. driven lap
+            terms["typicality_score"],                                            # 3. typicality
+        )
+        # A stage passes at 0.999; passing all three scores exactly 1.0, the
+        # benchmark's feasibility line (pcg_env.quality).
+        score = 0.0
+        for value in stages:
+            if value < 0.999:
+                return (score + value) / len(stages)
+            score += 1.0
+        return 1.0
 
     def diversity(self, info1, info2):
-        grid_size = 20
-        _cp1 = info1.get('curve_points')
-        _cp2 = info2.get('curve_points')
-        g1 = self._track_to_grid(np.asarray(_cp1 if _cp1 is not None else [], dtype=float), grid_size)
-        g2 = self._track_to_grid(np.asarray(_cp2 if _cp2 is not None else [], dtype=float), grid_size)
-        spatial_frac = float(np.abs(g1 - g2).sum()) / (grid_size * grid_size)
-
-        a1 = float(info1.get('avg_turn', 0.0))
-        a2 = float(info2.get('avg_turn', 0.0))
-        angle_frac = min(abs(a1 - a2) / np.pi, 1.0)
-
-        # The 0.4 plateau is out of reach for four of the five representations.
-        # spatial_frac is the symmetric difference of two 20x20 occupancy
-        # grids, and a track only occupies ~15-25% of the grid, so two totally
-        # unrelated tracks still overlap on all the empty cells.  Measured mean
-        # blended distance: racing 0.27, radial 0.18, voronoi/tile/hex 0.13,
-        # i.e. diversity saturates at 0.67/0.45/0.32 respectively rather than
-        # at 1.0.  That systematically rates the free-form spline as twice as
-        # diverse as the grid representations, which is an artifact of the
-        # measure, not a property of the content.
-        blended = 0.7 * spatial_frac + 0.3 * angle_frac
-        return get_range_reward(blended, 0, self._diversity, 1.0)
+        """How different two layouts are: Arkin et al.'s (1991) turning-
+        function distance (L2 between heading-against-lap-fraction curves,
+        minimised over rotation and start point; invariant to position,
+        rotation and scale) in units of pi, ramped to full marks at
+        self._diversity.  It compares the sequence of corners and straights
+        a driver meets, as zelda and mdungeons compare solution paths.
+        Length is left out (it is a control; a scaled copy is the same
+        layout); a mirror image counts as different (0.331 for a circuit and
+        its mirror).  Why not an occupancy grid: a shifted copy counts as new
+        and small footprints look alike.  Why not speed profiles: they depend
+        on the driver.  The benchmark's 0.4 (8 of its 14 problems) fits: the
+        276 circuit pairs run p10 0.293, median 0.382, p90 0.474.  Random
+        pairs (seed 7) median: racing 0.313, Voronoi 0.342, tile 0.468, hex
+        0.478."""
+        tf1 = info1.get("turning_function")
+        tf2 = info2.get("turning_function")
+        if tf1 is None or tf2 is None:
+            return 0.0
+        d = min(turning_distance(tf1, tf2) / np.pi, 1.0)
+        return get_range_reward(d, 0, self._diversity, 1.0)
 
     def controlability(self, info, control):
-        """How close the content came to what was asked for.
-
-        Both terms are trapezoids centred on the request: full marks inside
-        the tolerance, falling to zero three tolerances out on either side.
-        One rule, and symmetric, so missing by a given amount costs the same
-        whichever way it was missed.
-
-        Anchoring the ends at 0 and at an absolute ceiling instead made the
-        two slopes wildly uneven and paid for overshoot.  Against a 6000 m
-        target on a 0 to 24000 m envelope, 2250 m scored 0.44 while 9750 m
-        scored 0.83, so a search maximising controlability was pushed toward
-        longer tracks whatever the target was."""
-        length_err = self._width * 0.6
-        l_score = get_range_reward(
-            info.get('total_length', 0.0),
-            control['length'] - 3.0 * length_err,
-            control['length'] - length_err,
-            control['length'] + length_err,
-            control['length'] + 3.0 * length_err,
-        )
-        turns_err = 2
-        t_score = get_range_reward(
-            info.get('num_turns', 0),
-            control['num_turns'] - 3 * turns_err,
-            control['num_turns'] - turns_err,
-            control['num_turns'] + turns_err,
-            control['num_turns'] + 3 * turns_err,
-        )
-        return (l_score + t_score) / 2.0
+        """The mean over the targets of get_range_reward(value, domain_lo,
+        target - tol, target + tol, domain_hi), every upstream problem's form,
+        with the domain ends of _rebuild_control_space.  Slopes are uneven
+        off-centre (5100 m target: 1000 m short scores 0.69, 1000 m long
+        0.77).  Why not a symmetric trapezoid: not the benchmark's form, and
+        its ends could credit a value quality scores 0.  Why not one distance
+        over all ten: one large miss could be paid for by the rest; here a
+        missed target costs at most 1/10.  No control depends on the driver."""
+        terms = self._quality_terms(info)
+        if terms is None:
+            return 0.0
+        scores = []
+        for k, (key, (dom_lo, dom_hi), tol) in self._control_bands.items():
+            c = float(control[k])
+            scores.append(float(get_range_reward(
+                float(terms[key]), min(dom_lo, c - tol - 1e-9), c - tol,
+                c + tol, max(dom_hi, c + tol + 1e-9))))
+        return float(np.mean(scores))
 
     def _draw_bg_overlay(self, bg_draw, scale):
         """Hook: draw extra background detail (e.g. the voronoi grid) between
@@ -1614,27 +1971,15 @@ class RacingProblem(Problem):
             bg_draw.line(scaled_curve, fill=centerline_color, width=2)
         return bg
 
-    # The frame pipeline, one method per stage:
-    #   _track_edges        offset the centerline into left/right road edges
-    #   _render_track_bg    draw the static background once (road + overlay)
-    #   _draw_car           wheels, body, heading line
-    #   _draw_lookahead     the agent's aim point (cyan circle + line)
-    #   _draw_hud           telemetry text box in the top-left corner
-    #   _iter_render_frames replay the trajectory, yield one frame at a time
-    #   render              collect the generator into a list
-    #
-    # Every draw helper appends the pixel coordinates it touched to
-    # bbox_xs/bbox_ys.  In fast mode each new frame only restores the small
-    # background rectangle the previous frame drew over (a "dirty rectangle"),
-    # instead of copying the whole background image again.
+    # Frames: _track_edges, _render_track_bg (background once), _draw_car,
+    # _draw_lookahead, _draw_hud, _iter_render_frames (replays the
+    # trajectory, one frame at a time), render (collects them).  Draw helpers
+    # record the pixels they touch in bbox_xs/bbox_ys, so fast mode restores
+    # only that dirty rectangle per frame.
 
     def _track_edges(self, curve_px, half_width):
-        """Left/right road-edge polylines in pixels, as lists of (x, y) tuples.
-
-        The offsetting itself is utils.compute_offset_edges, the same routine
-        the geometry soundness check runs in metres; this wrapper only feeds it
-        pixel coordinates and converts the result to the tuple lists PIL draws
-        from."""
+        """Road-edge polylines in pixels (utils.compute_offset_edges) as the
+        tuple lists PIL draws."""
         left, right = compute_offset_edges(curve_px, track_width=2.0 * half_width)
         return ([(float(x), float(y)) for x, y in left],
                 [(float(x), float(y)) for x, y in right])
@@ -1746,13 +2091,10 @@ class RacingProblem(Problem):
         progress_desc=None,
         render_scale=1.0,
     ):
-        """Yield rendered frames one at a time (memory-safe for gif writers).
-
-        Replays the cached trajectory over a background drawn once.  A HUD
-        agent runs alongside the replay purely to recover what the real agent
-        was doing at each step (its action and lookahead point), which is why
-        agent.act runs for every trajectory step even when the frame itself
-        is skipped by frame_sampling."""
+        """Yield frames one at a time (memory-safe for gif writers),
+        replaying the cached trajectory over a background drawn once.  A HUD
+        copy of the driver runs alongside to recover its action and
+        lookahead, so agent.act runs on every step, sampled frames or not."""
         if skip is None:
             skip = self._skip_render
         if skip:
@@ -1794,8 +2136,7 @@ class RacingProblem(Problem):
         font = None
         if show_hud:
             engine = getattr(self, '_engine', None)
-            agent = SteeringAgent(curve_np, track_width=float(self._track_width),
-                                  engine=engine)
+            agent = self._make_agent(curve_np)
             agent.reset()
             dt = float(getattr(engine, 'time_step', 0.1) or 0.1)
             mass = float(getattr(engine, 'mass', 1350.0) or 1350.0)

@@ -19,13 +19,19 @@ import numpy as np
 # Why processes and not threads: the racing simulation is interpreted Python
 # stepping one car at a time, so it holds the GIL throughout.
 #
-# Results are byte for byte the serial ones, because evaluation is a pure
-# function of the content: Problem.info consumes no randomness (the problems'
-# _random is used by their content spaces, which stay in the parent), and
-# executor.map returns results in input order.  Verified two ways: identical
-# SHA-256 of every info dict across all five racing representations, and a
-# 3-generation GA at population 100 whose saved output diffs clean against the
-# serial run.
+# Results are byte for byte the serial ones.  Problem.info consumes no
+# randomness (the problems' _random is used by their content spaces, which
+# stay in the parent), and executor.map returns results in input order.
+# Verified two ways: identical SHA-256 of every info dict across all five
+# racing representations, and a 3-generation GA at population 100 whose saved
+# output diffs clean against the serial run.
+#
+# Problem.info may also write into the content it is given: the tile problems
+# re-encode the genome in place (Bailly and Levieux 2023, Alg. 1 l.20), and the
+# search breeds from that object.  A worker holds a pickled copy, so it returns
+# the copy alongside the info and _write_back puts it into the caller's object.
+# Without that step the re-encoded genome stays in the worker and the search
+# breeds from the genome as sampled.
 _DEFAULT_WORKERS = min(8, os.cpu_count() or 1)
 
 _POOL = None
@@ -40,7 +46,21 @@ def _worker_init(problem_bytes):
 
 
 def _worker_info(content):
-    return _WORKER_PROBLEM.info(content)
+    info = _WORKER_PROBLEM.info(content)
+    return info, content
+
+
+def _write_back(target, source):
+    """Copy a worker's content into the caller's object, keeping its identity.
+
+    The search holds a reference to the content it passed in, so the values
+    must land in that object rather than in a new one."""
+    if isinstance(target, dict):
+        target.update(source)
+    elif isinstance(target, np.ndarray):
+        target[...] = source
+    elif isinstance(target, list):
+        target[:] = source
 
 
 def _drop_pool():
@@ -240,7 +260,10 @@ class PCGEnv:
             # cap), so fixed chunks leave workers idle at the end of a
             # generation.  Ordered map, so info[i] belongs to contents[i].
             try:
-                info = list(pool.map(_worker_info, contents, chunksize=1))
+                results = list(pool.map(_worker_info, contents, chunksize=1))
+                info = [i for i, _ in results]
+                for content, (_, worked) in zip(contents, results):
+                    _write_back(content, worked)
             except Exception as e:
                 # A dead worker must not end an overnight search.  The serial
                 # path gives the same values, so the run continues correctly,
